@@ -8,10 +8,11 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import jwt
 import pymysql
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -62,6 +63,41 @@ class CreateUserRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=255)
     role: str = Field(default="user", min_length=1, max_length=32)
+
+
+class ActivityLogRequest(BaseModel):
+    category: str = Field(default="general", min_length=1, max_length=64)
+    action: str = Field(min_length=1, max_length=128)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserSessionRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=128)
+    browser_name: str = Field(default="Google Chrome", min_length=1, max_length=64)
+    browser_mode: str = Field(default="Incognito", min_length=1, max_length=32)
+    status: str = Field(default="Running", min_length=1, max_length=32)
+    browser_pid: int | None = None
+    launch_preset: str = Field(default="Default", max_length=64)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingRequest(BaseModel):
+    setting_key: str = Field(min_length=1, max_length=128)
+    setting_value: Any
+
+
+class ContentRequest(BaseModel):
+    content_type: str = Field(default="message", min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=255)
+    subject: str = Field(default="", max_length=255)
+    body_text: str = Field(default="")
+    body_html: str = Field(default="")
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContentUpdateRequest(ContentRequest):
+    content_id: int = Field(gt=0)
 
 
 def _connect(database: str | None = None):
@@ -131,6 +167,90 @@ def _ensure_schema() -> None:
                 )
             else:
                 _migrate_plaintext_passwords(cursor)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS login_history (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    success TINYINT(1) NOT NULL DEFAULT 0,
+                    ip_address VARCHAR(45) NULL,
+                    location_label VARCHAR(128) NULL,
+                    user_agent VARCHAR(255) NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS activity_log (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    category VARCHAR(64) NOT NULL,
+                    action VARCHAR(128) NOT NULL,
+                    details_json LONGTEXT NULL,
+                    ip_address VARCHAR(45) NULL,
+                    location_label VARCHAR(128) NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS browser_sessions (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    session_id VARCHAR(128) NOT NULL UNIQUE,
+                    title VARCHAR(128) NOT NULL,
+                    browser_name VARCHAR(64) NOT NULL,
+                    browser_mode VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    browser_pid BIGINT UNSIGNED NULL,
+                    launch_preset VARCHAR(64) NULL,
+                    details_json LONGTEXT NULL,
+                    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP NULL,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    setting_key VARCHAR(128) NOT NULL,
+                    setting_value_json LONGTEXT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uq_user_setting (username, setting_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS content_library (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    content_type VARCHAR(64) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    subject VARCHAR(255) NOT NULL DEFAULT '',
+                    body_text LONGTEXT NULL,
+                    body_html LONGTEXT NULL,
+                    details_json LONGTEXT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
     finally:
         connection.close()
 
@@ -284,6 +404,191 @@ def _list_users() -> list[dict[str, str]]:
         connection.close()
 
 
+def _client_ip(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client is not None:
+        return request.client.host
+    return None
+
+
+def _location_label(ip_address: str | None) -> str | None:
+    if ip_address in {"127.0.0.1", "::1", "localhost"}:
+        return "Local machine"
+    return None
+
+
+def _persist_login_history(
+    username: str,
+    success: bool,
+    request: Request | None = None,
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            ip_address = _client_ip(request)
+            cursor.execute(
+                """
+                INSERT INTO login_history (user_id, username, success, ip_address, location_label, user_agent)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    username,
+                    1 if success else 0,
+                    ip_address,
+                    _location_label(ip_address),
+                    request.headers.get("user-agent") if request is not None else None,
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def record_activity(
+    username: str,
+    action: str,
+    category: str = "general",
+    details: dict[str, Any] | None = None,
+    request: Request | None = None,
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            ip_address = _client_ip(request)
+            cursor.execute(
+                """
+                INSERT INTO activity_log (user_id, username, category, action, details_json, ip_address, location_label)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    username,
+                    category,
+                    action,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    ip_address,
+                    _location_label(ip_address),
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def upsert_setting(
+    username: str,
+    setting_key: str,
+    setting_value: Any,
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO user_settings (user_id, username, setting_key, setting_value_json)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    user_id = VALUES(user_id),
+                    setting_value_json = VALUES(setting_value_json)
+                """,
+                (user_id, username, setting_key, json.dumps(setting_value, ensure_ascii=False)),
+            )
+    finally:
+        connection.close()
+
+
+def record_browser_session(
+    username: str,
+    session_id: str,
+    title: str,
+    browser_name: str,
+    browser_mode: str,
+    status: str,
+    browser_pid: int | None = None,
+    launch_preset: str = "Default",
+    details: dict[str, Any] | None = None,
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO browser_sessions (
+                    user_id, username, session_id, title, browser_name, browser_mode,
+                    status, browser_pid, launch_preset, details_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    user_id = VALUES(user_id),
+                    title = VALUES(title),
+                    browser_name = VALUES(browser_name),
+                    browser_mode = VALUES(browser_mode),
+                    status = VALUES(status),
+                    browser_pid = VALUES(browser_pid),
+                    launch_preset = VALUES(launch_preset),
+                    details_json = VALUES(details_json),
+                    updated_at = CURRENT_TIMESTAMP,
+                    closed_at = IF(VALUES(status) IN ('Closed', 'Stopped'), CURRENT_TIMESTAMP, closed_at)
+                """,
+                (
+                    user_id,
+                    username,
+                    session_id,
+                    title,
+                    browser_name,
+                    browser_mode,
+                    status,
+                    browser_pid,
+                    launch_preset,
+                    json.dumps(details or {}, ensure_ascii=False),
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def record_content(
+    username: str,
+    content_type: str,
+    title: str,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    details: dict[str, Any] | None = None,
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO content_library (
+                    user_id, username, content_type, title, subject, body_text, body_html, details_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    username,
+                    content_type,
+                    title,
+                    subject,
+                    body_text,
+                    body_html,
+                    json.dumps(details or {}, ensure_ascii=False),
+                ),
+            )
+    finally:
+        connection.close()
+
+
 def _decode_bearer_token(authorization: str | None) -> dict[str, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token.")
@@ -321,11 +626,13 @@ def health() -> dict[str, object]:
 
 
 @app.post("/api/login")
-def login(payload: LoginRequest) -> dict[str, object]:
+def login(payload: LoginRequest, request: Request) -> dict[str, object]:
     user = _authenticate(payload.username.strip(), payload.password)
     if user is None:
+        _persist_login_history(payload.username.strip(), False, request=request)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials.")
 
+    _persist_login_history(payload.username.strip(), True, request=request, user_id=int(user["id"]))
     token = _create_token(user)
     return {
         "ok": True,
@@ -354,6 +661,222 @@ def create_user(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return {"ok": True, "user": user}
+
+
+@app.post("/api/activity")
+def create_activity(
+    payload: ActivityLogRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    record_activity(
+        current_user["username"],
+        payload.action,
+        payload.category,
+        payload.details,
+        user_id=int(current_user["id"]) if current_user.get("id") else None,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/activity")
+def list_activity(current_user: dict[str, str] = Depends(get_current_user)) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT id, username, category, action, details_json, created_at
+                FROM activity_log
+                WHERE username = %s
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (current_user["username"],),
+            )
+            rows = cursor.fetchall() or []
+            return {"ok": True, "activity": rows}
+    finally:
+        connection.close()
+
+
+@app.post("/api/browser-sessions")
+def create_browser_session(
+    payload: BrowserSessionRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    record_browser_session(
+        current_user["username"],
+        payload.session_id,
+        payload.title,
+        payload.browser_name,
+        payload.browser_mode,
+        payload.status,
+        payload.browser_pid,
+        payload.launch_preset,
+        payload.details,
+        user_id=int(current_user["id"]) if current_user.get("id") else None,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/browser-sessions")
+def list_browser_sessions(current_user: dict[str, str] = Depends(get_current_user)) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT session_id, title, browser_name, browser_mode, status, browser_pid,
+                       launch_preset, details_json, started_at, updated_at, closed_at
+                FROM browser_sessions
+                WHERE username = %s
+                ORDER BY id DESC
+                """,
+                (current_user["username"],),
+            )
+            rows = cursor.fetchall() or []
+            return {"ok": True, "sessions": rows}
+    finally:
+        connection.close()
+
+
+@app.post("/api/settings")
+def upsert_setting_endpoint(
+    payload: SettingRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    upsert_setting(
+        current_user["username"],
+        payload.setting_key,
+        payload.setting_value,
+        user_id=int(current_user["id"]) if current_user.get("id") else None,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/settings")
+def list_settings(current_user: dict[str, str] = Depends(get_current_user)) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT setting_key, setting_value_json, updated_at
+                FROM user_settings
+                WHERE username = %s
+                ORDER BY setting_key ASC
+                """,
+                (current_user["username"],),
+            )
+            rows = cursor.fetchall() or []
+            return {"ok": True, "settings": rows}
+    finally:
+        connection.close()
+
+
+@app.post("/api/content")
+def create_content(
+    payload: ContentRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    record_content(
+        current_user["username"],
+        payload.content_type,
+        payload.title,
+        payload.subject,
+        payload.body_text,
+        payload.body_html,
+        payload.details,
+        user_id=int(current_user["id"]) if current_user.get("id") else None,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/content")
+def list_content(
+    content_type: str | None = None,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            params: list[Any] = [current_user["username"]]
+            type_clause = ""
+            if content_type:
+                type_clause = " AND content_type = %s"
+                params.append(content_type)
+            cursor.execute(
+                """
+                SELECT id, content_type, title, subject, body_text, body_html, details_json, created_at, updated_at
+                FROM content_library
+                WHERE username = %s
+                """ + type_clause + """
+                ORDER BY id DESC
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall() or []
+            return {"ok": True, "content": rows}
+    finally:
+        connection.close()
+
+
+@app.put("/api/content/{content_id}")
+def update_content(
+    content_id: int,
+    payload: ContentRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE content_library
+                SET content_type = %s,
+                    title = %s,
+                    subject = %s,
+                    body_text = %s,
+                    body_html = %s,
+                    details_json = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND username = %s
+                """,
+                (
+                    payload.content_type,
+                    payload.title,
+                    payload.subject,
+                    payload.body_text,
+                    payload.body_html,
+                    json.dumps(payload.details or {}, ensure_ascii=False),
+                    content_id,
+                    current_user["username"],
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content item not found.")
+    finally:
+        connection.close()
+    return {"ok": True}
+
+
+@app.delete("/api/content/{content_id}")
+def delete_content(
+    content_id: int,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM content_library WHERE id = %s AND username = %s",
+                (content_id, current_user["username"]),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content item not found.")
+    finally:
+        connection.close()
+    return {"ok": True}
 
 
 def ensure_api_server() -> None:
@@ -400,3 +923,97 @@ def login(username: str, password: str, timeout: float = 5.0) -> dict:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _authorized_request(
+    method: str,
+    path: str,
+    auth_token: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+    query: dict[str, Any] | None = None,
+) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    url = f"{API_BASE_URL}{path}"
+    if query:
+        from urllib.parse import urlencode
+
+        url = f"{url}?{urlencode(query)}"
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_settings(auth_token: str, timeout: float = 5.0) -> dict:
+    return _authorized_request("GET", "/api/settings", auth_token, timeout=timeout)
+
+
+def get_content(auth_token: str, timeout: float = 5.0, content_type: str | None = None) -> dict:
+    query = {"content_type": content_type} if content_type else None
+    return _authorized_request("GET", "/api/content", auth_token, timeout=timeout, query=query)
+
+
+def save_content(
+    auth_token: str,
+    content_type: str,
+    title: str,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    details: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+) -> dict:
+    return _authorized_request(
+        "POST",
+        "/api/content",
+        auth_token,
+        {
+            "content_type": content_type,
+            "title": title,
+            "subject": subject,
+            "body_text": body_text,
+            "body_html": body_html,
+            "details": details or {},
+        },
+        timeout=timeout,
+    )
+
+
+def update_content(
+    auth_token: str,
+    content_id: int,
+    content_type: str,
+    title: str,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    details: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+) -> dict:
+    return _authorized_request(
+        "PUT",
+        f"/api/content/{content_id}",
+        auth_token,
+        {
+            "content_id": content_id,
+            "content_type": content_type,
+            "title": title,
+            "subject": subject,
+            "body_text": body_text,
+            "body_html": body_html,
+            "details": details or {},
+        },
+        timeout=timeout,
+    )
+
+
+def delete_content(auth_token: str, content_id: int, timeout: float = 5.0) -> dict:
+    return _authorized_request("DELETE", f"/api/content/{content_id}", auth_token, timeout=timeout)

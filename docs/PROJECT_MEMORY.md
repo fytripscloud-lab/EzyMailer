@@ -7,8 +7,9 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 ## Current direction
 
 - Design first
-- Business logic later
+- Business logic is now being added in parallel
 - Gmail integration will use API-based authentication instead of direct password handling
+- Persistent audit storage is required for login history, browser sessions, content, settings, and activity logs
 - Keep all milestone decisions in markdown files for traceability
 
 ## UI goals
@@ -48,7 +49,7 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 
 ## Authentication placeholder
 
-- Temporary local login for design work
+- Local API login for development
 - Username: `admin`
 - Password: `admin`
-- Replace with API/OAuth flow in a later milestone
+- JWT bearer auth is used by the local API

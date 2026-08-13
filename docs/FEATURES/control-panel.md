@@ -7,26 +7,22 @@ Provide the left sidebar controls used to manage windows and browser sessions.
 ## Controls
 
 - Number of windows
-- Launch
-- Stop
+- Start Browser
+- Pause
 - Reset
 - Browser mode selector
 - Active sessions list
-- Default / Tile / Clear presets
-- Start Blast button
+- Default / Layout / Clear presets
+- Start Campaign button
 
 ## Launch presets
 
 - Default: restore the baseline launch preset for the current workspace
-- Tile: mark the launch as a tiled-window arrangement preset
+- Layout: mark the launch as a tiled-window arrangement preset
 - Clear: clear the selected launch preset back to none
 
 ## Notes
 
-- These presets are currently state and notification driven
-- The actual launch logic will use the preset selection later
-
-## Notes
-
-- This panel is design-first in the current milestone
-- Runtime window management will be implemented later
+- Browser sessions are now backed by live Chrome processes on macOS
+- Active sessions reflect the current browser state
+- Launch and preset changes are written to the local audit database

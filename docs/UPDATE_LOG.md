@@ -2,6 +2,11 @@
 
 ## 2026-08-13
 
+- Added live Chrome session launching for the browser control panel
+- Hid logout controls from the signed-out shell
+- Renamed the primary browser launch button to `Start Browser`
+- Added persistent audit tables for login history, browser sessions, settings, content, and activities
+- Added local API routes and Swagger documentation for the new audit and session data
 - Added a localhost login API for the desktop app
 - Created the MySQL-backed `ezymailer.user_db` table and seeded the `admin / admin` user
 - Switched the sign-in screen from hardcoded validation to API-based authentication
