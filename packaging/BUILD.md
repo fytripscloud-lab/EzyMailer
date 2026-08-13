@@ -1,25 +1,32 @@
-# Windows EXE Build
+# Build Packages
 
 ## Purpose
 
-Build the desktop app into a Windows executable using PyInstaller.
+Build the desktop app into platform-specific packages using PyInstaller.
 
 ## Prerequisites
 
-- Python 3.10+ installed on Windows
+- Python 3.10+ installed on the target platform
 - Internet access for first-time dependency installation
 
-## Build steps
+## Windows build steps
 
 1. Open a terminal in the project root.
 2. Run `build.bat`.
 3. Wait for `dist\EazyMailer.exe` to be created.
 
+## macOS build steps
+
+1. Open a terminal in the project root.
+2. Run `./build-macos.sh`.
+3. Wait for `dist/EzyMailer-macOS.dmg` to be created.
+
 ## Output
 
 - One-file executable: `dist\EazyMailer.exe`
+- Disk image: `dist/EzyMailer-macOS.dmg`
 
 ## Notes
 
-- The app currently depends on `PySide6`
-- The current environment does not include Python, so the executable cannot be produced here directly
+- The app depends on `PySide6`
+- macOS packaging creates a `.app` bundle first, then wraps it into a `.dmg`

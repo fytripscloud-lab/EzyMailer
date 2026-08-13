@@ -50,5 +50,5 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 
 - Temporary local login for design work
 - Username: `admin`
-- Password: `01010202`
+- Password: `admin`
 - Replace with API/OAuth flow in a later milestone

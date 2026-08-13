@@ -1,8 +1,24 @@
 ﻿import sys
 import html
+import json
+import ssl
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QDateTime, QEasingCurve, Property, QPropertyAnimation, QTimer, Qt, QEvent, QPoint
+from backend.local_api import API_BASE_URL, ensure_api_server, login as api_login
+from PySide6.QtCore import (
+    QDateTime,
+    QEasingCurve,
+    QObject,
+    Property,
+    QPropertyAnimation,
+    QTimer,
+    Qt,
+    QEvent,
+    QPoint,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,26 +57,141 @@ from PySide6.QtWidgets import (
 
 APP_TITLE = "EzyMailer"
 DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "01010202"
+DEFAULT_PASSWORD = "admin"
+IS_MAC = sys.platform == "darwin"
+
+
+def _scaled_int(value: float, scale: float, minimum: int = 1) -> int:
+    return max(minimum, int(round(value * scale)))
+
+
+def _compute_layout_scale(screen) -> float:
+    if screen is None:
+        return 1.00
+
+    geometry = screen.availableGeometry()
+    width_boost = max(0.0, (geometry.width() - 1280.0) / 8000.0)
+    height_boost = max(0.0, (geometry.height() - 768.0) / 8000.0)
+    scale = 1.0 + min(0.06, width_boost + height_boost)
+    return max(1.0, min(1.06, scale))
+
+
+def _compute_text_scale(screen) -> float:
+    if screen is None:
+        return 1.28
+
+    geometry = screen.availableGeometry()
+    width_boost = max(0.0, (geometry.width() - 1280.0) / 2200.0)
+    height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
+    scale = 1.28 + min(0.12, (width_boost + height_boost) * 0.8)
+    return max(1.28, min(1.40, scale))
 
 
 @dataclass
 class AppState:
     username: str = ""
     logged_in: bool = False
+    auth_token: str = ""
     browser_mode: str = "Incognito"
     window_count: int = 1
     launch_preset: str = "Default"
     active_sessions: list[str] = field(default_factory=lambda: ["Window 1 - Idle"])
     activity_log: list[str] = field(default_factory=list)
     body_mode: str = "Normal Message"
+    ai_provider: str = "ChatGPT"
+    ai_model: str = ""
+    ai_connected: bool = False
+
+
+class AIValidationWorker(QObject):
+    finished = Signal(str, list)
+    failed = Signal(str)
+
+    def __init__(self, provider: str, api_key: str):
+        super().__init__()
+        self.provider = provider
+        self.api_key = api_key
+
+    def run(self) -> None:
+        try:
+            models = self._fetch_models()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(self.provider, models)
+
+    def _fetch_models(self) -> list[str]:
+        provider = self.provider
+        context = self._ssl_context()
+        if provider == "Claude":
+            request = urllib.request.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "accept": "application/json",
+                },
+                method="GET",
+            )
+        elif provider == "DeepSeek":
+            request = urllib.request.Request(
+                "https://api.deepseek.com/models",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "accept": "application/json",
+                },
+                method="GET",
+            )
+        else:
+            request = urllib.request.Request(
+                "https://api.openai.com/v1/models",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "accept": "application/json",
+                },
+                method="GET",
+            )
+
+        with urllib.request.urlopen(request, timeout=20, context=context) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        return self._extract_model_ids(payload)
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    def _extract_model_ids(self, payload) -> list[str]:
+        models: list[str] = []
+        if isinstance(payload, dict):
+            entries = payload.get("data") or payload.get("models") or []
+        elif isinstance(payload, list):
+            entries = payload
+        else:
+            entries = []
+
+        for item in entries:
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("name") or item.get("model")
+                if model_id:
+                    models.append(str(model_id))
+
+        unique_models = list(dict.fromkeys(models))
+        if not unique_models:
+            raise ValueError("No models were returned by the provider.")
+        return unique_models
 
 
 class AnimatedLogoBadge(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self._pulse = 0.0
-        self.setFixedSize(40, 40)
+        self.setFixedSize(_scaled_int(40, self._scale), _scaled_int(40, self._scale))
         self._anim = QPropertyAnimation(self, b"pulse", self)
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
@@ -90,44 +221,128 @@ class AnimatedLogoBadge(QWidget):
         painter.setBrush(QColor("#2563eb"))
         painter.drawEllipse(self.rect().adjusted(5, 5, -5, -5))
 
-        painter.setPen(QPen(QColor("#67e8f9"), 1.4))
-        painter.drawLine(18, 10, 15, 19)
-        painter.drawLine(15, 19, 21, 19)
-        painter.drawLine(21, 19, 18, 29)
+        pen_width = max(1.0, 1.4 * self._scale)
+        painter.setPen(QPen(QColor("#67e8f9"), pen_width))
+        painter.drawLine(_scaled_int(18, self._scale), _scaled_int(10, self._scale), _scaled_int(15, self._scale), _scaled_int(19, self._scale))
+        painter.drawLine(_scaled_int(15, self._scale), _scaled_int(19, self._scale), _scaled_int(21, self._scale), _scaled_int(19, self._scale))
+        painter.drawLine(_scaled_int(21, self._scale), _scaled_int(19, self._scale), _scaled_int(18, self._scale), _scaled_int(29, self._scale))
 
         painter.setPen(QColor("#ffffff"))
-        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.setFont(QFont("Segoe UI", _scaled_int(10, self._scale), QFont.Bold))
         painter.drawText(self.rect(), Qt.AlignCenter, "EZ")
 
 
+class MacTrafficLightButton(QPushButton):
+    def __init__(self, kind: str, scale: float = 1.0, parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self._scale = scale
+        self._hover = False
+        self.setObjectName("macTrafficLightButton")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFlat(True)
+        self.setText("")
+        size = _scaled_int(14, self._scale)
+        self.setFixedSize(size, size)
+        self.setToolTip({
+            "close": "Close the window",
+            "minimize": "Minimize the window",
+            "maximize": "Maximize or restore the window",
+        }.get(kind, "Window control"))
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        colors = {
+            "close": QColor("#ff5f57"),
+            "minimize": QColor("#febc2e"),
+            "maximize": QColor("#28c840"),
+        }
+        base = colors.get(self._kind, QColor("#7a7a7a"))
+        if self._hover:
+            base = base.lighter(110)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(base)
+        painter.drawEllipse(self.rect().adjusted(0, 0, -1, -1))
+
+        if self._hover:
+            painter.setPen(QPen(QColor(0, 0, 0, 180), max(1, _scaled_int(1, self._scale))))
+            w = self.width()
+            h = self.height()
+            if self._kind == "close":
+                painter.drawLine(_scaled_int(4, self._scale), _scaled_int(4, self._scale), w - _scaled_int(4, self._scale), h - _scaled_int(4, self._scale))
+                painter.drawLine(w - _scaled_int(4, self._scale), _scaled_int(4, self._scale), _scaled_int(4, self._scale), h - _scaled_int(4, self._scale))
+            elif self._kind == "minimize":
+                painter.drawLine(_scaled_int(4, self._scale), h // 2, w - _scaled_int(4, self._scale), h // 2)
+            else:
+                painter.drawLine(_scaled_int(4, self._scale), h // 2, w - _scaled_int(4, self._scale), h // 2)
+                painter.drawLine(w // 2, _scaled_int(4, self._scale), w // 2, h - _scaled_int(4, self._scale))
+
+
 class TitleBar(QWidget):
-    def __init__(self, window, on_close):
+    def __init__(self, window, on_close, scale: float = 1.0):
         super().__init__()
         self._window = window
         self._on_close = on_close
         self._drag_pos = None
         self._is_maximized = False
+        self._scale = scale
         self.setObjectName("topBar")
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
+        if IS_MAC:
+            layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(1, self._scale), _scaled_int(8, self._scale), _scaled_int(1, self._scale))
+            layout.setSpacing(_scaled_int(4, self._scale))
+        else:
+            layout.setContentsMargins(_scaled_int(4, self._scale), _scaled_int(2, self._scale), _scaled_int(4, self._scale), _scaled_int(2, self._scale))
+            layout.setSpacing(_scaled_int(6, self._scale))
+
+        controls = None
+        if IS_MAC:
+            controls = QHBoxLayout()
+            controls.setSpacing(_scaled_int(5, self._scale))
+            self.close_button = MacTrafficLightButton("close", self._scale)
+            self.close_button.clicked.connect(self._on_close)
+            self.minimize_button = MacTrafficLightButton("minimize", self._scale)
+            self.minimize_button.clicked.connect(self._window.showMinimized)
+            self.maximize_button = MacTrafficLightButton("maximize", self._scale)
+            self.maximize_button.clicked.connect(self._toggle_maximize)
+            controls.addWidget(self.close_button)
+            controls.addWidget(self.minimize_button)
+            controls.addWidget(self.maximize_button)
+            controls.addSpacing(_scaled_int(6, self._scale))
 
         brand = QHBoxLayout()
-        brand.setSpacing(6)
-        self.logo = AnimatedLogoBadge()
+        brand.setSpacing(_scaled_int(6, self._scale))
+        self.logo = AnimatedLogoBadge(scale=self._scale)
         title_block = QVBoxLayout()
         title_block.setSpacing(0)
         title = QLabel("EzyMailer")
         title.setObjectName("brandTitle")
-        subtitle = QLabel("Modern enterprise workspace for Gmail automation")
+        subtitle = QLabel("Desktop workspace for email automation")
         subtitle.setObjectName("brandSubtitle")
-        title_block.addWidget(title)
-        title_block.addWidget(subtitle)
-        brand.addWidget(self.logo)
-        brand.addLayout(title_block)
+        if IS_MAC:
+            title.setStyleSheet("font-weight: 800;")
+            brand.addWidget(title)
+        else:
+            title_block.addWidget(title)
+            title_block.addWidget(subtitle)
+            brand.addWidget(self.logo)
+            brand.addLayout(title_block)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -137,50 +352,60 @@ class TitleBar(QWidget):
         self.status_badge = QLabel("LOCKED")
         self.status_badge.setObjectName("statusBadge")
         for badge in (version_badge, self.status_badge):
-            badge.setFixedHeight(28)
-            badge.setMinimumWidth(64)
+            badge.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
+            badge.setMinimumWidth(_scaled_int(58 if IS_MAC else 64, self._scale))
             badge.setAlignment(Qt.AlignCenter)
         version_badge.setToolTip("Application version")
         self.status_badge.setToolTip("Current login status")
+        if IS_MAC:
+            version_badge.hide()
+            self.status_badge.hide()
 
-        self.minimize_button = QPushButton("−")
-        self.minimize_button.setObjectName("windowControlButton")
-        self.minimize_button.setFixedSize(28, 28)
-        self.minimize_button.clicked.connect(self._window.showMinimized)
-        self.minimize_button.setToolTip("Minimize window")
-        self.maximize_button = QPushButton("▢")
-        self.maximize_button.setObjectName("windowControlButton")
-        self.maximize_button.setFixedSize(28, 28)
-        self.maximize_button.clicked.connect(self._toggle_maximize)
-        self.maximize_button.setToolTip("Maximize or restore window")
         self.logout_button = QPushButton("Logout")
         self.logout_button.setObjectName("secondaryButton")
-        self.logout_button.setFixedHeight(28)
-        self.logout_button.setMinimumWidth(64)
+        self.logout_button.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
+        self.logout_button.setMinimumWidth(_scaled_int(58 if IS_MAC else 64, self._scale))
         self.logout_button.setToolTip("Sign out and return to login")
 
-        close_button = QPushButton("✕")
-        close_button.setObjectName("closeButton")
-        close_button.setFixedSize(28, 28)
-        close_button.setText("✕")
-        close_button.clicked.connect(self._on_close)
-        close_button.setToolTip("Close application")
+        if not IS_MAC:
+            self.minimize_button = QPushButton("−")
+            self.minimize_button.setObjectName("windowControlButton")
+            self.minimize_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
+            self.minimize_button.clicked.connect(self._window.showMinimized)
+            self.minimize_button.setToolTip("Minimize window")
+            self.maximize_button = QPushButton("▢")
+            self.maximize_button.setObjectName("windowControlButton")
+            self.maximize_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
+            self.maximize_button.clicked.connect(self._toggle_maximize)
+            self.maximize_button.setToolTip("Maximize or restore window")
+            self.close_button = QPushButton("✕")
+            self.close_button.setObjectName("closeButton")
+            self.close_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
+            self.close_button.setText("✕")
+            self.close_button.clicked.connect(self._on_close)
+            self.close_button.setToolTip("Close application")
 
+        if controls is not None:
+            layout.addLayout(controls)
         layout.addLayout(brand)
         layout.addWidget(spacer)
-        layout.addWidget(version_badge)
-        layout.addWidget(self.status_badge)
-        layout.addWidget(self.minimize_button)
-        layout.addWidget(self.maximize_button)
+        if not IS_MAC:
+            layout.addWidget(version_badge)
+            layout.addWidget(self.status_badge)
+        if not IS_MAC:
+            layout.addWidget(self.minimize_button)
+            layout.addWidget(self.maximize_button)
         layout.addWidget(self.logout_button)
-        layout.addWidget(close_button)
+        if not IS_MAC:
+            layout.addWidget(self.close_button)
 
     def set_state(self, username: str, logged_in: bool) -> None:
         self.status_badge.setText("READY" if logged_in else "LOCKED")
 
     def sync_window_state(self) -> None:
         self._is_maximized = self._window.isMaximized()
-        self.maximize_button.setText("❐" if self._is_maximized else "▢")
+        if not IS_MAC:
+            self.maximize_button.setText("❐" if self._is_maximized else "▢")
 
     def _toggle_maximize(self) -> None:
         if self._window.isMaximized():
@@ -213,13 +438,14 @@ class TitleBar(QWidget):
 
 
 class Toast(QFrame):
-    def __init__(self, parent: QWidget, message: str, kind: str = "info"):
+    def __init__(self, parent: QWidget, message: str, kind: str = "info", scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self.setObjectName("toast")
         self.setProperty("kind", kind)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowFlags(Qt.SubWindow | Qt.FramelessWindowHint)
-        self.setFixedWidth(360)
+        self.setFixedWidth(_scaled_int(360, self._scale))
         self._effect = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._effect)
         self._effect.setOpacity(0.0)
@@ -242,12 +468,12 @@ class Toast(QFrame):
 
     def _build_ui(self, message: str, kind: str) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(8, self._scale), _scaled_int(12, self._scale), _scaled_int(8, self._scale))
+        layout.setSpacing(_scaled_int(8, self._scale))
 
         icon = QLabel("●")
         icon.setObjectName("toastIcon")
-        icon.setFixedSize(14, 14)
+        icon.setFixedSize(_scaled_int(14, self._scale), _scaled_int(14, self._scale))
         icon.setAlignment(Qt.AlignCenter)
         if kind == "warning":
             icon.setText("!")
@@ -275,11 +501,12 @@ class Toast(QFrame):
 
 
 class RobotLoaderBadge(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self._pulse = 0.0
         self._blink = False
-        self.setFixedSize(104, 104)
+        self.setFixedSize(_scaled_int(104, self._scale), _scaled_int(104, self._scale))
         self._pulse_anim = QPropertyAnimation(self, b"pulse", self)
         self._pulse_anim.setStartValue(0.0)
         self._pulse_anim.setEndValue(1.0)
@@ -314,34 +541,35 @@ class RobotLoaderBadge(QWidget):
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(14, 99, 156, int(34 + pulse * 60)))
-        painter.drawEllipse(rect.adjusted(4, 4, -4, -4))
+        inset = _scaled_int(4, self._scale)
+        painter.drawEllipse(rect.adjusted(inset, inset, -inset, -inset))
 
         # antenna
         painter.setPen(QPen(QColor("#8bd5ff"), 2))
-        painter.drawLine(rect.center().x(), 10, rect.center().x(), 24)
+        painter.drawLine(rect.center().x(), _scaled_int(10, self._scale), rect.center().x(), _scaled_int(24, self._scale))
         painter.setBrush(QColor("#f9fafb"))
-        painter.drawEllipse(rect.center().x() - 4, 6, 8, 8)
+        painter.drawEllipse(rect.center().x() - _scaled_int(4, self._scale), _scaled_int(6, self._scale), _scaled_int(8, self._scale), _scaled_int(8, self._scale))
 
         # head
-        head = rect.adjusted(18, 24, -18, -24)
+        head = rect.adjusted(_scaled_int(18, self._scale), _scaled_int(24, self._scale), -_scaled_int(18, self._scale), -_scaled_int(24, self._scale))
         painter.setBrush(QColor("#2d2d30"))
         painter.setPen(QPen(QColor("#4b4b4b"), 1))
         painter.drawRoundedRect(head, 18, 18)
 
         # eyes
-        eye_y = head.center().y() - 10
+        eye_y = head.center().y() - _scaled_int(10, self._scale)
         eye_color = QColor("#9cdcfe") if not self._blink else QColor("#3a3d41")
         painter.setBrush(eye_color)
         painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(head.center().x() - 19, eye_y, 12, 12, 4, 4)
-        painter.drawRoundedRect(head.center().x() + 7, eye_y, 12, 12, 4, 4)
+        painter.drawRoundedRect(head.center().x() - _scaled_int(19, self._scale), eye_y, _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(4, self._scale), _scaled_int(4, self._scale))
+        painter.drawRoundedRect(head.center().x() + _scaled_int(7, self._scale), eye_y, _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(4, self._scale), _scaled_int(4, self._scale))
 
         # mouth / badge line
         painter.setBrush(QColor("#0e639c"))
-        painter.drawRoundedRect(head.center().x() - 18, head.center().y() + 10, 36, 8, 4, 4)
+        painter.drawRoundedRect(head.center().x() - _scaled_int(18, self._scale), head.center().y() + _scaled_int(10, self._scale), _scaled_int(36, self._scale), _scaled_int(8, self._scale), _scaled_int(4, self._scale), _scaled_int(4, self._scale))
 
         # body
-        body = rect.adjusted(30, 56, -30, -16)
+        body = rect.adjusted(_scaled_int(30, self._scale), _scaled_int(56, self._scale), -_scaled_int(30, self._scale), -_scaled_int(16, self._scale))
         painter.setBrush(QColor("#1e1e1e"))
         painter.setPen(QPen(QColor("#3c3c3c"), 1))
         painter.drawRoundedRect(body, 10, 10)
@@ -352,8 +580,9 @@ class RobotLoaderBadge(QWidget):
 
 
 class LaunchLoaderDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self.setModal(False)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -362,25 +591,25 @@ class LaunchLoaderDialog(QDialog):
         self._build_ui()
 
         self._dot_timer = QTimer(self)
-        self._dot_timer.setInterval(260)
+        self._dot_timer.setInterval(_scaled_int(260, self._scale))
         self._dot_timer.timeout.connect(self._animate_dots)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(_scaled_int(24, self._scale), _scaled_int(24, self._scale), _scaled_int(24, self._scale), _scaled_int(24, self._scale))
         root.setSpacing(0)
 
         root.addStretch()
 
         card = QFrame()
         card.setObjectName("loaderCard")
-        card.setFixedWidth(360)
+        card.setFixedWidth(_scaled_int(360, self._scale))
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(18, 18, 18, 18)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(_scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale))
+        card_layout.setSpacing(_scaled_int(10, self._scale))
         card_layout.setAlignment(Qt.AlignCenter)
 
-        self.robot = RobotLoaderBadge()
+        self.robot = RobotLoaderBadge(scale=self._scale)
         self.loader_title = QLabel("Launching browser windows")
         self.loader_title.setObjectName("loaderTitle")
         self.loader_title.setAlignment(Qt.AlignCenter)
@@ -422,8 +651,9 @@ class LaunchLoaderDialog(QDialog):
 
 
 class ConfirmDialog(QDialog):
-    def __init__(self, parent: QWidget, title: str, message: str):
+    def __init__(self, parent: QWidget, title: str, message: str, scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setObjectName("confirmDialog")
@@ -431,14 +661,14 @@ class ConfirmDialog(QDialog):
 
     def _build_ui(self, title: str, message: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(_scaled_int(16, self._scale), _scaled_int(16, self._scale), _scaled_int(16, self._scale), _scaled_int(16, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
 
         card = QFrame()
         card.setObjectName("confirmCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 16, 16, 16)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(_scaled_int(16, self._scale), _scaled_int(16, self._scale), _scaled_int(16, self._scale), _scaled_int(16, self._scale))
+        card_layout.setSpacing(_scaled_int(10, self._scale))
 
         title_label = QLabel(title)
         title_label.setObjectName("confirmTitle")
@@ -472,43 +702,44 @@ class ConfirmDialog(QDialog):
 
 
 class OutputOptionsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
-        self.setWindowTitle("Output File Options")
+        self._scale = scale
+        self.setWindowTitle("Export Options")
         self.setModal(True)
         self.setObjectName("outputDialog")
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
 
-        layout.addWidget(self._dialog_card("OUTPUT FORMAT", [
-            "PDF Document",
-            "Excel Spreadsheet (XLSX)",
-            "Excel Template (XLTX)",
-            "PowerPoint Presentation (PPTX)",
-            "PowerPoint Slideshow (PPSX)",
-            "Word Document (DOCX)",
+        layout.addWidget(self._dialog_card("EXPORT FORMAT", [
+            "PDF document",
+            "Excel spreadsheet (XLSX)",
+            "Excel template (XLTX)",
+            "PowerPoint presentation (PPTX)",
+            "PowerPoint slideshow (PPSX)",
+            "Word document (DOCX)",
         ]))
 
         file_card = QFrame()
         file_card.setObjectName("dialogCard")
         file_layout = QVBoxLayout(file_card)
-        file_layout.setContentsMargins(12, 12, 12, 12)
-        file_layout.setSpacing(8)
-        title = QLabel("OUTPUT FILENAME")
+        file_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        file_layout.setSpacing(_scaled_int(8, self._scale))
+        title = QLabel("FILE NAME")
         title.setObjectName("sectionTitle")
         file_layout.addWidget(title)
 
-        self.auto_name = QRadioButton("Auto-generated (random unique name)")
-        self.custom_name = QRadioButton("Custom name:")
+        self.auto_name = QRadioButton("Auto-generate a unique name")
+        self.custom_name = QRadioButton("Use a custom name:")
         self.auto_name.setChecked(True)
         file_layout.addWidget(self.auto_name)
         custom_row = QHBoxLayout()
         self.custom_name_input = QLineEdit()
-        self.custom_name_input.setPlaceholderText("Custom name")
+        self.custom_name_input.setPlaceholderText("Enter file name")
         custom_row.addWidget(self.custom_name)
         custom_row.addWidget(self.custom_name_input, 1)
         custom_row.addWidget(QLabel(".pptx"))
@@ -518,13 +749,13 @@ class OutputOptionsDialog(QDialog):
         image_card = QFrame()
         image_card.setObjectName("dialogCard")
         image_layout = QVBoxLayout(image_card)
-        image_layout.setContentsMargins(12, 12, 12, 12)
-        image_layout.setSpacing(8)
+        image_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        image_layout.setSpacing(_scaled_int(8, self._scale))
         image_title = QLabel("IMAGE")
         image_title.setObjectName("sectionTitle")
         image_layout.addWidget(image_title)
-        image_layout.addWidget(QLabel("Image format used to capture the page before the document is built."))
-        image_layout.addWidget(QLabel("Supported reference formats: PNG, JPG, WEBP"))
+        image_layout.addWidget(QLabel("Image format used to capture the preview before export."))
+        image_layout.addWidget(QLabel("Supported formats: PNG, JPG, WEBP"))
         layout.addWidget(image_card)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
@@ -547,8 +778,8 @@ class OutputOptionsDialog(QDialog):
         card = QFrame()
         card.setObjectName("dialogCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(12, 12, 12, 12)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        card_layout.setSpacing(_scaled_int(8, self._scale))
         title_label = QLabel(title)
         title_label.setObjectName("sectionTitle")
         card_layout.addWidget(title_label)
@@ -558,8 +789,9 @@ class OutputOptionsDialog(QDialog):
 
 
 class HtmlPreviewDialog(QDialog):
-    def __init__(self, parent: QWidget, title: str, html: str, source_label: str = ""):
+    def __init__(self, parent: QWidget, title: str, html: str, source_label: str = "", scale: float = 1.0):
         super().__init__(parent)
+        self._scale = scale
         self.setModal(False)
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.setObjectName("previewDialog")
@@ -569,14 +801,14 @@ class HtmlPreviewDialog(QDialog):
 
     def _build_ui(self, title: str, source_label: str, html: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
 
         card = QFrame()
         card.setObjectName("previewCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(14, 14, 14, 14)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        card_layout.setSpacing(_scaled_int(10, self._scale))
 
         header_row = QHBoxLayout()
         title_label = QLabel(title)
@@ -585,13 +817,13 @@ class HtmlPreviewDialog(QDialog):
         header_row.addStretch()
         reload_button = QPushButton("Reload")
         reload_button.setObjectName("secondaryButton")
-        reload_button.setFixedHeight(28)
+        reload_button.setFixedHeight(_scaled_int(28, self._scale))
         reload_button.setToolTip("Reload the preview from the current HTML source")
         reload_button.clicked.connect(self._reload_preview)
 
         source_button = QPushButton("Source")
         source_button.setObjectName("secondaryButton")
-        source_button.setFixedHeight(28)
+        source_button.setFixedHeight(_scaled_int(28, self._scale))
         source_button.setCheckable(True)
         source_button.setToolTip("Show or hide the raw HTML source")
         source_button.clicked.connect(self._toggle_source_view)
@@ -599,19 +831,19 @@ class HtmlPreviewDialog(QDialog):
 
         zoom_out_button = QPushButton("A-")
         zoom_out_button.setObjectName("secondaryButton")
-        zoom_out_button.setFixedHeight(28)
+        zoom_out_button.setFixedHeight(_scaled_int(28, self._scale))
         zoom_out_button.setToolTip("Zoom out the rendered preview")
         zoom_out_button.clicked.connect(lambda: self._zoom_preview(-1))
 
         zoom_reset_button = QPushButton("100%")
         zoom_reset_button.setObjectName("secondaryButton")
-        zoom_reset_button.setFixedHeight(28)
+        zoom_reset_button.setFixedHeight(_scaled_int(28, self._scale))
         zoom_reset_button.setToolTip("Reset the preview zoom level")
         zoom_reset_button.clicked.connect(self._reset_zoom)
 
         zoom_in_button = QPushButton("A+")
         zoom_in_button.setObjectName("secondaryButton")
-        zoom_in_button.setFixedHeight(28)
+        zoom_in_button.setFixedHeight(_scaled_int(28, self._scale))
         zoom_in_button.setToolTip("Zoom in the rendered preview")
         zoom_in_button.clicked.connect(lambda: self._zoom_preview(1))
 
@@ -620,7 +852,7 @@ class HtmlPreviewDialog(QDialog):
 
         close_button = QPushButton("Close")
         close_button.setObjectName("secondaryButton")
-        close_button.setFixedHeight(28)
+        close_button.setFixedHeight(_scaled_int(28, self._scale))
         close_button.clicked.connect(self.close)
         header_row.addWidget(close_button)
         card_layout.addLayout(header_row)
@@ -644,11 +876,11 @@ class HtmlPreviewDialog(QDialog):
         self.source_view.setReadOnly(True)
         self.source_view.setPlainText(html)
         self.source_view.setVisible(False)
-        self.source_view.setMinimumHeight(180)
+        self.source_view.setMinimumHeight(_scaled_int(180, self._scale))
         card_layout.addWidget(self.source_view)
 
         layout.addWidget(card)
-        self.resize(920, 680)
+        self.resize(_scaled_int(920, self._scale), _scaled_int(680, self._scale))
 
     def _reload_preview(self) -> None:
         self.preview_browser.setHtml(self._source_html)
@@ -682,38 +914,40 @@ class HtmlPreviewDialog(QDialog):
             )
 
 class LoginPage(QWidget):
-    def __init__(self, on_login):
+    def __init__(self, on_login, scale: float = 1.0):
         super().__init__()
         self.on_login = on_login
+        self._scale = scale
         self.username_input = QLineEdit()
         self.password_input = QLineEdit()
         self.error_label = QLabel("")
+        self.login_button = QPushButton("Sign In")
         self._build_ui()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
+        root.setContentsMargins(_scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale))
         root.setSpacing(0)
 
         root.addStretch()
 
         shell = QFrame()
         shell.setObjectName("loginShell")
-        shell.setMaximumWidth(480)
+        shell.setMaximumWidth(_scaled_int(480, self._scale))
         shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(22, 22, 22, 22)
-        shell_layout.setSpacing(12)
+        shell_layout.setContentsMargins(_scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale))
+        shell_layout.setSpacing(_scaled_int(12, self._scale))
 
         header = QHBoxLayout()
-        header.setSpacing(10)
-        logo = AnimatedLogoBadge()
-        logo.setFixedSize(48, 48)
+        header.setSpacing(_scaled_int(10, self._scale))
+        logo = AnimatedLogoBadge(scale=self._scale)
+        logo.setFixedSize(_scaled_int(48, self._scale), _scaled_int(48, self._scale))
 
         title_block = QVBoxLayout()
         title_block.setSpacing(0)
         brand = QLabel("EzyMailer")
         brand.setObjectName("loginAppName")
-        kicker = QLabel("Gmail automation workspace")
+        kicker = QLabel("Desktop email automation workspace")
         kicker.setObjectName("loginKicker")
         title_block.addWidget(brand)
         title_block.addWidget(kicker)
@@ -726,7 +960,7 @@ class LoginPage(QWidget):
         intro.setObjectName("loginTitle")
         intro.setAlignment(Qt.AlignCenter)
 
-        subtitle = QLabel("Temporary local access for the current design milestone.")
+        subtitle = QLabel("Local access for this build only.")
         subtitle.setObjectName("loginSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
@@ -752,13 +986,12 @@ class LoginPage(QWidget):
         self.error_label.setWordWrap(True)
         self.error_label.setAlignment(Qt.AlignCenter)
 
-        login_button = QPushButton("Sign In")
-        login_button.setObjectName("primaryButton")
-        login_button.setMinimumHeight(38)
-        login_button.clicked.connect(lambda: self._attempt_login())
-        login_button.setToolTip("Authenticate and open the workspace")
+        self.login_button.setObjectName("primaryButton")
+        self.login_button.setMinimumHeight(_scaled_int(38, self._scale))
+        self.login_button.clicked.connect(lambda: self._attempt_login())
+        self.login_button.setToolTip("Authenticate and open the workspace")
 
-        footer = QLabel("Local credentials: admin / 01010202")
+        footer = QLabel("Local login: admin / admin")
         footer.setObjectName("loginHint")
         footer.setAlignment(Qt.AlignCenter)
         footer.setWordWrap(True)
@@ -768,7 +1001,7 @@ class LoginPage(QWidget):
         shell_layout.addWidget(subtitle)
         shell_layout.addLayout(form)
         shell_layout.addWidget(self.error_label)
-        shell_layout.addWidget(login_button)
+        shell_layout.addWidget(self.login_button)
         shell_layout.addWidget(footer)
 
         root.addWidget(shell, alignment=Qt.AlignHCenter)
@@ -777,30 +1010,65 @@ class LoginPage(QWidget):
         self.username_input.returnPressed.connect(self._attempt_login)
         self.password_input.returnPressed.connect(self._attempt_login)
 
+    def _set_busy(self, busy: bool) -> None:
+        self.username_input.setEnabled(not busy)
+        self.password_input.setEnabled(not busy)
+        self.login_button.setEnabled(not busy)
+        self.login_button.setText("Signing In..." if busy else "Sign In")
+        if busy:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            QApplication.restoreOverrideCursor()
+
     def _attempt_login(self) -> None:
         username = self.username_input.text().strip()
         password = self.password_input.text()
 
-        if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
-            self.error_label.setText("")
-            self.on_login(username)
+        if not username or not password:
+            self.error_label.setText("Please enter both a username and password.")
             return
 
-        self.error_label.setText("Invalid username or password.")
+        self.error_label.setText("")
+        self._set_busy(True)
+        QApplication.processEvents()
+        try:
+            payload = api_login(username, password, timeout=5.0)
+        except urllib.error.HTTPError as exc:
+            message = "The username or password is incorrect."
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", message))
+            except Exception:
+                pass
+            self.error_label.setText(message)
+            return
+        except Exception:
+            self.error_label.setText("Unable to reach the local login API.")
+            return
+        finally:
+            self._set_busy(False)
+
+        if not payload.get("ok"):
+            self.error_label.setText(str(payload.get("error", "Login failed.")))
+            return
+
+        user = payload.get("user") or {}
+        self.on_login(str(user.get("username", username)), str(payload.get("access_token", "")))
 
 
 class DashboardPage(QWidget):
-    def __init__(self, state: AppState, on_logout, notify):
+    def __init__(self, state: AppState, on_logout, notify, scale: float = 1.0):
         super().__init__()
         self.state = state
         self.on_logout = on_logout
         self.notify = notify
+        self._scale = scale
         self.session_list = QListWidget()
         self.window_spin = QSpinBox()
         self.incognito_button = QPushButton("Incognito")
-        self.normal_button = QPushButton("Normal Mode")
-        self.normal_message_button = QPushButton("Normal Message")
-        self.html_message_button = QPushButton("HTML Message")
+        self.normal_button = QPushButton("Normal mode")
+        self.normal_message_button = QPushButton("Plain text")
+        self.html_message_button = QPushButton("HTML")
         self.data_summary_labels: dict[str, QLabel] = {}
         self.pending_emails_editor = QTextEdit()
         self.subject_input = QLineEdit()
@@ -820,6 +1088,12 @@ class DashboardPage(QWidget):
         self.delay_from = QDoubleSpinBox()
         self.delay_to = QDoubleSpinBox()
         self.retry_count = QSpinBox()
+        self.ai_provider_combo = QComboBox()
+        self.ai_api_key_input = QLineEdit()
+        self.ai_connect_button = QPushButton("Connect")
+        self.ai_status_label = QLabel("Not connected")
+        self.ai_model_combo = QComboBox()
+        self._available_ai_models: list[str] = []
         self.window_mode_group = QButtonGroup(self)
         self.delay_type_group = QButtonGroup(self)
         self.send_order_group = QButtonGroup(self)
@@ -902,14 +1176,14 @@ class DashboardPage(QWidget):
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(300)
-        sidebar.setMaximumWidth(320)
+        sidebar.setMinimumWidth(_scaled_int(300, self._scale))
+        sidebar.setMaximumWidth(_scaled_int(320, self._scale))
 
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
 
-        launch_card, launch_layout = self._card("Browser Launch Controls")
+        launch_card, launch_layout = self._card("Browser Session Controls")
         self.window_spin.setRange(1, 99)
         self.window_spin.setValue(self.state.window_count)
         self.window_spin.setObjectName("windowSpin")
@@ -921,7 +1195,7 @@ class DashboardPage(QWidget):
         launch_button = QPushButton("Start")
         launch_button.setObjectName("primaryButton")
         launch_button.clicked.connect(lambda: self._handle_launch())
-        launch_button.setToolTip("Start the browser session workflow")
+        launch_button.setToolTip("Start the browser session flow")
 
         pause_button = QPushButton("Pause")
         pause_button.setObjectName("warningButton")
@@ -933,7 +1207,7 @@ class DashboardPage(QWidget):
         reset_button.clicked.connect(lambda: self._handle_reset())
         reset_button.setToolTip("Reset all launch and session settings")
 
-        launch_layout.addWidget(self._labeled_value_row("Number of Windows", self.window_spin))
+        launch_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
         launch_row.addWidget(launch_button)
         launch_row.addWidget(pause_button)
         launch_row.addWidget(reset_button)
@@ -963,7 +1237,7 @@ class DashboardPage(QWidget):
         preset_row.addStretch()
         launch_layout.addLayout(preset_row)
 
-        mode_card, mode_layout = self._card("Browser Mode", "Choose how sessions should launch.")
+        mode_card, mode_layout = self._card("Browser Mode", "Choose how sessions should open.")
         mode_group = QButtonGroup(self)
         mode_group.setExclusive(True)
         self._configure_segmented_button(self.incognito_button, checked=True)
@@ -972,26 +1246,26 @@ class DashboardPage(QWidget):
         mode_group.addButton(self.normal_button)
         self.incognito_button.clicked.connect(lambda: self._set_browser_mode("Incognito"))
         self.normal_button.clicked.connect(lambda: self._set_browser_mode("Normal"))
-        self.incognito_button.setToolTip("Launch windows in private browsing mode")
-        self.normal_button.setToolTip("Launch windows in normal browsing mode")
+        self.incognito_button.setToolTip("Open windows in private browsing mode")
+        self.normal_button.setToolTip("Open windows in normal browsing mode")
         mode_row = QHBoxLayout()
         mode_row.addWidget(self.incognito_button)
         mode_row.addWidget(self.normal_button)
         mode_layout.addLayout(mode_row)
 
-        sessions_card, sessions_layout = self._card("Active Sessions", "Current browser windows and their state.")
+        sessions_card, sessions_layout = self._card("Active Sessions", "Open browser windows and their current state.")
         self.session_list.setObjectName("sessionList")
         self.session_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         sessions_layout.addWidget(self.session_list)
 
-        activity_card, activity_layout = self._card("Activity Log", "Recent automation events.")
+        activity_card, activity_layout = self._card("Activity Log", "Recent actions and workflow updates.")
         self.activity_log_view.setObjectName("activityList")
         self.activity_log_view.setReadOnly(True)
         self.activity_log_view.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.activity_log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         activity_layout.addWidget(self.activity_log_view)
 
-        blast_button = QPushButton("Start Blast")
+        blast_button = QPushButton("Start Campaign")
         blast_button.setObjectName("blastButton")
         blast_button.clicked.connect(lambda: self._start_blast())
         blast_button.setToolTip("Start the main send workflow")
@@ -1008,25 +1282,25 @@ class DashboardPage(QWidget):
         content = QFrame()
         content.setObjectName("contentArea")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(8, self._scale), _scaled_int(8, self._scale), _scaled_int(8, self._scale))
+        layout.setSpacing(_scaled_int(8, self._scale))
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
         self.tabs.addTab(self._build_data_tab(), "Data")
-        self.tabs.addTab(self._build_subject_body_tab(), "Subject+Body")
+        self.tabs.addTab(self._build_subject_body_tab(), "Subject + Body")
         self.tabs.addTab(self._build_html_content_tab(), "Content")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
-        self.tabs.addTab(self._build_blaster_tab(), "Blaster")
         self.tabs.addTab(self._build_tags_tab(), "Tags")
+        self.tabs.addTab(self._build_blaster_tab(), "Campaign")
         for index, tip in enumerate(
             [
                 "Customer database and pending email list",
-                "Subject and body composition",
+                "Subject and message composition",
                 "HTML content and attachment setup",
                 "Sending and runtime settings",
-                "Launch and progress controls",
                 "Dynamic tag management",
+                "Launch and progress controls",
             ]
         ):
             self.tabs.setTabToolTip(index, tip)
@@ -1037,26 +1311,26 @@ class DashboardPage(QWidget):
     def _build_data_tab(self) -> QWidget:
         page = QWidget()
         page_layout = QVBoxLayout(page)
-        page_layout.setSpacing(10)
+        page_layout.setSpacing(_scaled_int(10, self._scale))
 
         header = self._section_title("CUSTOMER EMAILS")
         page_layout.addWidget(header)
 
         self.pending_emails_editor.setPlaceholderText("Paste email addresses here, one per line...")
         self.pending_emails_editor.setObjectName("bodyEditor")
-        self.pending_emails_editor.setMinimumHeight(360)
+        self.pending_emails_editor.setMinimumHeight(_scaled_int(360, self._scale))
         self.pending_emails_editor.setToolTip("Paste recipient email addresses, one per line")
         page_layout.addWidget(self.pending_emails_editor, 1)
 
         filter_card, filter_layout = self._card(
-            "EMAIL DOMAIN FILTER", "Choose whether to accept only Gmail addresses or all aliases."
+            "EMAIL DOMAIN FILTER", "Choose whether to accept only Gmail addresses or allow all domains and aliases."
         )
         filter_row = QHBoxLayout()
-        self.standard_email_radio = QRadioButton("Standard Email (@gmail.com only)")
-        self.mix_email_radio = QRadioButton("Mix Email (All Domains & Aliases)")
+        self.standard_email_radio = QRadioButton("Gmail only (@gmail.com)")
+        self.mix_email_radio = QRadioButton("All domains and aliases")
         self.standard_email_radio.setChecked(True)
         self.standard_email_radio.setToolTip("Accept only Gmail addresses")
-        self.mix_email_radio.setToolTip("Allow Gmail and alias domains")
+        self.mix_email_radio.setToolTip("Allow all domains and aliases")
         filter_row.addWidget(self.standard_email_radio)
         filter_row.addWidget(self.mix_email_radio)
         filter_row.addStretch()
@@ -1067,11 +1341,11 @@ class DashboardPage(QWidget):
         load_button.setObjectName("secondaryButton")
         clear_button = QPushButton("Clear List")
         clear_button.setObjectName("secondaryButton")
-        validate_button = QPushButton("Validate & Count")
+        validate_button = QPushButton("Validate and Count")
         validate_button.setObjectName("primaryButton")
         load_button.setToolTip("Load recipient emails from a file")
         clear_button.setToolTip("Clear the current recipient list")
-        validate_button.setToolTip("Validate emails and count the results")
+        validate_button.setToolTip("Validate the list and count the results")
         load_button.clicked.connect(lambda: self._log_action("Loaded pending emails from file"))
         clear_button.clicked.connect(lambda: self._clear_pending_emails())
         validate_button.clicked.connect(lambda: self._log_action("Validated email list"))
@@ -1089,7 +1363,7 @@ class DashboardPage(QWidget):
             card = QFrame()
             card.setObjectName("miniStat")
             card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(10, 8, 10, 8)
+            card_layout.setContentsMargins(_scaled_int(10, self._scale), _scaled_int(8, self._scale), _scaled_int(10, self._scale), _scaled_int(8, self._scale))
             stat_label = QLabel(label_text)
             stat_label.setObjectName("miniStatLabel")
             card_layout.addWidget(stat_label)
@@ -1104,9 +1378,9 @@ class DashboardPage(QWidget):
     def _build_subject_body_tab(self) -> QWidget:
         page = QWidget()
         page_layout = QVBoxLayout(page)
-        page_layout.setSpacing(10)
+        page_layout.setSpacing(_scaled_int(10, self._scale))
 
-        window_card, window_layout = self._card("SUBJECT + BODY", "Compose message content for the selected window.")
+        window_card, window_layout = self._card("SUBJECT + BODY", "Compose the message for the selected window.")
         window_pill = QLabel("Window 1")
         window_pill.setObjectName("windowPill")
         window_layout.addWidget(window_pill)
@@ -1124,7 +1398,7 @@ class DashboardPage(QWidget):
 
         mode_row = QHBoxLayout()
         mode_row.setSpacing(8)
-        mode_label = QLabel("Message Body")
+        mode_label = QLabel("Message type")
         mode_label.setObjectName("fieldLabel")
         self._configure_segmented_button(self.normal_message_button, checked=True)
         self._configure_segmented_button(self.html_message_button)
@@ -1135,7 +1409,7 @@ class DashboardPage(QWidget):
         self.normal_message_button.clicked.connect(lambda: self._set_body_mode("Normal Message"))
         self.html_message_button.clicked.connect(lambda: self._set_body_mode("HTML Message"))
         self.normal_message_button.setToolTip("Write a plain text message")
-        self.html_message_button.setToolTip("Write or paste HTML message code")
+        self.html_message_button.setToolTip("Write or paste HTML content")
         mode_row.addWidget(mode_label)
         mode_row.addWidget(self.normal_message_button)
         mode_row.addWidget(self.html_message_button)
@@ -1146,15 +1420,15 @@ class DashboardPage(QWidget):
         self.html_message_editor = QTextEdit()
         self.body_editor.setPlaceholderText("Type your message here...")
         self.body_editor.setObjectName("bodyEditor")
-        self.body_editor.setToolTip("Compose the normal text message body")
+        self.body_editor.setToolTip("Compose the plain text message body")
         self.body_editor.setPlainText(
-            "Hello {{first_name}},\n\nThis is a modern design preview for your email automation workspace."
+            "Hello {{first_name}},\n\nThis is a design preview for your email automation workspace."
         )
         self.html_message_editor.setObjectName("bodyEditor")
-        self.html_message_editor.setPlaceholderText("<!-- Paste HTML message code here -->")
-        self.html_message_editor.setToolTip("Paste HTML email code here")
+        self.html_message_editor.setPlaceholderText("<!-- Paste HTML message content here -->")
+        self.html_message_editor.setToolTip("Paste HTML email content here")
         self.html_message_editor.setPlainText(
-            "<div style='font-family: Segoe UI;'>\n  <h2>Hello {{first_name}}</h2>\n  <p>Paste your HTML code here.</p>\n</div>"
+            "<div style='font-family: Segoe UI;'>\n  <h2>Hello {{first_name}}</h2>\n  <p>Paste your HTML content here.</p>\n</div>"
         )
         self.message_stack = QStackedWidget()
         self.message_stack.addWidget(self.body_editor)
@@ -1175,14 +1449,14 @@ class DashboardPage(QWidget):
         preview_button = QPushButton("Preview")
         preview_button.setObjectName("primaryButton")
         preview_button.clicked.connect(lambda: self._preview_subject_body())
-        guide_button = QPushButton("Spintax Guide")
+        guide_button = QPushButton("Spintax Help")
         guide_button.setObjectName("warningButton")
-        guide_button.clicked.connect(lambda: self._log_action("Opened spintax guide"))
+        guide_button.clicked.connect(lambda: self._log_action("Opened spintax help"))
         load_subject.setToolTip("Load a subject template from file")
-        load_body.setToolTip("Load a body template from file")
+        load_body.setToolTip("Load a message template from file")
         clear_button.setToolTip("Clear the subject and body fields")
         preview_button.setToolTip("Preview the current message content")
-        guide_button.setToolTip("Open the spintax usage guide")
+        guide_button.setToolTip("Open a short spintax help guide")
 
         for button in (load_subject, load_body, clear_button, preview_button, guide_button):
             footer_row.addWidget(button)
@@ -1195,7 +1469,7 @@ class DashboardPage(QWidget):
     def _build_html_content_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(10)
+        layout.setSpacing(_scaled_int(10, self._scale))
 
         header = self._section_title("HTML CONTENT EDITOR")
         layout.addWidget(header)
@@ -1203,7 +1477,7 @@ class DashboardPage(QWidget):
         status_banner = QFrame()
         status_banner.setObjectName("panelCard")
         status_layout = QHBoxLayout(status_banner)
-        status_layout.setContentsMargins(12, 10, 12, 10)
+        status_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(10, self._scale), _scaled_int(12, self._scale), _scaled_int(10, self._scale))
         status_label = QLabel("No active windows")
         status_label.setObjectName("placeholderText")
         status_layout.addWidget(status_label)
@@ -1211,27 +1485,27 @@ class DashboardPage(QWidget):
         layout.addWidget(status_banner)
 
         self.html_editor.setObjectName("bodyEditor")
-        self.html_editor.setPlaceholderText("<!-- Paste your HTML email template here... -->")
-        self.html_editor.setToolTip("Paste the HTML email template here")
+        self.html_editor.setPlaceholderText("<!-- Paste your HTML template here... -->")
+        self.html_editor.setToolTip("Paste the HTML template here")
         self.html_editor.setPlainText(
-            "<html>\n  <body style='font-family: Segoe UI; background:#0f172a; color:#e5eefc;'>\n    <h1>Campaign Title</h1>\n    <p>Hello {{first_name}}, welcome to the preview.</p>\n  </body>\n</html>"
+            "<html>\n  <body style='font-family: Segoe UI; background:#0f172a; color:#e5eefc;'>\n    <h1>Email Campaign Title</h1>\n    <p>Hello {{first_name}}, welcome to the preview.</p>\n  </body>\n</html>"
         )
-        self.html_editor.setMinimumHeight(300)
+        self.html_editor.setMinimumHeight(_scaled_int(300, self._scale))
         layout.addWidget(self.html_editor, 1)
 
         footer_row = QHBoxLayout()
         preview_html = QPushButton("Preview HTML")
         preview_html.setObjectName("primaryButton")
-        convert_check = QCheckBox("Convert to File")
+        convert_check = QCheckBox("Convert to file")
         convert_check.setChecked(True)
-        convert_file = QPushButton("Convert to File")
+        convert_file = QPushButton("Export to file")
         convert_file.setObjectName("secondaryButton")
-        convert_preview = QPushButton("Convert & Preview")
+        convert_preview = QPushButton("Export and Preview")
         convert_preview.setObjectName("primaryButton")
         preview_html.setToolTip("Preview the HTML content")
-        convert_check.setToolTip("Enable conversion to a file output")
-        convert_file.setToolTip("Open the file output options")
-        convert_preview.setToolTip("Convert the HTML and preview the output")
+        convert_check.setToolTip("Enable export to a file")
+        convert_file.setToolTip("Open the file export options")
+        convert_preview.setToolTip("Export the HTML and preview the result")
         preview_html.clicked.connect(lambda: self._preview_html_content())
         convert_file.clicked.connect(lambda: self._open_output_options_dialog())
         convert_preview.clicked.connect(lambda: self._open_output_options_dialog(preview=True))
@@ -1262,7 +1536,7 @@ class DashboardPage(QWidget):
         attach_actions.addStretch()
         attach_layout.addLayout(attach_actions)
 
-        attachment_hint = QLabel("PDF, images, and additional files can be attached later in the logic phase.")
+        attachment_hint = QLabel("PDFs, images, and other files can be attached later in the logic phase.")
         attachment_hint.setObjectName("sectionHint")
         attachment_hint.setWordWrap(True)
         attach_layout.addWidget(attachment_hint)
@@ -1273,7 +1547,7 @@ class DashboardPage(QWidget):
     def _build_settings_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(10)
+        layout.setSpacing(_scaled_int(10, self._scale))
 
         header = self._section_title("SENDING SETTINGS")
         layout.addWidget(header)
@@ -1305,7 +1579,7 @@ class DashboardPage(QWidget):
         delay_row.addWidget(self.delay_from)
         delay_row.addWidget(QLabel("to"))
         delay_row.addWidget(self.delay_to)
-        delay_row.addWidget(QLabel("seconds (random delay range)"))
+        delay_row.addWidget(QLabel("seconds (random range)"))
         delay_holder = QFrame()
         delay_holder.setLayout(delay_row)
         form.addRow(delay_holder)
@@ -1313,8 +1587,8 @@ class DashboardPage(QWidget):
 
         delay_type_row = QHBoxLayout()
         fixed_radio = QRadioButton("Fixed")
-        random_radio = QRadioButton("Random Range")
-        human_radio = QRadioButton("Human Pattern")
+        random_radio = QRadioButton("Random range")
+        human_radio = QRadioButton("Human-like pattern")
         random_radio.setChecked(True)
         fixed_radio.setToolTip("Use the same delay for every send")
         random_radio.setToolTip("Use a random delay within the range")
@@ -1353,7 +1627,7 @@ class DashboardPage(QWidget):
 
         window_mode_row = QHBoxLayout()
         parallel_radio = QRadioButton("Parallel (all windows at once)")
-        sequential_window_radio = QRadioButton("Sequential (1 window at a time, rotate)")
+        sequential_window_radio = QRadioButton("Sequential (one window at a time)")
         parallel_radio.setChecked(True)
         parallel_radio.setToolTip("Launch and send in parallel")
         sequential_window_radio.setToolTip("Rotate through windows one at a time")
@@ -1379,13 +1653,60 @@ class DashboardPage(QWidget):
         layout.addWidget(proxy_card)
 
         startup_card, startup_layout = self._card("ADDITIONAL STARTUP TABS", "Open custom URLs when each session launches.")
-        startup_checkbox = QCheckBox("Open custom URL in new tab on startup")
+        startup_checkbox = QCheckBox("Open custom URL in a new tab on startup")
         self.custom_url_input.setPlaceholderText("Custom URL")
         startup_checkbox.setToolTip("Open a custom page when each session starts")
         self.custom_url_input.setToolTip("Enter the startup URL to open")
         startup_layout.addWidget(startup_checkbox)
         startup_layout.addWidget(self.custom_url_input)
         layout.addWidget(startup_card)
+
+        ai_card, ai_layout = self._card("AI ASSISTANT", "Connect an AI provider to unlock model selection.")
+        ai_form = QFormLayout()
+        ai_form.setLabelAlignment(Qt.AlignLeft)
+        ai_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        ai_form.setHorizontalSpacing(_scaled_int(16, self._scale))
+        ai_form.setVerticalSpacing(_scaled_int(12, self._scale))
+
+        self.ai_provider_combo.clear()
+        self.ai_provider_combo.addItems(["ChatGPT", "Claude", "DeepSeek"])
+        self.ai_provider_combo.setCurrentText(self.state.ai_provider)
+        self.ai_provider_combo.setToolTip("Select the AI provider")
+        self.ai_provider_combo.currentTextChanged.connect(lambda _value: self._on_ai_provider_changed())
+        self.ai_provider_combo.setMinimumWidth(_scaled_int(240, self._scale))
+        self.ai_provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.ai_api_key_input.setPlaceholderText("Enter API key")
+        self.ai_api_key_input.setEchoMode(QLineEdit.Password)
+        self.ai_api_key_input.setToolTip("Enter the provider API key")
+        self.ai_api_key_input.setMinimumWidth(_scaled_int(240, self._scale))
+        self.ai_api_key_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.ai_model_combo.setEnabled(False)
+        self.ai_model_combo.setToolTip("Choose a model after connecting")
+        self.ai_model_combo.currentTextChanged.connect(lambda _value: self._on_ai_model_changed())
+        self.ai_model_combo.setMinimumWidth(_scaled_int(240, self._scale))
+        self.ai_model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.ai_connect_button.setObjectName("primaryButton")
+        self.ai_connect_button.clicked.connect(lambda: self._connect_ai_provider())
+        self.ai_connect_button.setToolTip("Validate the API key and connect")
+        self.ai_connect_button.setMinimumWidth(_scaled_int(140, self._scale))
+        self.ai_connect_button.setCursor(Qt.PointingHandCursor)
+
+        self.ai_status_label.setObjectName("windowPill")
+        self.ai_status_label.setAlignment(Qt.AlignCenter)
+        self.ai_status_label.setMinimumHeight(_scaled_int(32, self._scale))
+        self.ai_status_label.setMinimumWidth(_scaled_int(140, self._scale))
+        self.ai_status_label.setText("Not connected")
+
+        ai_form.addRow("Provider", self.ai_provider_combo)
+        ai_form.addRow("API key", self.ai_api_key_input)
+        ai_form.addRow("", self.ai_connect_button)
+        ai_form.addRow("Model", self.ai_model_combo)
+        ai_form.addRow("Status", self.ai_status_label)
+        ai_layout.addLayout(ai_form)
+        layout.addWidget(ai_card)
 
         save_button = QPushButton("Save Settings")
         save_button.setObjectName("primaryButton")
@@ -1394,12 +1715,126 @@ class DashboardPage(QWidget):
         layout.addWidget(save_button, alignment=Qt.AlignLeft)
         layout.addStretch()
 
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
+
         return self._tab_scroll(page)
+
+    def _refresh_ai_models(self) -> None:
+        self.ai_model_combo.blockSignals(True)
+        self.ai_model_combo.clear()
+        self.ai_model_combo.addItems(self._available_ai_models)
+        if self.state.ai_model and self.state.ai_model in self._available_ai_models:
+            self.ai_model_combo.setCurrentText(self.state.ai_model)
+        elif self._available_ai_models:
+            self.ai_model_combo.setCurrentIndex(0)
+            self.state.ai_model = self.ai_model_combo.currentText()
+        self.ai_model_combo.blockSignals(False)
+
+    def _sync_ai_connection_ui(self) -> None:
+        connected = self.state.ai_connected
+        self.ai_model_combo.setEnabled(connected and bool(self._available_ai_models))
+        self.ai_connect_button.setText("Reconnect" if connected else "Connect")
+        self.ai_connect_button.setEnabled(True)
+        if connected:
+            self.ai_status_label.setText("Connected")
+            self.ai_status_label.setStyleSheet(
+                "QLabel { background:#12351e; color:#7dff9a; border:1px solid #1e7a3a; border-radius:8px; padding:4px 10px; font-weight:700; }"
+            )
+        else:
+            self.ai_status_label.setText("Not connected")
+            self.ai_status_label.setStyleSheet(
+                "QLabel { background:#2a1d1d; color:#f0a0a0; border:1px solid #7a3131; border-radius:8px; padding:4px 10px; font-weight:700; }"
+            )
+        self.ai_model_combo.blockSignals(True)
+        if connected and self.state.ai_model:
+            index = self.ai_model_combo.findText(self.state.ai_model)
+            if index >= 0:
+                self.ai_model_combo.setCurrentIndex(index)
+        self.ai_model_combo.blockSignals(False)
+
+    def _set_ai_busy(self, busy: bool) -> None:
+        self.ai_provider_combo.setEnabled(not busy)
+        self.ai_api_key_input.setEnabled(not busy)
+        self.ai_model_combo.setEnabled((not busy) and self.state.ai_connected and bool(self._available_ai_models))
+        self.ai_connect_button.setEnabled(not busy)
+        if busy:
+            self.ai_connect_button.setText("Connecting...")
+            self.ai_connect_button.setStyleSheet(
+                "QPushButton#primaryButton { background:#a87917; color:#ffffff; border:none; }"
+            )
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            self.ai_connect_button.setStyleSheet("")
+            QApplication.restoreOverrideCursor()
+
+    def _on_ai_provider_changed(self) -> None:
+        self.state.ai_provider = self.ai_provider_combo.currentText() or "ChatGPT"
+        self.state.ai_connected = False
+        self.state.ai_model = ""
+        self._available_ai_models = []
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
+        self._log_action(f"AI provider selected: {self.state.ai_provider}")
+
+    def _connect_ai_provider(self) -> None:
+        provider = self.ai_provider_combo.currentText() or "ChatGPT"
+        api_key = self.ai_api_key_input.text().strip()
+        if not api_key:
+            self.state.ai_connected = False
+            self.state.ai_model = ""
+            self._available_ai_models = []
+            self._refresh_ai_models()
+            self._sync_ai_connection_ui()
+            self.notify("Enter an API key to connect")
+            return
+
+        self._set_ai_busy(True)
+        QApplication.processEvents()
+        self.state.ai_provider = provider
+        self.state.ai_connected = False
+        self.state.ai_model = ""
+        self._available_ai_models = []
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
+
+        try:
+            models = AIValidationWorker(provider, api_key)._fetch_models()
+        except Exception as exc:
+            self.state.ai_connected = False
+            self.state.ai_model = ""
+            self._available_ai_models = []
+            self._refresh_ai_models()
+            self._sync_ai_connection_ui()
+            self._set_ai_busy(False)
+            self._log_action(f"AI connection failed: {exc}")
+            self.notify("AI connection failed")
+            return
+
+        self.state.ai_provider = provider
+        self.state.ai_connected = True
+        self._available_ai_models = models
+        self._refresh_ai_models()
+        if self._available_ai_models:
+            if not self.state.ai_model or self.state.ai_model not in self._available_ai_models:
+                self.state.ai_model = self._available_ai_models[0]
+            self.ai_model_combo.setCurrentText(self.state.ai_model)
+        self._sync_ai_connection_ui()
+        self._set_ai_busy(False)
+        self._log_action(f"Connected AI provider: {provider}")
+        self.notify(f"{provider} connected")
+
+    def _on_ai_model_changed(self) -> None:
+        if not self.ai_model_combo.isEnabled():
+            return
+        self.state.ai_model = self.ai_model_combo.currentText().strip()
+        if self.state.ai_model:
+            self._log_action(f"AI model selected: {self.state.ai_model}")
 
     def _build_blaster_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(10)
+        layout.setSpacing(_scaled_int(10, self._scale))
 
         header = self._section_title("EMAIL BLASTING CONTROLS", "Send emails from all open Gmail windows.")
         layout.addWidget(header)
@@ -1427,11 +1862,11 @@ class DashboardPage(QWidget):
         controls_layout.addWidget(progress_text)
         layout.addWidget(controls_card)
 
-        start_button = QPushButton("Start Blast")
+        start_button = QPushButton("Start Campaign")
         start_button.setObjectName("blastButton")
-        start_button.setMinimumHeight(54)
-        start_button.clicked.connect(lambda: self._log_action("Start Blast pressed"))
-        start_button.setToolTip("Start the email blasting workflow")
+        start_button.setMinimumHeight(_scaled_int(54, self._scale))
+        start_button.clicked.connect(lambda: self._log_action("Start Campaign clicked"))
+        start_button.setToolTip("Start the email sending workflow")
         layout.addWidget(start_button)
 
         log_card, log_layout = self._card("SEND LOG")
@@ -1446,15 +1881,24 @@ class DashboardPage(QWidget):
     def _build_tags_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(10)
+        layout.setSpacing(_scaled_int(10, self._scale))
 
-        header = self._section_title("DYNAMIC TAGS", "Use these tags in Subject or Body — they generate random values when sending.")
+        header = self._section_title("DYNAMIC TAGS", "Use these tags in Subject or Body. They generate random values when sending.")
         layout.addWidget(header)
 
         grid_card, grid_layout = self._card("", None)
-        grid_layout.setContentsMargins(6, 6, 6, 6)
-        tag_grid = QGridLayout()
-        tag_grid.setSpacing(8)
+        grid_layout.setContentsMargins(_scaled_int(6, self._scale), _scaled_int(6, self._scale), _scaled_int(6, self._scale), _scaled_int(6, self._scale))
+        tag_scroll = QScrollArea()
+        tag_scroll.setWidgetResizable(True)
+        tag_scroll.setFrameShape(QFrame.NoFrame)
+        tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tag_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tag_scroll.setMaximumHeight(_scaled_int(430, self._scale))
+
+        tag_host = QWidget()
+        tag_host_layout = QGridLayout(tag_host)
+        tag_host_layout.setContentsMargins(0, 0, 0, 0)
+        tag_host_layout.setSpacing(_scaled_int(8, self._scale))
         samples = [
             ("VOIS", "$random4", "4 char alphanumeric uppercase"),
             ("V3EAJO", "$random6", "6 char alphanumeric uppercase"),
@@ -1468,10 +1912,23 @@ class DashboardPage(QWidget):
             ("640296", "$num6", "6 digit number"),
             ("45250809", "$num8", "8 digit number"),
             ("1-800-181-7889", "$phone", "Phone-style sample"),
+            ("QLRZ", "$word4a", "Alternative 4-letter word"),
+            ("MOTION", "$word6", "6-letter uppercase word"),
+            ("7A4F", "$mix4", "Mixed 4-character token"),
+            ("DX8M2P", "$mix6", "Mixed 6-character token"),
+            ("0314", "$day4", "4 digit day code"),
+            ("202608", "$ym6", "Year-month code"),
+            ("94-221-88", "$id9", "Structured numeric token"),
+            ("support@ezymailer.com", "$email", "Email address sample"),
+            ("https://ezymailer.app", "$url", "Website URL sample"),
+            ("Alice Johnson", "$name", "Full name sample"),
+            ("Seattle", "$city", "City sample"),
+            ("hello-world", "$slug", "Slug sample"),
         ]
         for index, (title, token, description) in enumerate(samples):
-            tag_grid.addWidget(self._tag_card(title, token, description), index // 3, index % 3)
-        grid_layout.addLayout(tag_grid)
+            tag_host_layout.addWidget(self._tag_card(title, token, description), index // 3, index % 3)
+        tag_scroll.setWidget(tag_host)
+        grid_layout.addWidget(tag_scroll)
         layout.addWidget(grid_card)
 
         actions_row = QHBoxLayout()
@@ -1493,8 +1950,8 @@ class DashboardPage(QWidget):
         actions_row.addStretch()
         layout.addLayout(actions_row)
 
-        manual_card, manual_layout = self._card("MANUAL CUSTOM TAGS", "Values entered here will replace $custom1 and $custom2.")
-        manual_layout.addWidget(QLabel("For example, you can add your phone number, email address, or anything else."))
+        manual_card, manual_layout = self._card("MANUAL CUSTOM TAGS", "Values entered here replace $custom1 and $custom2.")
+        manual_layout.addWidget(QLabel("For example, you can add a phone number, email address, or any other text."))
         self.custom1_input.setPlaceholderText("$custom1 =")
         self.custom2_input.setPlaceholderText("$custom2 =")
         self.custom1_input.setToolTip("Define the first manual custom tag value")
@@ -1515,7 +1972,7 @@ class DashboardPage(QWidget):
         row = QFrame()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(10)
+        row_layout.setSpacing(_scaled_int(10, self._scale))
 
         label = QLabel(label_text)
         label.setObjectName("fieldLabel")
@@ -1532,7 +1989,7 @@ class DashboardPage(QWidget):
         row = QFrame()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(10)
+        row_layout.setSpacing(_scaled_int(10, self._scale))
 
         line_edit.setObjectName("searchInput")
         copy_button = QPushButton("Copy")
@@ -1545,15 +2002,15 @@ class DashboardPage(QWidget):
         return row
 
     def _open_output_options_dialog(self, preview: bool = False) -> None:
-        dialog = OutputOptionsDialog(self.window())
+        dialog = OutputOptionsDialog(self.window(), scale=self._scale)
         if dialog.exec() == QDialog.Accepted:
-            self._log_action("Opened output file options")
+            self._log_action("Opened export options")
             if preview:
-                self._log_action("Converted HTML and opened preview")
-                self.notify("HTML conversion preview ready")
+                self._log_action("Exported HTML and opened preview")
+                self.notify("HTML export preview ready")
                 self._preview_html_content(title="Converted HTML Preview")
             else:
-                self.notify("Output file options confirmed")
+                self.notify("Export options confirmed")
 
     def _wrap_text_as_html(self, text: str, subject: str = "") -> str:
         safe_subject = html.escape(subject.strip())
@@ -1570,7 +2027,7 @@ class DashboardPage(QWidget):
         """
 
     def _build_preview_dialog(self, title: str, html_content: str, source_label: str) -> HtmlPreviewDialog:
-        dialog = HtmlPreviewDialog(self.window(), title, html_content, source_label)
+        dialog = HtmlPreviewDialog(self.window(), title, html_content, source_label, scale=self._scale)
         self._floating_windows.append(dialog)
         dialog.finished.connect(lambda _result, d=dialog: self._remove_floating_window(d))
         dialog.destroyed.connect(lambda *_args, d=dialog: self._remove_floating_window(d))
@@ -1584,12 +2041,12 @@ class DashboardPage(QWidget):
         subject = self.subject_input.text().strip() or "Subject Preview"
         if self.state.body_mode == "HTML Message":
             html_content = self.html_message_editor.toPlainText().strip()
-            source = "Previewing the HTML message body."
+            source = "Previewing the HTML message content."
             if not html_content:
                 html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML content available.</body></html>"
         else:
             body_text = self.body_editor.toPlainText().strip()
-            source = "Previewing the plain-text body as rendered HTML."
+            source = "Previewing the plain-text message as HTML."
             if not body_text:
                 body_text = "No message body available."
             html_content = self._wrap_text_as_html(body_text, subject)
@@ -1620,8 +2077,8 @@ class DashboardPage(QWidget):
         card = QFrame()
         card.setObjectName("panelCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        layout.setSpacing(_scaled_int(6, self._scale))
 
         header = QHBoxLayout()
         title_label = QLabel(title)
@@ -1638,7 +2095,7 @@ class DashboardPage(QWidget):
         token_value.setObjectName("sectionSubtitle")
         remove_button = QPushButton("X")
         remove_button.setObjectName("dangerButton")
-        remove_button.setFixedWidth(36)
+        remove_button.setFixedWidth(_scaled_int(36, self._scale))
         copy_button = QPushButton("Copy")
         copy_button.setObjectName("secondaryButton")
         copy_button.clicked.connect(lambda: self._log_action(f"Copied tag {token}"))
@@ -1671,8 +2128,9 @@ class DashboardPage(QWidget):
         self.normal_message_button.setChecked(mode == "Normal Message")
         self.html_message_button.setChecked(mode == "HTML Message")
         self.message_stack.setCurrentIndex(0 if mode == "Normal Message" else 1)
-        self._log_action(f"Body mode set to {mode}")
-        self.notify(f"Body mode changed to {mode}")
+        label = "Plain text" if mode == "Normal Message" else "HTML"
+        self._log_action(f"Body mode set to {label}")
+        self.notify(f"Body mode changed to {label}")
 
     def _set_launch_preset(self, preset: str | None) -> None:
         self.state.launch_preset = preset or ""
@@ -1688,9 +2146,9 @@ class DashboardPage(QWidget):
         title = "Confirm Launch"
         prompt = (
             f"Start {self.window_spin.value()} window(s) using {self.state.browser_mode} mode "
-            f"and {self.launch_preset_label.text()} preset?"
+            f"and the {self.launch_preset_label.text()} preset?"
         )
-        confirm = ConfirmDialog(self.window(), title, prompt)
+        confirm = ConfirmDialog(self.window(), title, prompt, scale=self._scale)
         if confirm.exec() != QDialog.Accepted:
             self.notify("Launch cancelled")
             return
@@ -1733,8 +2191,16 @@ class DashboardPage(QWidget):
         self.state.browser_mode = "Incognito"
         self.state.body_mode = "Normal Message"
         self.state.launch_preset = "Default"
+        self.state.ai_provider = "ChatGPT"
+        self.state.ai_model = ""
+        self.state.ai_connected = False
+        self._available_ai_models = []
         self.state.active_sessions = ["Window 1 - Idle"]
         self.window_spin.setValue(1)
+        self.ai_provider_combo.blockSignals(True)
+        self.ai_provider_combo.setCurrentText("ChatGPT")
+        self.ai_provider_combo.blockSignals(False)
+        self.ai_api_key_input.clear()
         self._refresh_sessions()
         self._refresh_controls()
         self._log_action("Reset workspace to defaults")
@@ -1795,7 +2261,7 @@ class DashboardPage(QWidget):
         self._session_stage = 0
         self._session_timer.start(700)
         self._log_action(f"Started {target} window(s)")
-        self.notify(f"Start initiated for {target} window(s)")
+        self.notify(f"Launch started for {target} window(s)")
 
     def _clear_subject_body(self) -> None:
         self.subject_input.clear()
@@ -1868,6 +2334,11 @@ class DashboardPage(QWidget):
         self.active_windows_value.setText(str(self.state.window_count))
         self.launch_preset_label.setText(self.state.launch_preset or "None")
         self.progress_bar.setValue(0)
+        self.ai_provider_combo.blockSignals(True)
+        self.ai_provider_combo.setCurrentText(self.state.ai_provider)
+        self.ai_provider_combo.blockSignals(False)
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
 
     def _log_action(self, message: str) -> None:
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -1880,9 +2351,9 @@ class DashboardPage(QWidget):
         row = QFrame()
         row.setObjectName("sessionRow")
         row_layout = QVBoxLayout(row)
-        row_layout.setContentsMargins(8, 7, 8, 7)
-        row_layout.setSpacing(4)
-        row.setMinimumHeight(52)
+        row_layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(7, self._scale), _scaled_int(8, self._scale), _scaled_int(7, self._scale))
+        row_layout.setSpacing(_scaled_int(4, self._scale))
+        row.setMinimumHeight(_scaled_int(52, self._scale))
 
         dot = QLabel("●")
         dot.setObjectName("sessionDot")
@@ -1891,23 +2362,23 @@ class DashboardPage(QWidget):
         label.setObjectName("sessionTitleSmall")
         state = QLabel(session_state)
         state.setObjectName("sessionState")
-        label.setMinimumWidth(72)
-        state.setMinimumWidth(80)
+        label.setMinimumWidth(_scaled_int(72, self._scale))
+        state.setMinimumWidth(_scaled_int(80, self._scale))
         state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         close_button = QPushButton("✕")
         close_button.setObjectName("dangerButton")
-        close_button.setFixedWidth(28)
+        close_button.setFixedWidth(_scaled_int(28, self._scale))
         close_button.clicked.connect(lambda _, i=index - 1, s=session: self._close_session(i, s))
         close_button.setToolTip("Close this browser window")
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(6)
+        top_row.setSpacing(_scaled_int(6, self._scale))
         top_row.addWidget(dot)
         top_row.addWidget(label)
         top_row.addStretch()
 
         bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(6)
+        bottom_row.setSpacing(_scaled_int(6, self._scale))
         bottom_row.addWidget(state)
         bottom_row.addStretch()
         bottom_row.addWidget(close_button)
@@ -1935,9 +2406,12 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self._toasts = []
         self._pending_launch_target = 0
+        self._scale = _compute_layout_scale(QApplication.primaryScreen())
+        self._text_scale = _compute_text_scale(QApplication.primaryScreen())
+        self._centered_once = False
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self.resize(1380, 860)
+        self.resize(_scaled_int(1120, self._scale), _scaled_int(760, self._scale))
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1946,14 +2420,14 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self.title_bar = TitleBar(self, self.close)
+        self.title_bar = TitleBar(self, self.close, scale=self._scale)
         self.title_bar.set_logout_handler(self.handle_logout)
         self.title_bar.sync_window_state()
-        self.launch_loader = LaunchLoaderDialog(self)
+        self.launch_loader = LaunchLoaderDialog(self, scale=self._scale)
 
         self.stack = QStackedWidget()
-        self.login_page = LoginPage(self.handle_login)
-        self.dashboard_page = DashboardPage(self.state, self.handle_logout, self.show_toast)
+        self.login_page = LoginPage(self.handle_login, scale=self._scale)
+        self.dashboard_page = DashboardPage(self.state, self.handle_logout, self.show_toast, scale=self._scale)
         self.stack.addWidget(self.login_page)
         self.stack.addWidget(self.dashboard_page)
         root.addWidget(self.title_bar)
@@ -1963,7 +2437,7 @@ class MainWindow(QMainWindow):
         self.show_login()
 
     def show_toast(self, message: str, kind: str = "info") -> None:
-        toast = Toast(self, message, kind)
+        toast = Toast(self, message, kind, scale=self._scale)
         self._toasts.append(toast)
         toast.destroyed.connect(lambda: self._remove_toast(toast))
         toast.adjustSize()
@@ -1993,10 +2467,25 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.WindowStateChange:
             self.title_bar.sync_window_state()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._centered_once:
+            self._centered_once = True
+            QTimer.singleShot(0, self._center_window_on_screen)
+
+    def _center_window_on_screen(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        geometry = screen.availableGeometry()
+        x = geometry.x() + (geometry.width() - self.width()) // 2
+        y = geometry.y() + (geometry.height() - self.height()) // 2
+        self.move(x, y)
+
     def _apply_styles(self) -> None:
-        self.setFont(QFont("Segoe UI", 9))
-        self.setStyleSheet(
-            """
+        self.setFont(QFont("Segoe UI", _scaled_int(10, self._text_scale)))
+        style = """
             QMainWindow {
                 background: #1e1e1e;
             }
@@ -2314,6 +2803,15 @@ class MainWindow(QMainWindow):
                 padding: 6px 10px;
                 font-weight: 700;
             }
+            QPushButton#macTrafficLightButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+            }
+            QPushButton#macTrafficLightButton:pressed {
+                transform: none;
+            }
             QPushButton#primaryButton,
             QPushButton#blastButton {
                 background: #0e639c;
@@ -2502,7 +3000,17 @@ class MainWindow(QMainWindow):
                 background: #111827;
             }
             """
-        )
+        import re
+
+        def scale_font(match) -> str:
+            value = float(match.group(1))
+            return f"font-size: {value * self._text_scale:.1f}pt;"
+
+        style = re.sub(r"font-size:\s*([0-9]+(?:\.[0-9]+)?)pt;", scale_font, style)
+        style = style.replace("min-width: 96px;", f"min-width: {_scaled_int(96, self._scale)}px;")
+        style = style.replace("width: 10px;", f"width: {_scaled_int(10, self._scale)}px;")
+        style = style.replace("height: 10px;", f"height: {_scaled_int(10, self._scale)}px;")
+        self.setStyleSheet(style)
 
     def show_login(self) -> None:
         self.hide_launch_loader()
@@ -2515,9 +3023,10 @@ class MainWindow(QMainWindow):
         self.dashboard_page.refresh()
         self.stack.setCurrentWidget(self.dashboard_page)
 
-    def handle_login(self, username: str) -> None:
+    def handle_login(self, username: str, auth_token: str = "") -> None:
         self.state.username = username
         self.state.logged_in = True
+        self.state.auth_token = auth_token
         self.state.activity_log.append("User authenticated")
         self.title_bar.set_state(self.state.username, self.state.logged_in)
         self.show_dashboard()
@@ -2536,6 +3045,11 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    try:
+        ensure_api_server()
+    except Exception as exc:
+        print(f"Local login API failed to start: {exc}")
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
@@ -2544,4 +3058,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,5 +1,12 @@
 # Update Log
 
+## 2026-08-13
+
+- Added a localhost login API for the desktop app
+- Created the MySQL-backed `ezymailer.user_db` table and seeded the `admin / admin` user
+- Switched the sign-in screen from hardcoded validation to API-based authentication
+- Added a reusable SQL schema for importing the local database in phpMyAdmin
+
 ## 2026-08-12
 
 - Created the first project memory and update records
