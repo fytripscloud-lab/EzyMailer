@@ -2,16 +2,19 @@
 import html
 import csv
 import json
+import os
 import re
 import subprocess
 import shutil
 import ssl
+import sqlite3
 import urllib.error
 import urllib.request
 from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
+from typing import Callable
 
 from backend.local_api import (
     API_BASE_URL,
@@ -41,6 +44,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QDialog,
@@ -74,6 +78,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QTextBrowser,
     QWidget,
+    QHeaderView,
 )
 
 
@@ -82,6 +87,22 @@ DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin"
 IS_MAC = sys.platform == "darwin"
 MAX_BODY_TABS = 50
+MAX_ATTACHMENT_TABS = 50
+MAX_SUBJECTS = 100
+LOCAL_CACHE_DIR = (
+    Path.home() / "Library" / "Application Support" / APP_TITLE
+    if IS_MAC
+    else Path.home() / ".ezymailer"
+)
+LEGACY_LOCAL_CACHE_DIR = Path.home() / ".ezymailer"
+LEGACY_LOCAL_CACHE_DB = LEGACY_LOCAL_CACHE_DIR / "local_drafts.sqlite3"
+LOCAL_CACHE_DB = LOCAL_CACHE_DIR / "local_drafts.sqlite3"
+LOCAL_ATTACHMENT_STATE_KEY = "attachment_content_state"
+LOCAL_SUBJECT_STATE_KEY = "subject_content_state"
+LOCAL_BODY_STATE_KEY = "body_content_state"
+LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
+ROLE_LOCAL_ONLY = Qt.UserRole + 10
+ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 
 
 def _scaled_int(value: float, scale: float, minimum: int = 1) -> int:
@@ -110,6 +131,391 @@ def _compute_text_scale(screen) -> float:
     return max(1.28, min(1.40, scale))
 
 
+def _is_subject_content_row(row: dict[str, object]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if bool(row.get("local_only")) and str(row.get("content_type") or "") == "subject":
+        return True
+    content_type = str(row.get("content_type") or "")
+    details = row.get("details_json")
+    kind = ""
+    if isinstance(details, str):
+        try:
+            parsed = json.loads(details)
+            if isinstance(parsed, dict):
+                kind = str(parsed.get("kind") or "")
+        except Exception:
+            kind = ""
+    elif isinstance(details, dict):
+        kind = str(details.get("kind") or "")
+    return content_type in {"subject", "subject-draft"} or kind in {"subject", "subject-draft"}
+
+
+def _subject_rows_from_content(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    subject_rows: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not _is_subject_content_row(row):
+            continue
+        subject = str(row.get("subject") or "").strip()
+        if not subject:
+            continue
+        subject_rows.append(row)
+    return subject_rows
+
+
+def _subject_count_text(count: int) -> str:
+    return f"{count}/{MAX_SUBJECTS} subjects"
+
+
+def _ensure_local_cache_db() -> None:
+    LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(LOCAL_CACHE_DIR, 0o700)
+    except Exception:
+        pass
+    if not LOCAL_CACHE_DB.exists() and LEGACY_LOCAL_CACHE_DB.exists():
+        try:
+            shutil.copy2(LEGACY_LOCAL_CACHE_DB, LOCAL_CACHE_DB)
+        except Exception:
+            pass
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draft_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                body_text TEXT NOT NULL DEFAULT '',
+                body_html TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attachment_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    try:
+        os.chmod(LOCAL_CACHE_DB, 0o600)
+    except Exception:
+        pass
+
+
+def _save_local_draft(
+    content_type: str,
+    title: str,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    details: dict[str, object] | None = None,
+) -> int:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO draft_content (content_type, title, subject, body_text, body_html, details_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                content_type,
+                title,
+                subject,
+                body_text,
+                body_html,
+                json.dumps(details or {}, ensure_ascii=False),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid or 0)
+    finally:
+        connection.close()
+
+
+def _update_local_draft(
+    draft_id: int,
+    content_type: str,
+    title: str,
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+    details: dict[str, object] | None = None,
+) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            UPDATE draft_content
+            SET content_type = ?,
+                title = ?,
+                subject = ?,
+                body_text = ?,
+                body_html = ?,
+                details_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                content_type,
+                title,
+                subject,
+                body_text,
+                body_html,
+                json.dumps(details or {}, ensure_ascii=False),
+                draft_id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _delete_local_draft(draft_id: int) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute("DELETE FROM draft_content WHERE id = ?", (draft_id,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _delete_local_drafts(content_type: str | None = None) -> int:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        cursor = connection.cursor()
+        if content_type:
+            cursor.execute("DELETE FROM draft_content WHERE content_type = ?", (content_type,))
+        else:
+            cursor.execute("DELETE FROM draft_content")
+        connection.commit()
+        return int(cursor.rowcount or 0)
+    finally:
+        connection.close()
+
+
+def _list_local_drafts(content_type: str | None = None) -> list[dict[str, object]]:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        if content_type:
+            cursor.execute(
+                """
+                SELECT id, content_type, title, subject, body_text, body_html, details_json, created_at, updated_at
+                FROM draft_content
+                WHERE content_type = ?
+                ORDER BY id ASC
+                """,
+                (content_type,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, content_type, title, subject, body_text, body_html, details_json, created_at, updated_at
+                FROM draft_content
+                ORDER BY id ASC
+                """
+            )
+        rows = cursor.fetchall() or []
+        payload: list[dict[str, object]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "id": int(row["id"]),
+                    "content_type": str(row["content_type"]),
+                    "title": str(row["title"]),
+                    "subject": str(row["subject"]),
+                    "body_text": str(row["body_text"]),
+                    "body_html": str(row["body_html"]),
+                    "details_json": row["details_json"],
+                    "created_at": str(row["created_at"]),
+                    "updated_at": str(row["updated_at"]),
+                    "local_only": True,
+                }
+            )
+        return payload
+    finally:
+        connection.close()
+
+
+def _upsert_attachment_state(payload: dict[str, object]) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            INSERT INTO attachment_state (state_key, payload_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (LOCAL_ATTACHMENT_STATE_KEY, json.dumps(payload, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _load_attachment_state() -> dict[str, object]:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT payload_json
+            FROM attachment_state
+            WHERE state_key = ?
+            """,
+            (LOCAL_ATTACHMENT_STATE_KEY,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        raw_payload = row["payload_json"]
+        if not raw_payload:
+            return {}
+        try:
+            payload = json.loads(str(raw_payload))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    finally:
+        connection.close()
+
+
+def _delete_attachment_state() -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            "DELETE FROM attachment_state WHERE state_key = ?",
+            (LOCAL_ATTACHMENT_STATE_KEY,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _upsert_ui_state(state_key: str, payload: dict[str, object]) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ui_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO ui_state (state_key, payload_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (state_key, json.dumps(payload, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _load_ui_state(state_key: str) -> dict[str, object]:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ui_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT payload_json
+            FROM ui_state
+            WHERE state_key = ?
+            """,
+            (state_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        raw_payload = str(row["payload_json"] or "")
+        if not raw_payload:
+            return {}
+        try:
+            payload = json.loads(raw_payload)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    finally:
+        connection.close()
+
+
+def _delete_ui_state(state_key: str) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ui_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute("DELETE FROM ui_state WHERE state_key = ?", (state_key,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _is_local_draft_item(item: QTableWidgetItem | QListWidgetItem | None) -> bool:
+    if item is None:
+        return False
+    return bool(item.data(ROLE_LOCAL_ONLY))
+
+
+def _local_draft_id_from_item(item: QTableWidgetItem | QListWidgetItem | None) -> int | None:
+    if item is None:
+        return None
+    value = item.data(ROLE_LOCAL_DRAFT_ID)
+    return int(value) if value else None
+
+
 @dataclass
 class AppState:
     username: str = ""
@@ -127,8 +533,18 @@ class AppState:
     html_message_text: str = ""
     html_template_text: str = ""
     ai_provider: str = "ChatGPT"
+    ai_api_key: str = ""
     ai_model: str = ""
     ai_connected: bool = False
+    sender_limit: int = 500
+    delay_from: float = 0.5
+    delay_to: float = 1.0
+    retry_count: int = 3
+    retry_enabled: bool = True
+    delay_type: str = "Random range"
+    email_send_order: str = "Sequential"
+    window_send_mode: str = "Parallel"
+    ai_available_models: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -742,6 +1158,8 @@ class BodyDraftEditor(QWidget):
         super().__init__()
         self._scale = scale
         self.draft_id: int | None = None
+        self.local_draft_id: int | None = None
+        self.local_only = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -823,12 +1241,13 @@ class BodyDraftEditor(QWidget):
         self.contentChanged.emit()
         self._sync_preview_button_state()
 
-    def set_content(self, title: str, mode: str, plain_text: str, html_text: str) -> None:
+    def set_content(self, title: str, mode: str, plain_text: str, html_text: str, *, local_only: bool = False) -> None:
         self.blockSignals(True)
         self.title_input.blockSignals(True)
         self.plain_editor.blockSignals(True)
         self.html_editor.blockSignals(True)
         try:
+            self.local_only = local_only
             self.title_input.setText(title)
             self.plain_editor.setPlainText(plain_text)
             self.html_editor.setPlainText(html_text)
@@ -852,16 +1271,99 @@ class BodyDraftEditor(QWidget):
         has_html = bool(self.html_editor.toPlainText().strip())
         self.preview_button.setVisible(self.mode_text() == "HTML Message" and has_html)
 
+
+class AttachmentDraftEditor(QWidget):
+    contentChanged = Signal()
+    titleChanged = Signal(str)
+    previewRequested = Signal()
+
+    def __init__(self, scale: float = 1.0):
+        super().__init__()
+        self._scale = scale
+        self.draft_id: int | None = None
+        self.local_draft_id: int | None = None
+        self.local_only = False
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(10, self._scale), _scaled_int(10, self._scale), _scaled_int(10, self._scale), _scaled_int(10, self._scale))
+        layout.setSpacing(_scaled_int(8, self._scale))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        title_row = QHBoxLayout()
+        title_label = QLabel("Tab label")
+        title_label.setObjectName("fieldLabel")
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("Tab label")
+        self.title_input.setToolTip("Name this content tab")
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.setObjectName("secondaryButton")
+        self.preview_button.setVisible(False)
+        self.preview_button.clicked.connect(self.previewRequested.emit)
+        title_row.addWidget(title_label)
+        title_row.addWidget(self.title_input, 1)
+        title_row.addWidget(self.preview_button)
+        layout.addLayout(title_row)
+
+        self.html_editor = QTextEdit()
+        self.html_editor.setObjectName("bodyEditor")
+        self.html_editor.setPlaceholderText("<!-- Paste HTML content here -->")
+        self.html_editor.setToolTip("Compose the HTML attachment content")
+        self.html_editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.html_editor, 1)
+
+        self.title_input.textChanged.connect(lambda _text: self.titleChanged.emit(self.title_text()))
+        self.title_input.textChanged.connect(self.contentChanged.emit)
+        self.html_editor.textChanged.connect(self.contentChanged.emit)
+        self.html_editor.textChanged.connect(self._sync_preview_button_state)
+        self._sync_preview_button_state()
+
+    def title_text(self) -> str:
+        return self.title_input.text().strip()
+
+    def set_content(self, title: str, html_text: str, *, local_only: bool = False) -> None:
+        self.blockSignals(True)
+        self.title_input.blockSignals(True)
+        self.html_editor.blockSignals(True)
+        try:
+            self.local_only = local_only
+            self.title_input.setText(title)
+            self.html_editor.setPlainText(html_text)
+            self._sync_preview_button_state()
+        finally:
+            self.title_input.blockSignals(False)
+            self.html_editor.blockSignals(False)
+            self.blockSignals(False)
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "title": self.title_text(),
+            "html_text": self.html_editor.toPlainText(),
+        }
+
+    def _sync_preview_button_state(self) -> None:
+        self.preview_button.setVisible(bool(self.html_editor.toPlainText().strip()))
+
 class SubjectDraftsDialog(QDialog):
-    def __init__(self, parent: QWidget, auth_token: str, scale: float = 1.0):
+    def __init__(
+        self,
+        parent: QWidget,
+        auth_token: str,
+        scale: float = 1.0,
+        on_changed=None,
+    ):
         super().__init__(parent)
         self._scale = scale
         self._auth_token = auth_token
-        self._applied_subject = ""
+        self._on_changed = on_changed
+        self._loading_subjects = False
         self.setWindowTitle("Subjects")
         self.setModal(True)
         self.setObjectName("confirmDialog")
+        self.setMinimumSize(_scaled_int(900, self._scale), _scaled_int(660, self._scale))
         self._build_ui()
+        self.resize(_scaled_int(1060, self._scale), _scaled_int(760, self._scale))
         self._load_subjects()
 
     def _build_ui(self) -> None:
@@ -871,196 +1373,389 @@ class SubjectDraftsDialog(QDialog):
 
         header = QLabel("Manage Subjects")
         header.setObjectName("sectionTitle")
-        subtitle = QLabel("Select, edit, create, or remove subjects.")
+        subtitle = QLabel("Click any subject to edit inline. Use the cross button to remove a row.")
         subtitle.setObjectName("sectionSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(header)
         layout.addWidget(subtitle)
 
-        split = QSplitter(Qt.Horizontal)
-        split.setChildrenCollapsible(False)
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(
+            _scaled_int(12, self._scale),
+            _scaled_int(12, self._scale),
+            _scaled_int(12, self._scale),
+            _scaled_int(12, self._scale),
+        )
+        card_layout.setSpacing(_scaled_int(8, self._scale))
 
-        left_card = QFrame()
-        left_card.setObjectName("dialogCard")
-        left_layout = QVBoxLayout(left_card)
-        left_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
-        left_layout.setSpacing(_scaled_int(8, self._scale))
-
-        self.subject_list = QListWidget()
-        self.subject_list.currentItemChanged.connect(self._on_selection_changed)
-        self.subject_list.itemDoubleClicked.connect(lambda _item: self._apply_subject())
-        left_layout.addWidget(self.subject_list, 1)
-
-        right_card = QFrame()
-        right_card.setObjectName("dialogCard")
-        right_layout = QVBoxLayout(right_card)
-        right_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
-        right_layout.setSpacing(_scaled_int(8, self._scale))
-
-        self.subject_input = QLineEdit()
-        self.subject_input.setPlaceholderText("Type or edit a subject")
-        self.subject_input.setToolTip("Edit the selected subject")
-        right_layout.addWidget(QLabel("Subject"))
-        right_layout.addWidget(self.subject_input)
-
-        actions = QHBoxLayout()
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(_scaled_int(8, self._scale))
         self.new_button = QPushButton("New")
-        self.save_button = QPushButton("Save")
-        self.delete_button = QPushButton("Delete")
-        self.apply_button = QPushButton("Use Subject")
-        self.refresh_button = QPushButton("Refresh")
-        for button in (self.new_button, self.save_button, self.delete_button, self.apply_button, self.refresh_button):
-            actions.addWidget(button)
-        right_layout.addLayout(actions)
+        self.import_button = QPushButton("Import CSV")
+        self.remove_all_button = QPushButton("Remove All")
+        toolbar.addWidget(self.new_button)
+        toolbar.addWidget(self.import_button)
+        toolbar.addWidget(self.remove_all_button)
+        toolbar.addStretch()
+        card_layout.addLayout(toolbar)
 
-        self.count_label = QLabel("0 subjects")
+        self.subject_table = QTableWidget(0, 2)
+        self.subject_table.setObjectName("subjectTable")
+        self.subject_table.setHorizontalHeaderLabels(["Subject", ""])
+        self.subject_table.verticalHeader().setVisible(False)
+        self.subject_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.subject_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.subject_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.subject_table.itemChanged.connect(self._on_item_changed)
+        self.subject_table.cellClicked.connect(self._on_cell_clicked)
+        self.subject_table.horizontalHeader().setStretchLastSection(False)
+        self.subject_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.subject_table.setColumnWidth(1, _scaled_int(44, self._scale))
+        card_layout.addWidget(self.subject_table, 1)
+
+        self.count_label = QLabel(_subject_count_text(0))
         self.count_label.setObjectName("sectionSubtitle")
-        right_layout.addWidget(self.count_label)
-        right_layout.addStretch()
+        card_layout.addWidget(self.count_label)
+        layout.addWidget(card, 1)
 
-        self.new_button.clicked.connect(self._new_subject)
-        self.save_button.clicked.connect(self._save_subject)
-        self.delete_button.clicked.connect(self._delete_subject)
-        self.apply_button.clicked.connect(self._apply_subject)
-        self.refresh_button.clicked.connect(self._load_subjects)
-
-        split.addWidget(left_card)
-        split.addWidget(right_card)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 1)
-        layout.addWidget(split, 1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Done")
+        buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def selected_subject(self) -> str:
-        return self._applied_subject.strip()
+        self.new_button.clicked.connect(self._new_subject)
+        self.import_button.clicked.connect(self._import_subjects_from_csv)
+        self.remove_all_button.clicked.connect(self._delete_all_subjects)
 
-    def _item_record_id(self, item: QListWidgetItem | None) -> int | None:
+    def selected_subject(self) -> str:
+        current_item = self.subject_table.currentItem()
+        if current_item is None:
+            return ""
+        return self._table_item_subject(current_item).strip()
+
+    def _table_item_record_id(self, item: QTableWidgetItem | None) -> int | None:
         if item is None:
             return None
         value = item.data(Qt.UserRole)
         return int(value) if value else None
 
-    def _item_subject(self, item: QListWidgetItem | None) -> str:
+    def _table_item_subject(self, item: QTableWidgetItem | None) -> str:
         if item is None:
             return ""
         return str(item.data(Qt.UserRole + 2) or "")
 
-    def _set_item_data(self, item: QListWidgetItem, record_id: int | None, title: str, subject: str) -> None:
+    def _set_item_data(
+        self,
+        item: QTableWidgetItem,
+        record_id: int | None,
+        title: str,
+        subject: str,
+        *,
+        local_only: bool = False,
+        local_draft_id: int | None = None,
+    ) -> None:
         item.setData(Qt.UserRole, record_id)
         item.setData(Qt.UserRole + 1, title)
         item.setData(Qt.UserRole + 2, subject)
-        item.setText(title or subject or "Untitled Subject")
+        item.setData(ROLE_LOCAL_ONLY, local_only)
+        item.setData(ROLE_LOCAL_DRAFT_ID, local_draft_id)
+        item.setText(subject or title or "Untitled Subject")
+        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable)
 
-    def _load_subjects(self) -> None:
-        try:
-            payload = api_get_content(self._auth_token)
-        except Exception as exc:
-            self.count_label.setText("Unable to load subjects")
+    def _set_row_remove_button(self, row: int) -> None:
+        button = QPushButton("×")
+        button.setObjectName("dangerButton")
+        button.setToolTip("Remove subject")
+        button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
+        button.clicked.connect(lambda _checked=False, r=row: self._delete_subject_row(r))
+        container = QWidget()
+        row_layout = QHBoxLayout(container)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setAlignment(Qt.AlignCenter)
+        row_layout.addWidget(button)
+        self.subject_table.setCellWidget(row, 1, container)
+
+    def _refresh_remove_buttons(self) -> None:
+        for row in range(self.subject_table.rowCount()):
+            self._set_row_remove_button(row)
+
+    def _selected_subject_row(self) -> int:
+        item = self.subject_table.currentItem()
+        if item is None:
+            return -1
+        return self.subject_table.row(item)
+
+    def _update_count_label(self) -> None:
+        self.count_label.setText(_subject_count_text(self.subject_table.rowCount()))
+
+    def _notify_parent_subjects_changed(self) -> None:
+        if callable(self._on_changed):
+            try:
+                self._on_changed()
+            except Exception:
+                pass
             return
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_load_subjects"):
+            try:
+                parent._load_subjects()
+            except Exception:
+                pass
 
-        rows = payload.get("content") or []
-        filtered_rows: list[dict[str, object]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            details = row.get("details_json")
-            if isinstance(details, str):
-                try:
-                    details = json.loads(details)
-                except Exception:
-                    details = {}
-            kind = ""
-            if isinstance(details, dict):
-                kind = str(details.get("kind") or "")
-            content_type = str(row.get("content_type") or "")
-            if content_type in {"subject", "subject-draft"} or kind in {"subject", "subject-draft"}:
-                filtered_rows.append(row)
-        self.subject_list.blockSignals(True)
-        try:
-            self.subject_list.clear()
-            for row in reversed(filtered_rows):
-                item = QListWidgetItem()
-                record_id = int(row.get("id") or 0) or None
-                title = str(row.get("title") or row.get("subject") or "Subject")
-                subject = str(row.get("subject") or row.get("title") or "")
-                self._set_item_data(item, record_id, title, subject)
-                self.subject_list.addItem(item)
-            if self.subject_list.count() > 0:
-                self.subject_list.setCurrentRow(self.subject_list.count() - 1)
-        finally:
-            self.subject_list.blockSignals(False)
-
-        self.count_label.setText(f"{self.subject_list.count()} subject(s)")
-        if self.subject_list.currentItem() is not None:
-            self.subject_input.setText(self._item_subject(self.subject_list.currentItem()))
-
-    def _on_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        if current is None:
+    def _commit_active_subject_row(self) -> None:
+        row = self._selected_subject_row()
+        if row < 0:
             return
-        self.subject_input.setText(self._item_subject(current))
-
-    def _new_subject(self) -> None:
-        self.subject_list.blockSignals(True)
-        try:
-            self.subject_list.clearSelection()
-        finally:
-            self.subject_list.blockSignals(False)
-        self.subject_input.clear()
-
-    def _save_subject(self) -> None:
-        subject = self.subject_input.text().strip()
+        item = self.subject_table.item(row, 0)
+        if item is None:
+            return
+        subject = item.text().strip()
         if not subject:
             return
+        self._save_subject_row(row, subject)
 
-        current_item = self.subject_list.currentItem()
-        title = subject[:64] or "Subject"
-        details = {"kind": "subject"}
+    def _delete_subject_row(self, row: int) -> None:
+        if row < 0 or row >= self.subject_table.rowCount():
+            return
+        self.subject_table.removeRow(row)
+        self._refresh_remove_buttons()
+        if self.subject_table.rowCount() > 0:
+            self.subject_table.setCurrentCell(min(row, self.subject_table.rowCount() - 1), 0)
+        self._update_count_label()
+        self._save_subject_state()
+        self._notify_parent_subjects_changed()
+
+    def _new_subject(self) -> None:
+        self._commit_active_subject_row()
+        if self.subject_table.rowCount() >= MAX_SUBJECTS:
+            self._update_count_label()
+            return
+        self._loading_subjects = True
+        self.subject_table.blockSignals(True)
         try:
-            if current_item is not None and current_item.data(Qt.UserRole):
-                record_id = int(current_item.data(Qt.UserRole))
-                api_update_content(
-                    self._auth_token,
-                    record_id,
-                    "subject",
-                    title,
-                    subject=subject,
-                    details=details,
+            row = self.subject_table.rowCount()
+            self.subject_table.insertRow(row)
+            item = QTableWidgetItem()
+            self._set_item_data(item, None, "Subject", "")
+            self.subject_table.setItem(row, 0, item)
+            self._set_row_remove_button(row)
+            self.subject_table.setCurrentCell(row, 0)
+        finally:
+            self.subject_table.blockSignals(False)
+            self._loading_subjects = False
+        self._update_count_label()
+        item = self.subject_table.item(self.subject_table.currentRow(), 0)
+        if item is not None:
+            self.subject_table.editItem(item)
+
+    def _delete_all_subjects(self) -> None:
+        if self.subject_table.rowCount() == 0:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Remove All Subjects",
+            "Remove every subject from the list?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            _delete_ui_state(LOCAL_SUBJECT_STATE_KEY)
+        except Exception:
+            return
+        self.subject_table.blockSignals(True)
+        try:
+            self.subject_table.setRowCount(0)
+        finally:
+            self.subject_table.blockSignals(False)
+        self._update_count_label()
+        self._notify_parent_subjects_changed()
+
+    def _import_subjects_from_csv(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Subjects CSV",
+            "",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        imported_subjects: list[str] = []
+        try:
+            if path.suffix.lower() != ".csv":
+                raise ValueError("Please choose a CSV file.")
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.reader(handle)
+                for row in reader:
+                    for value in row:
+                        subject = str(value or "").strip()
+                        if subject:
+                            imported_subjects.append(subject)
+            if len(imported_subjects) > 100:
+                raise ValueError("CSV can contain at most 100 subjects.")
+            if self.subject_table.rowCount() + len(imported_subjects) > MAX_SUBJECTS:
+                raise ValueError("Total subjects cannot exceed 100.")
+            for subject in imported_subjects:
+                if len(subject) > 300:
+                    raise ValueError("Each subject must be 300 characters or less.")
+        except Exception:
+            self.count_label.setText("Unable to import CSV")
+            return
+
+        if not imported_subjects:
+            self.count_label.setText("No subjects found in CSV")
+            return
+
+        if self.subject_table.rowCount() >= MAX_SUBJECTS:
+            self.count_label.setText(_subject_count_text(self.subject_table.rowCount()))
+            return
+
+        added = 0
+        self._loading_subjects = True
+        self.subject_table.blockSignals(True)
+        try:
+            current_rows = self._subject_rows()
+            if self.subject_table.rowCount() + len(imported_subjects) > MAX_SUBJECTS:
+                raise ValueError("Total subjects cannot exceed 100.")
+            if len(current_rows) + len(imported_subjects) > MAX_SUBJECTS:
+                raise ValueError("Total subjects cannot exceed 100.")
+            for subject in imported_subjects:
+                if len(subject) > 300:
+                    raise ValueError("Each subject must be 300 characters or less.")
+            rows = current_rows[:]
+            for subject in imported_subjects:
+                rows.append({"title": subject[:64] or "Subject", "subject": subject})
+            self._apply_subject_rows(rows)
+            added = len(imported_subjects)
+        finally:
+            self.subject_table.blockSignals(False)
+            self._loading_subjects = False
+        self._refresh_remove_buttons()
+        self._update_count_label()
+        self._notify_parent_subjects_changed()
+
+    def _load_subjects(self) -> None:
+        filtered_rows = self._subject_rows()
+        selected_index = int(_load_ui_state(LOCAL_SUBJECT_STATE_KEY).get("selected_index") or -1)
+        if not filtered_rows:
+            filtered_rows = []
+        self._loading_subjects = True
+        self.subject_table.blockSignals(True)
+        try:
+            self._apply_subject_rows(filtered_rows, selected_index=selected_index)
+        finally:
+            self.subject_table.blockSignals(False)
+            self._loading_subjects = False
+
+        self._update_count_label()
+
+    def _subject_rows(self) -> list[dict[str, object]]:
+        payload = _load_ui_state(LOCAL_SUBJECT_STATE_KEY)
+        rows = payload.get("subjects") or []
+        result: list[dict[str, object]] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                subject = str(row.get("subject") or row.get("title") or "").strip()
+                if not subject:
+                    continue
+                result.append(
+                    {
+                        "title": str(row.get("title") or subject[:64] or "Subject"),
+                        "subject": subject,
+                    }
                 )
+        return result
+
+    def _apply_subject_rows(self, rows: list[dict[str, object]], *, selected_index: int = -1) -> None:
+        self.subject_table.setRowCount(0)
+        for row in rows:
+            row_index = self.subject_table.rowCount()
+            self.subject_table.insertRow(row_index)
+            item = QTableWidgetItem()
+            title = str(row.get("title") or row.get("subject") or "Subject")
+            subject = str(row.get("subject") or row.get("title") or "")
+            self._set_item_data(item, None, title, subject, local_only=True, local_draft_id=None)
+            self.subject_table.setItem(row_index, 0, item)
+            self._set_row_remove_button(row_index)
+        if self.subject_table.rowCount() > 0:
+            if 0 <= selected_index < self.subject_table.rowCount():
+                self.subject_table.setCurrentCell(selected_index, 0)
             else:
-                api_save_content(
-                    self._auth_token,
-                    "subject",
-                    title,
-                    subject=subject,
-                    details=details,
-                )
-        except Exception:
-            return
-        self._load_subjects()
-        self.subject_input.setText(subject)
+                self.subject_table.setCurrentCell(self.subject_table.rowCount() - 1, 0)
 
-    def _delete_subject(self) -> None:
-        current_item = self.subject_list.currentItem()
-        if current_item is None:
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading_subjects:
             return
-        record_id = current_item.data(Qt.UserRole)
-        if not record_id:
-            self._new_subject()
+        if item is None:
             return
+        row = self.subject_table.row(item)
+        if row < 0 or self.subject_table.column(item) != 0:
+            return
+        self._save_subject_row(row, item.text().strip())
+
+    def _on_cell_clicked(self, row: int, column: int) -> None:
+        if self._loading_subjects or row < 0 or column != 0:
+            return
+        item = self.subject_table.item(row, 0)
+        if item is None:
+            return
+        self.subject_table.editItem(item)
+
+    def _save_subject_row(self, row: int, subject_text: str | None = None) -> None:
+        if self._loading_subjects or row < 0 or row >= self.subject_table.rowCount():
+            return
+        item = self.subject_table.item(row, 0)
+        if item is None:
+            return
+        subject = (subject_text if subject_text is not None else item.text()).strip()
+        if not subject:
+            return
+        if len(subject) > 300:
+            self.count_label.setText("Subject must be 300 characters or less")
+            return
+        if not self._table_item_record_id(item) and self.subject_table.rowCount() >= MAX_SUBJECTS:
+            self.count_label.setText(_subject_count_text(self.subject_table.rowCount()))
+            return
+        title = subject[:64] or "Subject"
         try:
-            api_delete_content(self._auth_token, int(record_id))
+            self.subject_table.blockSignals(True)
+            try:
+                self._set_item_data(item, None, title, subject, local_only=True, local_draft_id=None)
+            finally:
+                self.subject_table.blockSignals(False)
+            self._update_count_label()
+            self._save_subject_state()
         except Exception:
             return
-        self._load_subjects()
-        self.subject_input.clear()
 
-    def _apply_subject(self) -> None:
-        self._applied_subject = self.subject_input.text().strip()
-        if self._applied_subject:
-            self.accept()
+        self._notify_parent_subjects_changed()
+
+    def _save_subject_state(self) -> None:
+        rows: list[dict[str, object]] = []
+        for row in range(self.subject_table.rowCount()):
+            item = self.subject_table.item(row, 0)
+            if item is None:
+                continue
+            subject = item.text().strip()
+            if not subject:
+                continue
+            rows.append({"title": subject[:64] or "Subject", "subject": subject})
+        _upsert_ui_state(
+            LOCAL_SUBJECT_STATE_KEY,
+            {
+                "subjects": rows,
+                "selected_index": self.subject_table.currentRow(),
+            },
+        )
 
 
 class OutputOptionsDialog(QDialog):
@@ -1148,6 +1843,172 @@ class OutputOptionsDialog(QDialog):
         for option in options:
             card_layout.addWidget(QRadioButton(option))
         return card
+
+
+class FileFormatDialog(QDialog):
+    def __init__(self, parent=None, scale: float = 1.0, selected_format: str = "PDF document"):
+        super().__init__(parent)
+        self._scale = scale
+        self._selected_format = selected_format
+        self.setWindowTitle("Choose File Format")
+        self.setModal(True)
+        self.setObjectName("outputDialog")
+        self._buttons: list[QCheckBox] = []
+        self._random_checkbox: QCheckBox | None = None
+        self.auto_name: QRadioButton | None = None
+        self.custom_name: QRadioButton | None = None
+        self.custom_name_input: QLineEdit | None = None
+        self.file_extension_label: QLabel | None = None
+        self._build_ui()
+        self._apply_initial_selection()
+        self._wire_exclusive_selection()
+        self._sync_file_name_controls()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
+
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        card_layout.setSpacing(_scaled_int(8, self._scale))
+
+        title = QLabel("FILE FORMAT")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+
+        self._random_checkbox = QCheckBox("Random format")
+        self._random_checkbox.setToolTip("Choose a random format from the selected file types")
+        self._random_checkbox.toggled.connect(self._handle_random_toggled)
+        card_layout.addWidget(self._random_checkbox)
+
+        for label in [
+            "PDF document",
+            "Excel spreadsheet (XLSX)",
+            "Excel template (XLTX)",
+            "PowerPoint presentation (PPTX)",
+            "PowerPoint slideshow (PPSX)",
+            "Word document (DOCX)",
+        ]:
+            button = QCheckBox(label)
+            if label == self._selected_format:
+                button.setChecked(True)
+            button.toggled.connect(self._handle_format_toggled)
+            self._buttons.append(button)
+            card_layout.addWidget(button)
+
+        layout.addWidget(card)
+
+        file_card = QFrame()
+        file_card.setObjectName("dialogCard")
+        file_layout = QVBoxLayout(file_card)
+        file_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        file_layout.setSpacing(_scaled_int(8, self._scale))
+
+        file_title = QLabel("FILE NAME")
+        file_title.setObjectName("sectionTitle")
+        file_layout.addWidget(file_title)
+
+        self.auto_name = QRadioButton("Auto-generate a unique name")
+        self.custom_name = QRadioButton("Use a custom name")
+        self.auto_name.setChecked(True)
+        self.auto_name.toggled.connect(self._sync_file_name_controls)
+        self.custom_name.toggled.connect(self._sync_file_name_controls)
+        file_layout.addWidget(self.auto_name)
+
+        custom_row = QHBoxLayout()
+        custom_row.setContentsMargins(0, 0, 0, 0)
+        custom_row.setSpacing(_scaled_int(8, self._scale))
+        self.custom_name_input = QLineEdit()
+        self.custom_name_input.setPlaceholderText("Enter file name")
+        self.file_extension_label = QLabel(self._format_extension())
+        custom_row.addWidget(self.custom_name)
+        custom_row.addWidget(self.custom_name_input, 1)
+        custom_row.addWidget(self.file_extension_label)
+        file_layout.addLayout(custom_row)
+        layout.addWidget(file_card)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _apply_initial_selection(self) -> None:
+        if self._random_checkbox is None:
+            return
+        current = (self._selected_format or "").strip()
+        if not current:
+            return
+        if current == "Random format":
+            self._random_checkbox.setChecked(True)
+            return
+        current_values = {part.strip() for part in current.split(",") if part.strip()}
+        for button in self._buttons:
+            if button.text() in current_values:
+                button.setChecked(True)
+
+    def _wire_exclusive_selection(self) -> None:
+        # Keep the random option mutually exclusive with specific file formats.
+        if self._random_checkbox is not None:
+            self._random_checkbox.setTristate(False)
+        for button in self._buttons:
+            button.setTristate(False)
+
+    def _handle_random_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        for button in self._buttons:
+            if button.isChecked():
+                button.blockSignals(True)
+                try:
+                    button.setChecked(False)
+                finally:
+                    button.blockSignals(False)
+        self._sync_file_name_controls()
+
+    def _handle_format_toggled(self, checked: bool) -> None:
+        if not checked or self._random_checkbox is None:
+            return
+        if self._random_checkbox.isChecked():
+            self._random_checkbox.blockSignals(True)
+            try:
+                self._random_checkbox.setChecked(False)
+            finally:
+                self._random_checkbox.blockSignals(False)
+        self._sync_file_name_controls()
+
+    def selected_format(self) -> str:
+        if self._random_checkbox is not None and self._random_checkbox.isChecked():
+            return "Random format"
+        selected = [button.text() for button in self._buttons if button.isChecked()]
+        if selected:
+            if len(selected) == 1:
+                return selected[0]
+            return ", ".join(selected)
+        return self._selected_format
+
+    def _format_extension(self) -> str:
+        selected = [button.text() for button in self._buttons if button.isChecked()]
+        if len(selected) != 1:
+            return ".out"
+        mapping = {
+            "PDF document": ".pdf",
+            "Excel spreadsheet (XLSX)": ".xlsx",
+            "Excel template (XLTX)": ".xltx",
+            "PowerPoint presentation (PPTX)": ".pptx",
+            "PowerPoint slideshow (PPSX)": ".ppsx",
+            "Word document (DOCX)": ".docx",
+        }
+        return mapping.get(selected[0], ".out")
+
+    def _sync_file_name_controls(self) -> None:
+        auto_checked = bool(self.auto_name and self.auto_name.isChecked())
+        if self.custom_name_input is not None:
+            self.custom_name_input.setEnabled(not auto_checked)
+        if self.file_extension_label is not None:
+            self.file_extension_label.setText(self._format_extension())
 
 
 class HtmlPreviewDialog(QDialog):
@@ -1435,14 +2296,20 @@ class DashboardPage(QWidget):
         self.subject_drafts_list = QListWidget()
         self.subject_toggle_button = QPushButton("More")
         self.subject_new_button = QPushButton("New Subject")
-        self.subject_save_button = QPushButton("Save Subject")
-        self.subject_delete_button = QPushButton("Delete Subject")
-        self.subject_refresh_button = QPushButton("Refresh")
-        self.subject_count_label = QLabel("0")
+        self.subject_import_button = QPushButton("Import CSV")
+        self.subject_count_label = QLabel(_subject_count_text(0))
         self.body_tabs = QTabWidget()
         self.body_add_button = QPushButton("+")
         self.body_upload_button = QPushButton("Upload")
-        self.body_refresh_button = QPushButton("Refresh")
+        self.body_refresh_button = QPushButton("Reset Body")
+        self.attach_tabs = QTabWidget()
+        self.attach_add_button = QPushButton("+")
+        self.attach_upload_button = QPushButton("Upload")
+        self.attach_reset_button = QPushButton("Reset Content")
+        self.attach_convert_checkbox = QCheckBox("Convert")
+        self.attach_choose_format_button = QPushButton("Choose Format")
+        self.attach_format_value = "PDF document"
+        self.attach_format_label = QLabel(self._attachment_format_summary(self.attach_format_value))
         self.pending_emails_editor = QTextEdit()
         self.subject_input = QLineEdit()
         self.body_editor = QTextEdit()
@@ -1455,17 +2322,23 @@ class DashboardPage(QWidget):
         self.launch_preset_label = QLabel("Default")
         self.custom1_input = QLineEdit()
         self.custom2_input = QLineEdit()
-        self.custom_url_input = QLineEdit()
-        self.proxy_input = QLineEdit()
         self.sender_limit = QSpinBox()
         self.delay_from = QDoubleSpinBox()
         self.delay_to = QDoubleSpinBox()
         self.retry_count = QSpinBox()
+        self.retry_enable_checkbox = QCheckBox("Enable")
         self.ai_provider_combo = QComboBox()
         self.ai_api_key_input = QLineEdit()
         self.ai_connect_button = QPushButton("Connect")
         self.ai_status_label = QLabel("Not connected")
         self.ai_model_combo = QComboBox()
+        self.delay_fixed_radio = QRadioButton("Fixed")
+        self.delay_random_radio = QRadioButton("Random range")
+        self.delay_human_radio = QRadioButton("Human-like pattern")
+        self.send_seq_radio = QRadioButton("Sequential")
+        self.send_rand_radio = QRadioButton("Random shuffle")
+        self.window_parallel_radio = QRadioButton("Parallel (all windows at once)")
+        self.window_sequential_radio = QRadioButton("Sequential (one window at a time)")
         self._available_ai_models: list[str] = []
         self.window_mode_group = QButtonGroup(self)
         self.delay_type_group = QButtonGroup(self)
@@ -1478,7 +2351,17 @@ class DashboardPage(QWidget):
         self._subject_body_save_timer.setSingleShot(True)
         self._subject_body_save_timer.setInterval(700)
         self._subject_body_save_timer.timeout.connect(self._persist_subject_body_state)
+        self._attachment_save_timer = QTimer(self)
+        self._attachment_save_timer.setSingleShot(True)
+        self._attachment_save_timer.setInterval(700)
+        self._attachment_save_timer.timeout.connect(self._persist_attachment_state)
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(700)
+        self._settings_save_timer.timeout.connect(self._persist_sending_settings_state)
+        self._subject_manager_dialog: SubjectDraftsDialog | None = None
         self._workspace_loading = False
+        self._active_attachment_widget: AttachmentDraftEditor | None = None
         self._row_animations: list[QPropertyAnimation] = []
         self._floating_windows: list[QDialog] = []
         self._browser_sessions: list[BrowserSessionHandle] = []
@@ -1667,7 +2550,7 @@ class DashboardPage(QWidget):
         self.tabs.setObjectName("mainTabs")
         self.tabs.addTab(self._build_data_tab(), "Data")
         self.tabs.addTab(self._build_subject_body_tab(), "Subject + Body")
-        self.tabs.addTab(self._build_html_content_tab(), "Content")
+        self.tabs.addTab(self._build_html_content_tab(), "Attach Content")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
         self.tabs.addTab(self._build_tags_tab(), "Tags")
         self.tabs.addTab(self._build_blaster_tab(), "Campaign")
@@ -1769,8 +2652,10 @@ class DashboardPage(QWidget):
         self.subject_input = QLineEdit()
         self.subject_input.setPlaceholderText("Type your subject here")
         self.subject_input.setToolTip("Edit the active subject")
+        self.subject_input.setMaxLength(300)
         self.subject_toggle_button.setObjectName("secondaryButton")
         self.subject_toggle_button.setToolTip("Open the subject manager modal")
+        self.subject_toggle_button.setVisible(False)
         self.subject_toggle_button.clicked.connect(self._open_subject_manager)
         subject_row.addWidget(subject_label)
         subject_row.addWidget(self.subject_input, 1)
@@ -1779,24 +2664,13 @@ class DashboardPage(QWidget):
 
         subject_toolbar = QHBoxLayout()
         self.subject_new_button.setObjectName("secondaryButton")
-        self.subject_save_button.setObjectName("primaryButton")
-        self.subject_delete_button.setObjectName("dangerButton")
-        self.subject_refresh_button.setObjectName("secondaryButton")
         self.subject_new_button.clicked.connect(self._new_subject_draft)
-        self.subject_save_button.clicked.connect(self._save_subject_draft)
-        self.subject_delete_button.clicked.connect(self._delete_subject_draft)
-        self.subject_refresh_button.clicked.connect(self.load_user_workspace)
         self.subject_new_button.setToolTip("Start a new subject")
-        self.subject_save_button.setToolTip("Save the active subject")
-        self.subject_delete_button.setToolTip("Remove the selected subject")
-        self.subject_refresh_button.setToolTip("Reload subjects from the local database")
-        for button in (
-            self.subject_new_button,
-            self.subject_save_button,
-            self.subject_delete_button,
-            self.subject_refresh_button,
-        ):
-            subject_toolbar.addWidget(button)
+        subject_toolbar.addWidget(self.subject_new_button)
+        self.subject_import_button.setObjectName("secondaryButton")
+        self.subject_import_button.clicked.connect(self._load_subject_from_file)
+        self.subject_import_button.setToolTip("Import subject rows from a CSV file")
+        subject_toolbar.addWidget(self.subject_import_button)
         subject_toolbar.addStretch()
         subject_box.addLayout(subject_toolbar)
         subject_box.addWidget(self.subject_count_label)
@@ -1817,7 +2691,7 @@ class DashboardPage(QWidget):
         self.body_upload_button.setToolTip("Upload CSV text bodies or HTML body files")
         self.body_refresh_button.setObjectName("secondaryButton")
         self.body_refresh_button.clicked.connect(self.load_user_workspace)
-        self.body_refresh_button.setToolTip("Reload bodies from the local database")
+        self.body_refresh_button.setToolTip("Reset the body workspace to a single active body tab")
         body_header.addWidget(self.body_add_button)
         body_header.addWidget(self.body_upload_button)
         body_header.addWidget(self.body_refresh_button)
@@ -1842,77 +2716,78 @@ class DashboardPage(QWidget):
         layout = QVBoxLayout(page)
         layout.setSpacing(_scaled_int(10, self._scale))
 
-        header = self._section_title("HTML CONTENT EDITOR")
-        layout.addWidget(header)
+        content_card, content_layout = self._card("", None)
+        content_header = QHBoxLayout()
+        content_header.setContentsMargins(0, 0, 0, 0)
+        content_header.setSpacing(_scaled_int(8, self._scale))
+        content_label = QLabel("ATTACHMENT CONTENT")
+        content_label.setObjectName("sectionTitle")
+        content_header.addWidget(content_label)
+        content_header.addStretch()
+        self.attach_add_button.setObjectName("secondaryButton")
+        self.attach_add_button.setFixedWidth(_scaled_int(34, self._scale))
+        self.attach_add_button.setToolTip("Add a new HTML attachment tab")
+        self.attach_add_button.clicked.connect(self._new_attachment_draft_tab)
+        self.attach_upload_button.setObjectName("secondaryButton")
+        self.attach_upload_button.clicked.connect(self._upload_attachment_files)
+        self.attach_upload_button.setToolTip("Upload HTML files and create tabs")
+        self.attach_reset_button.setObjectName("secondaryButton")
+        self.attach_reset_button.clicked.connect(self._reset_attachment_tabs)
+        self.attach_reset_button.setToolTip("Reset attachments to a single blank tab")
+        content_header.addWidget(self.attach_add_button)
+        content_header.addWidget(self.attach_upload_button)
+        content_header.addWidget(self.attach_reset_button)
+        content_layout.addLayout(content_header)
 
-        status_banner = QFrame()
-        status_banner.setObjectName("panelCard")
-        status_layout = QHBoxLayout(status_banner)
-        status_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(10, self._scale), _scaled_int(12, self._scale), _scaled_int(10, self._scale))
-        status_label = QLabel("No active windows")
-        status_label.setObjectName("placeholderText")
-        status_layout.addWidget(status_label)
-        status_layout.addStretch()
-        layout.addWidget(status_banner)
+        self.attach_tabs.setTabsClosable(True)
+        self.attach_tabs.setMovable(True)
+        self.attach_tabs.setDocumentMode(True)
+        self.attach_tabs.setUsesScrollButtons(True)
+        self.attach_tabs.tabCloseRequested.connect(self._remove_attachment_draft_tab)
+        self.attach_tabs.currentChanged.connect(self._on_attachment_tab_changed)
+        self.attach_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout.addWidget(self.attach_tabs, 1)
 
-        self.html_editor.setObjectName("bodyEditor")
-        self.html_editor.setPlaceholderText("<!-- Paste your HTML template here... -->")
-        self.html_editor.setToolTip("Paste the HTML template here")
-        self.html_editor.setPlainText(
-            "<html>\n  <body style='font-family: Segoe UI; background:#0f172a; color:#e5eefc;'>\n    <h1>Email Campaign Title</h1>\n    <p>Hello {{first_name}}, welcome to the preview.</p>\n  </body>\n</html>"
-        )
-        self.html_editor.setMinimumHeight(_scaled_int(300, self._scale))
-        layout.addWidget(self.html_editor, 1)
+        export_card, export_layout = self._card("ATTACHMENT FORMAT OPTIONS", "Choose the attachment file format and preview behavior for the active HTML content.")
+        export_form = QFormLayout()
+        export_form.setLabelAlignment(Qt.AlignLeft)
 
-        footer_row = QHBoxLayout()
-        preview_html = QPushButton("Preview HTML")
-        preview_html.setObjectName("primaryButton")
-        convert_check = QCheckBox("Convert to file")
-        convert_check.setChecked(True)
-        convert_file = QPushButton("Export to file")
-        convert_file.setObjectName("secondaryButton")
-        convert_preview = QPushButton("Export and Preview")
-        convert_preview.setObjectName("primaryButton")
-        preview_html.setToolTip("Preview the HTML content")
-        convert_check.setToolTip("Enable export to a file")
-        convert_file.setToolTip("Open the file export options")
-        convert_preview.setToolTip("Export the HTML and preview the result")
-        preview_html.clicked.connect(lambda: self._preview_html_content())
-        convert_file.clicked.connect(lambda: self._open_output_options_dialog())
-        convert_preview.clicked.connect(lambda: self._open_output_options_dialog(preview=True))
-        footer_row.addWidget(preview_html)
-        footer_row.addWidget(convert_check)
-        footer_row.addWidget(convert_file)
-        footer_row.addWidget(convert_preview)
-        footer_row.addStretch()
-        layout.addLayout(footer_row)
+        self.attach_convert_checkbox.setChecked(True)
+        self.attach_convert_checkbox.setToolTip("Enable file conversion options")
+        self.attach_convert_checkbox.toggled.connect(self._sync_attachment_convert_controls)
+        convert_row = QHBoxLayout()
+        convert_row.setContentsMargins(0, 0, 0, 0)
+        convert_row.setSpacing(_scaled_int(10, self._scale))
+        convert_label = QLabel("Convert")
+        convert_label.setObjectName("fieldLabel")
+        convert_row.addWidget(convert_label)
+        convert_row.addWidget(self.attach_convert_checkbox)
+        convert_row.addStretch()
+        export_form.addRow(self._wrap_layout(convert_row))
 
-        attach_card, attach_layout = self._card("ATTACHMENT", "Configure file naming and upload actions.")
-        auto_radio = QRadioButton("Auto-generated (random unique name)")
-        auto_radio.setChecked(True)
-        auto_radio.setToolTip("Generate a random attachment name")
-        attach_layout.addWidget(auto_radio)
+        self.attach_format_label.setObjectName("sectionSubtitle")
+        self.attach_choose_format_button.setObjectName("secondaryButton")
+        self.attach_choose_format_button.clicked.connect(self._choose_attachment_file_format)
+        self.attach_choose_format_button.setToolTip("Open a modal to choose one or more export file formats")
+        format_row = QHBoxLayout()
+        format_row.setContentsMargins(0, 0, 0, 0)
+        format_row.setSpacing(_scaled_int(8, self._scale))
+        format_row.addWidget(self.attach_choose_format_button)
+        format_row.addWidget(self.attach_format_label)
+        format_row.addStretch()
+        self.attach_format_row_widget = self._wrap_layout(format_row)
+        export_form.addRow("File format", self.attach_format_row_widget)
+        self.attach_format_row_label = export_form.labelForField(self.attach_format_row_widget)
 
-        attach_actions = QHBoxLayout()
-        upload_button = QPushButton("Upload Custom Attachment")
-        upload_button.setObjectName("secondaryButton")
-        remove_button = QPushButton("Remove")
-        remove_button.setObjectName("dangerButton")
-        upload_button.setToolTip("Upload a custom attachment")
-        remove_button.setToolTip("Remove the selected attachment")
-        upload_button.clicked.connect(lambda: self._log_action("Uploaded attachment"))
-        remove_button.clicked.connect(lambda: self._log_action("Removed attachment"))
-        attach_actions.addWidget(upload_button)
-        attach_actions.addWidget(remove_button)
-        attach_actions.addStretch()
-        attach_layout.addLayout(attach_actions)
+        export_layout.addLayout(export_form)
+        self._sync_attachment_convert_controls(self.attach_convert_checkbox.isChecked())
 
-        attachment_hint = QLabel("PDFs, images, and other files can be attached later in the logic phase.")
-        attachment_hint.setObjectName("sectionHint")
-        attachment_hint.setWordWrap(True)
-        attach_layout.addWidget(attachment_hint)
-
-        layout.addWidget(attach_card)
+        layout.addWidget(content_card, 1)
+        layout.addWidget(export_card)
+        if self.attach_tabs.count() == 0:
+            self._add_attachment_draft_tab(select=True)
+        self._sync_active_attachment_widget_refs()
+        self._update_attachment_tab_controls()
         return self._tab_scroll(page)
 
     def _build_settings_tab(self) -> QWidget:
@@ -1957,80 +2832,49 @@ class DashboardPage(QWidget):
         send_layout.addLayout(form)
 
         delay_type_row = QHBoxLayout()
-        fixed_radio = QRadioButton("Fixed")
-        random_radio = QRadioButton("Random range")
-        human_radio = QRadioButton("Human-like pattern")
-        random_radio.setChecked(True)
-        fixed_radio.setToolTip("Use the same delay for every send")
-        random_radio.setToolTip("Use a random delay within the range")
-        human_radio.setToolTip("Use a human-like delay pattern")
+        self.delay_fixed_radio.setToolTip("Use the same delay for every send")
+        self.delay_random_radio.setToolTip("Use a random delay within the range")
+        self.delay_human_radio.setToolTip("Use a human-like delay pattern")
         self.delay_type_group = QButtonGroup(self)
         self.delay_type_group.setExclusive(True)
-        for button in (fixed_radio, random_radio, human_radio):
+        for button in (self.delay_fixed_radio, self.delay_random_radio, self.delay_human_radio):
             self.delay_type_group.addButton(button)
             delay_type_row.addWidget(button)
         delay_type_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Delay type", self._wrap_layout(delay_type_row)))
 
         retry_row = QHBoxLayout()
-        retry_enable = QCheckBox("Enable")
-        retry_enable.setChecked(True)
-        retry_enable.setToolTip("Enable retry handling for failed sends")
-        retry_row.addWidget(retry_enable)
+        self.retry_enable_checkbox.setChecked(True)
+        self.retry_enable_checkbox.setToolTip("Enable retry handling for failed sends")
+        retry_row.addWidget(self.retry_enable_checkbox)
         retry_row.addWidget(self.retry_count)
         retry_row.addWidget(QLabel("retries"))
         retry_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Retry failed sends", self._wrap_layout(retry_row)))
 
         order_row = QHBoxLayout()
-        seq_radio = QRadioButton("Sequential")
-        rand_radio = QRadioButton("Random shuffle")
-        seq_radio.setChecked(True)
-        seq_radio.setToolTip("Send in list order")
-        rand_radio.setToolTip("Shuffle the send order")
+        self.send_seq_radio.setToolTip("Send in list order")
+        self.send_rand_radio.setToolTip("Shuffle the send order")
         self.send_order_group = QButtonGroup(self)
         self.send_order_group.setExclusive(True)
-        for button in (seq_radio, rand_radio):
+        for button in (self.send_seq_radio, self.send_rand_radio):
             self.send_order_group.addButton(button)
             order_row.addWidget(button)
         order_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Email send order", self._wrap_layout(order_row)))
 
         window_mode_row = QHBoxLayout()
-        parallel_radio = QRadioButton("Parallel (all windows at once)")
-        sequential_window_radio = QRadioButton("Sequential (one window at a time)")
-        parallel_radio.setChecked(True)
-        parallel_radio.setToolTip("Launch and send in parallel")
-        sequential_window_radio.setToolTip("Rotate through windows one at a time")
+        self.window_parallel_radio.setToolTip("Launch and send in parallel")
+        self.window_sequential_radio.setToolTip("Rotate through windows one at a time")
         self.window_mode_group = QButtonGroup(self)
         self.window_mode_group.setExclusive(True)
-        for button in (parallel_radio, sequential_window_radio):
+        for button in (self.window_parallel_radio, self.window_sequential_radio):
             self.window_mode_group.addButton(button)
             window_mode_row.addWidget(button)
         window_mode_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Window send mode", self._wrap_layout(window_mode_row)))
 
         layout.addWidget(send_card)
-
-        proxy_card, proxy_layout = self._card("ADVANCED SETTINGS (PROXIES)", "Optional runtime safeguards.")
-        proxy_row = QHBoxLayout()
-        proxy_enable = QCheckBox("Enable Proxy (IP:Port per window)")
-        self.proxy_input.setPlaceholderText("Proxy list or endpoint configuration")
-        proxy_enable.setToolTip("Route sessions through a proxy per window")
-        self.proxy_input.setToolTip("Enter proxy addresses or endpoint settings")
-        proxy_row.addWidget(proxy_enable)
-        proxy_row.addWidget(self.proxy_input, 1)
-        proxy_layout.addLayout(proxy_row)
-        layout.addWidget(proxy_card)
-
-        startup_card, startup_layout = self._card("ADDITIONAL STARTUP TABS", "Open custom URLs when each session launches.")
-        startup_checkbox = QCheckBox("Open custom URL in a new tab on startup")
-        self.custom_url_input.setPlaceholderText("Custom URL")
-        startup_checkbox.setToolTip("Open a custom page when each session starts")
-        self.custom_url_input.setToolTip("Enter the startup URL to open")
-        startup_layout.addWidget(startup_checkbox)
-        startup_layout.addWidget(self.custom_url_input)
-        layout.addWidget(startup_card)
 
         ai_card, ai_layout = self._card("AI ASSISTANT", "Connect an AI provider to unlock model selection.")
         ai_form = QFormLayout()
@@ -2081,10 +2925,22 @@ class DashboardPage(QWidget):
 
         save_button = QPushButton("Save Settings")
         save_button.setObjectName("primaryButton")
-        save_button.clicked.connect(lambda: self._log_action("Saved settings"))
+        save_button.clicked.connect(lambda: self._save_sending_settings())
         save_button.setToolTip("Save the current sending settings")
         layout.addWidget(save_button, alignment=Qt.AlignLeft)
         layout.addStretch()
+
+        self.sender_limit.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.delay_from.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.delay_to.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.retry_count.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.retry_enable_checkbox.toggled.connect(lambda _value: self._schedule_sending_settings_save())
+        self.delay_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
+        self.send_order_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
+        self.window_mode_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
+        self.ai_provider_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.ai_api_key_input.textEdited.connect(lambda _value: self._on_ai_api_key_changed())
+        self.ai_model_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
 
         self._refresh_ai_models()
         self._sync_ai_connection_ui()
@@ -2124,6 +2980,169 @@ class DashboardPage(QWidget):
                 self.ai_model_combo.setCurrentIndex(index)
         self.ai_model_combo.blockSignals(False)
 
+    def _current_sending_settings_payload(self) -> dict[str, object]:
+        delay_type = "Random range"
+        if self.delay_fixed_radio.isChecked():
+            delay_type = "Fixed"
+        elif self.delay_human_radio.isChecked():
+            delay_type = "Human-like pattern"
+
+        email_send_order = "Sequential"
+        if self.send_rand_radio.isChecked():
+            email_send_order = "Random shuffle"
+
+        window_send_mode = "Parallel"
+        if self.window_sequential_radio.isChecked():
+            window_send_mode = "Sequential"
+
+        return {
+            "sender_limit": int(self.sender_limit.value()),
+            "delay_from": float(self.delay_from.value()),
+            "delay_to": float(self.delay_to.value()),
+            "retry_count": int(self.retry_count.value()),
+            "retry_enabled": bool(self.retry_enable_checkbox.isChecked()),
+            "delay_type": delay_type,
+            "email_send_order": email_send_order,
+            "window_send_mode": window_send_mode,
+            "ai_provider": self.ai_provider_combo.currentText().strip() or "ChatGPT",
+            "ai_api_key": self.ai_api_key_input.text(),
+            "ai_model": self.ai_model_combo.currentText().strip(),
+            "ai_connected": bool(self.state.ai_connected),
+            "available_models": list(self._available_ai_models),
+        }
+
+    def _apply_sending_settings_payload(self, payload: dict[str, object]) -> None:
+        def _as_int(value: object, default: int) -> int:
+            try:
+                return int(float(value))
+            except Exception:
+                return default
+
+        def _as_float(value: object, default: float) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return default
+
+        def _as_bool(value: object, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "on"}:
+                    return True
+                if lowered in {"0", "false", "no", "off"}:
+                    return False
+            return default
+
+        def _block(widget: QWidget, value: Callable[[], None]) -> None:
+            widget.blockSignals(True)
+            try:
+                value()
+            finally:
+                widget.blockSignals(False)
+
+        sender_limit = _as_int(payload.get("sender_limit"), 500)
+        delay_from = _as_float(payload.get("delay_from"), 0.5)
+        delay_to = _as_float(payload.get("delay_to"), 1.0)
+        retry_count = _as_int(payload.get("retry_count"), 3)
+        retry_enabled = _as_bool(payload.get("retry_enabled"), True)
+        delay_type = str(payload.get("delay_type") or "Random range")
+        email_send_order = str(payload.get("email_send_order") or "Sequential")
+        window_send_mode = str(payload.get("window_send_mode") or "Parallel")
+        ai_provider = str(payload.get("ai_provider") or "ChatGPT")
+        ai_api_key = str(payload.get("ai_api_key") or "")
+        ai_model = str(payload.get("ai_model") or "")
+        ai_connected = _as_bool(payload.get("ai_connected"), False)
+        available_models_raw = payload.get("available_models")
+        available_models = available_models_raw if isinstance(available_models_raw, list) else []
+
+        _block(self.sender_limit, lambda: self.sender_limit.setValue(sender_limit))
+        _block(self.delay_from, lambda: self.delay_from.setValue(delay_from))
+        _block(self.delay_to, lambda: self.delay_to.setValue(delay_to))
+        _block(self.retry_count, lambda: self.retry_count.setValue(retry_count))
+        _block(self.retry_enable_checkbox, lambda: self.retry_enable_checkbox.setChecked(retry_enabled))
+
+        _block(self.delay_fixed_radio, lambda: self.delay_fixed_radio.setChecked(delay_type == "Fixed"))
+        _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Random range"))
+        _block(self.delay_human_radio, lambda: self.delay_human_radio.setChecked(delay_type == "Human-like pattern"))
+        if not any((self.delay_fixed_radio.isChecked(), self.delay_random_radio.isChecked(), self.delay_human_radio.isChecked())):
+            self.delay_random_radio.setChecked(True)
+
+        _block(self.send_seq_radio, lambda: self.send_seq_radio.setChecked(email_send_order != "Random shuffle"))
+        _block(self.send_rand_radio, lambda: self.send_rand_radio.setChecked(email_send_order == "Random shuffle"))
+
+        _block(self.window_parallel_radio, lambda: self.window_parallel_radio.setChecked(window_send_mode != "Sequential"))
+        _block(self.window_sequential_radio, lambda: self.window_sequential_radio.setChecked(window_send_mode == "Sequential"))
+
+        _block(self.ai_provider_combo, lambda: self.ai_provider_combo.setCurrentText(ai_provider))
+        _block(self.ai_api_key_input, lambda: self.ai_api_key_input.setText(ai_api_key))
+
+        self.state.sender_limit = sender_limit
+        self.state.delay_from = delay_from
+        self.state.delay_to = delay_to
+        self.state.retry_count = retry_count
+        self.state.retry_enabled = retry_enabled
+        self.state.delay_type = delay_type
+        self.state.email_send_order = email_send_order
+        self.state.window_send_mode = window_send_mode
+        self.state.ai_provider = ai_provider
+        self.state.ai_api_key = ai_api_key
+        self.state.ai_model = ai_model
+        self.state.ai_connected = ai_connected
+        self._available_ai_models = [str(item) for item in available_models if str(item).strip()]
+        self.state.ai_available_models = list(self._available_ai_models)
+
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
+
+    def _load_sending_settings_state(self, mysql_settings_map: dict[str, object] | None = None) -> None:
+        local_payload = _load_ui_state(LOCAL_SETTINGS_STATE_KEY)
+        payload: dict[str, object] = {}
+        if isinstance(mysql_settings_map, dict):
+            payload.update(mysql_settings_map)
+        if isinstance(local_payload, dict):
+            payload.update(local_payload)
+        self._apply_sending_settings_payload(payload)
+
+    def _schedule_sending_settings_save(self) -> None:
+        if self._workspace_loading:
+            return
+        self._settings_save_timer.start()
+
+    def _persist_sending_settings_state(self) -> None:
+        if self._workspace_loading:
+            return
+        payload = self._current_sending_settings_payload()
+        _upsert_ui_state(LOCAL_SETTINGS_STATE_KEY, payload)
+        self.state.sender_limit = int(payload["sender_limit"])
+        self.state.delay_from = float(payload["delay_from"])
+        self.state.delay_to = float(payload["delay_to"])
+        self.state.retry_count = int(payload["retry_count"])
+        self.state.retry_enabled = bool(payload["retry_enabled"])
+        self.state.delay_type = str(payload["delay_type"])
+        self.state.email_send_order = str(payload["email_send_order"])
+        self.state.window_send_mode = str(payload["window_send_mode"])
+        self.state.ai_provider = str(payload["ai_provider"])
+        self.state.ai_api_key = str(payload["ai_api_key"])
+        self.state.ai_model = str(payload["ai_model"])
+        self.state.ai_connected = bool(payload["ai_connected"])
+        self.state.ai_available_models = [str(item) for item in payload.get("available_models") or []]
+        self._available_ai_models = list(self.state.ai_available_models)
+        if self.state.logged_in and self.state.username:
+            try:
+                for key, value in payload.items():
+                    upsert_setting(self.state.username, str(key), value)
+            except Exception:
+                pass
+
+    def _save_sending_settings(self) -> None:
+        self._persist_sending_settings_state()
+        self._log_action("Saved sending settings")
+        self.notify("Settings saved")
+
     def _set_ai_busy(self, busy: bool) -> None:
         self.ai_provider_combo.setEnabled(not busy)
         self.ai_api_key_input.setEnabled(not busy)
@@ -2147,10 +3166,22 @@ class DashboardPage(QWidget):
         self._refresh_ai_models()
         self._sync_ai_connection_ui()
         self._log_action(f"AI provider selected: {self.state.ai_provider}")
+        self._schedule_sending_settings_save()
+
+    def _on_ai_api_key_changed(self) -> None:
+        api_key = self.ai_api_key_input.text()
+        self.state.ai_api_key = api_key
+        self.state.ai_connected = False
+        self.state.ai_model = ""
+        self._available_ai_models = []
+        self._refresh_ai_models()
+        self._sync_ai_connection_ui()
+        self._schedule_sending_settings_save()
 
     def _connect_ai_provider(self) -> None:
         provider = self.ai_provider_combo.currentText() or "ChatGPT"
         api_key = self.ai_api_key_input.text().strip()
+        self.state.ai_api_key = api_key
         if not api_key:
             self.state.ai_connected = False
             self.state.ai_model = ""
@@ -2158,6 +3189,7 @@ class DashboardPage(QWidget):
             self._refresh_ai_models()
             self._sync_ai_connection_ui()
             self.notify("Enter an API key to connect")
+            self._persist_sending_settings_state()
             return
 
         self._set_ai_busy(True)
@@ -2179,6 +3211,7 @@ class DashboardPage(QWidget):
             self._sync_ai_connection_ui()
             self._set_ai_busy(False)
             self._log_action(f"AI connection failed: {exc}")
+            self._persist_sending_settings_state()
             self.notify("AI connection failed")
             return
 
@@ -2193,6 +3226,7 @@ class DashboardPage(QWidget):
         self._sync_ai_connection_ui()
         self._set_ai_busy(False)
         self._log_action(f"Connected AI provider: {provider}")
+        self._persist_sending_settings_state()
         self.notify(f"{provider} connected")
 
     def _on_ai_model_changed(self) -> None:
@@ -2201,6 +3235,7 @@ class DashboardPage(QWidget):
         self.state.ai_model = self.ai_model_combo.currentText().strip()
         if self.state.ai_model:
             self._log_action(f"AI model selected: {self.state.ai_model}")
+            self._schedule_sending_settings_save()
 
     def _build_blaster_tab(self) -> QWidget:
         page = QWidget()
@@ -2383,6 +3418,43 @@ class DashboardPage(QWidget):
             else:
                 self.notify("Export options confirmed")
 
+    def _choose_attachment_file_format(self) -> None:
+        dialog = FileFormatDialog(self.window(), scale=self._scale, selected_format=getattr(self, "attach_format_value", "PDF document") or "PDF document")
+        if dialog.exec() == QDialog.Accepted:
+            selected = dialog.selected_format()
+            self.attach_format_value = selected
+            self.attach_format_label.setText(self._attachment_format_summary(selected))
+            self._log_action(f"Selected attachment format: {selected}")
+            self.notify(f"Format set to {selected}")
+
+    def _sync_attachment_convert_controls(self, checked: bool) -> None:
+        row_widget = getattr(self, "attach_format_row_widget", None)
+        row_label = getattr(self, "attach_format_row_label", None)
+        if row_widget is not None:
+            row_widget.setVisible(checked)
+        if row_label is not None:
+            row_label.setVisible(checked)
+        self.attach_choose_format_button.setEnabled(checked)
+        self.attach_format_label.setEnabled(checked)
+
+    def _attachment_format_summary(self, selected: str) -> str:
+        summary_map = {
+            "PDF document": "PDF",
+            "Excel spreadsheet (XLSX)": "XLSX",
+            "Excel template (XLTX)": "XLTX",
+            "PowerPoint presentation (PPTX)": "PPTX",
+            "PowerPoint slideshow (PPSX)": "PPSX",
+            "Word document (DOCX)": "DOCX",
+        }
+        selected = (selected or "").strip()
+        if not selected:
+            return "PDF"
+        if selected == "Random format":
+            return "Random"
+        parts = [part.strip() for part in selected.split(",") if part.strip()]
+        short_parts = [summary_map.get(part, part) for part in parts]
+        return ", ".join(short_parts)
+
     def _wrap_text_as_html(self, text: str, subject: str = "") -> str:
         safe_subject = html.escape(subject.strip())
         safe_text = html.escape(text).replace("\n", "<br>")
@@ -2454,7 +3526,12 @@ class DashboardPage(QWidget):
         self.notify("Body preview opened")
 
     def _preview_html_content(self, title: str = "HTML Preview") -> None:
-        html_content = self.html_editor.toPlainText().strip()
+        current_widget = self._current_attachment_widget()
+        html_content = ""
+        if current_widget is not None:
+            html_content = current_widget.html_editor.toPlainText().strip()
+        elif hasattr(self, "html_editor") and isinstance(self.html_editor, QTextEdit):
+            html_content = self.html_editor.toPlainText().strip()
         if not html_content:
             html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML template available.</body></html>"
         dialog = self._build_preview_dialog(
@@ -2813,8 +3890,10 @@ class DashboardPage(QWidget):
         self.state.body_mode = "Normal Message"
         self.state.launch_preset = "Default"
         self.state.ai_provider = "ChatGPT"
+        self.state.ai_api_key = ""
         self.state.ai_model = ""
         self.state.ai_connected = False
+        self.state.ai_available_models = []
         self._available_ai_models = []
         self.window_spin.setValue(1)
         self.ai_provider_combo.blockSignals(True)
@@ -2893,10 +3972,26 @@ class DashboardPage(QWidget):
         self.body_add_button.setEnabled(not limit_reached)
         self.body_add_button.setToolTip("Maximum of 50 bodies reached" if limit_reached else "Add a new body")
 
-    def _set_subject_item_data(self, item: QListWidgetItem, record_id: int | None, title: str, subject: str) -> None:
+    def _update_attachment_tab_controls(self) -> None:
+        limit_reached = self.attach_tabs.count() >= MAX_ATTACHMENT_TABS
+        self.attach_add_button.setEnabled(not limit_reached)
+        self.attach_add_button.setToolTip("Maximum of 50 content tabs reached" if limit_reached else "Add a new HTML content tab")
+
+    def _set_subject_item_data(
+        self,
+        item: QListWidgetItem,
+        record_id: int | None,
+        title: str,
+        subject: str,
+        *,
+        local_only: bool = False,
+        local_draft_id: int | None = None,
+    ) -> None:
         item.setData(Qt.UserRole, record_id)
         item.setData(Qt.UserRole + 1, title)
         item.setData(Qt.UserRole + 2, subject)
+        item.setData(ROLE_LOCAL_ONLY, local_only)
+        item.setData(ROLE_LOCAL_DRAFT_ID, local_draft_id)
         item.setText(title or subject or "Untitled Subject")
 
     def _selected_subject_item(self) -> QListWidgetItem | None:
@@ -2908,6 +4003,9 @@ class DashboardPage(QWidget):
             self.subject_drafts_list.clearSelection()
         finally:
             self.subject_drafts_list.blockSignals(False)
+
+    def _update_subject_toggle_visibility(self) -> None:
+        self.subject_toggle_button.setVisible(self.subject_drafts_list.count() > 0)
 
     def _subject_item_subject(self, item: QListWidgetItem | None) -> str:
         if item is None:
@@ -2924,18 +4022,51 @@ class DashboardPage(QWidget):
             self.notify("Sign in first to manage subjects")
             return
 
-        dialog = SubjectDraftsDialog(self, self.state.auth_token, scale=self._scale)
-        if dialog.exec() == QDialog.Accepted:
-            subject = dialog.selected_subject()
-            if subject:
-                self.subject_input.blockSignals(True)
+        if self._subject_manager_dialog is not None:
+            if self._subject_manager_dialog.isVisible():
                 try:
-                    self.subject_input.setText(subject)
-                finally:
-                    self.subject_input.blockSignals(False)
-                self.state.subject_text = subject
-                self._schedule_subject_body_save()
-            self.load_user_workspace()
+                    self._subject_manager_dialog.raise_()
+                    self._subject_manager_dialog.activateWindow()
+                except Exception:
+                    pass
+                return
+            try:
+                self._subject_manager_dialog.deleteLater()
+            except Exception:
+                pass
+            self._subject_manager_dialog = None
+
+        try:
+            dialog = SubjectDraftsDialog(self, self.state.auth_token, scale=self._scale, on_changed=self._load_subjects)
+            self._subject_manager_dialog = dialog
+            dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+            dialog.finished.connect(lambda _result, d=dialog: self._on_subject_manager_finished(d))
+            dialog.setWindowModality(Qt.ApplicationModal)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            QTimer.singleShot(0, dialog.raise_)
+            QTimer.singleShot(0, dialog.activateWindow)
+        except Exception as exc:
+            self._subject_manager_dialog = None
+            self._log_action(f"Failed to open subject manager: {exc}")
+            self.notify("Unable to open subject manager")
+
+    def _on_subject_manager_finished(self, dialog: SubjectDraftsDialog) -> None:
+        if self._subject_manager_dialog is dialog:
+            self._subject_manager_dialog = None
+        subject = dialog.selected_subject()
+        if subject:
+            self.subject_input.blockSignals(True)
+            try:
+                self.subject_input.setText(subject)
+            except Exception:
+                pass
+            finally:
+                self.subject_input.blockSignals(False)
+            self.state.subject_text = subject
+            self._schedule_subject_body_save()
+        self._load_subjects()
 
     def _on_subject_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         if self._workspace_loading:
@@ -2952,10 +4083,22 @@ class DashboardPage(QWidget):
             self.state.subject_text = subject
 
     def _new_subject_draft(self) -> None:
+        current_text = self.subject_input.text().strip()
+        if self.subject_drafts_list.count() >= MAX_SUBJECTS:
+            self.notify("Maximum 100 subjects allowed")
+            self._update_subject_count_label()
+            return
+        if current_text:
+            self._save_subject_draft(force_new=True)
         self._clear_subject_selection()
-        self.subject_input.clear()
+        self.subject_input.blockSignals(True)
+        try:
+            self.subject_input.clear()
+        finally:
+            self.subject_input.blockSignals(False)
         self.state.subject_text = ""
-        self._schedule_subject_body_save()
+        self._update_subject_toggle_visibility()
+        self._persist_subject_body_state()
 
     def _subject_draft_rows(self) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
@@ -2963,15 +4106,13 @@ class DashboardPage(QWidget):
             item = self.subject_drafts_list.item(index)
             rows.append(
                 {
-                    "id": item.data(Qt.UserRole),
                     "title": self._subject_item_title(item),
                     "subject": self._subject_item_subject(item),
-                    "item": item,
                 }
             )
         return rows
 
-    def _save_subject_draft(self) -> None:
+    def _save_subject_draft(self, *, force_new: bool = False) -> None:
         if self._workspace_loading or not self.state.logged_in or not self.state.username:
             return
 
@@ -2979,42 +4120,43 @@ class DashboardPage(QWidget):
         if not subject:
             self.notify("Enter a subject first")
             return
+        if len(subject) > 300:
+            self.notify("Subject must be 300 characters or less")
+            return
+        current_item = self._selected_subject_item()
+        if current_item is None and self.subject_drafts_list.count() >= MAX_SUBJECTS:
+            self.notify("Maximum 100 subjects allowed")
+            self._update_subject_count_label()
+            return
 
         self._show_subject_body_loader("Saving subject.")
         try:
-            current_item = self._selected_subject_item()
             title = subject[:64]
-            details = {"kind": "subject"}
-            if current_item is not None and current_item.data(Qt.UserRole):
-                record_id = int(current_item.data(Qt.UserRole))
-                api_update_content(
-                    self.state.auth_token,
-                    record_id,
-                    "subject",
+            if current_item is not None and not force_new:
+                self._set_subject_item_data(
+                    current_item,
+                    None,
                     title,
-                    subject=subject,
-                    details=details,
+                    subject,
+                    local_only=True,
+                    local_draft_id=None,
                 )
-                self._set_subject_item_data(current_item, record_id, title, subject)
             else:
-                payload = api_save_content(
-                    self.state.auth_token,
-                    "subject",
-                    title,
-                    subject=subject,
-                    details=details,
-                )
-                record = payload.get("content") or {}
-                if isinstance(record, dict):
-                    record_id = int(record.get("id") or 0)
-                else:
-                    record_id = 0
                 new_item = QListWidgetItem()
-                self._set_subject_item_data(new_item, record_id or None, title, subject)
+                self._set_subject_item_data(
+                    new_item,
+                    None,
+                    title,
+                    subject,
+                    local_only=True,
+                    local_draft_id=None,
+                )
                 self.subject_drafts_list.addItem(new_item)
                 self.subject_drafts_list.setCurrentItem(new_item)
             self.state.subject_text = subject
-            self.subject_count_label.setText(f"{self.subject_drafts_list.count()} subjects")
+            self._update_subject_count_label()
+            self._update_subject_toggle_visibility()
+            self._persist_subject_body_state()
             self._log_action(f"Saved subject: {title}")
             self.notify("Subject saved")
         except Exception as exc:
@@ -3027,38 +4169,27 @@ class DashboardPage(QWidget):
         item = self._selected_subject_item()
         if item is None:
             return
-        record_id = item.data(Qt.UserRole)
         title = self._subject_item_title(item)
-        try:
-            if record_id:
-                api_delete_content(self.state.auth_token, int(record_id))
-        except Exception as exc:
-            self._log_action(f"Failed to delete subject: {exc}")
-            self.notify("Unable to remove subject")
-            return
         row = self.subject_drafts_list.row(item)
         self.subject_drafts_list.takeItem(row)
         self.subject_input.clear()
         self.state.subject_text = ""
-        self.subject_count_label.setText(f"{self.subject_drafts_list.count()} subjects")
+        self._update_subject_count_label()
+        self._update_subject_toggle_visibility()
+        self._persist_subject_body_state()
         self._log_action(f"Removed subject: {title or 'Untitled'}")
         self.notify("Subject removed")
 
     def _create_body_draft_tab(self, record: dict[str, object] | None = None) -> BodyDraftEditor:
         widget = BodyDraftEditor(scale=self._scale)
         if record:
-            mode = "HTML Message" if str(record.get("body_html") or "") else "Normal Message"
-            title = str(record.get("title") or "Body")
-            subject = str(record.get("subject") or "")
-            body_text = str(record.get("body_text") or "")
-            body_html = str(record.get("body_html") or "")
-            details = self._decode_setting_value(record.get("details_json"))
-            if isinstance(details, dict) and details.get("body_mode"):
-                mode = str(details.get("body_mode"))
-            widget.draft_id = int(record.get("id") or 0) or None
-            widget.set_content(title, mode, body_text, body_html or body_text)
+            mode = str(record.get("mode") or "Normal Message")
+            title = str(record.get("title") or self._body_record_title(record, self.body_tabs.count()))
+            body_text = str(record.get("plain_text") or record.get("body_text") or "")
+            body_html = str(record.get("html_text") or record.get("body_html") or "")
+            widget.set_content(title, mode, body_text, body_html or body_text, local_only=True)
         else:
-            title = f"Body {self.body_tabs.count() + 1}"
+            title = self._next_body_title()
             widget.set_content(title, "Normal Message", "Hello {{first_name}},\n\nThis is a body message.", "<div></div>")
 
         widget.titleChanged.connect(lambda title_text, w=widget: self._rename_body_tab(w, title_text))
@@ -3075,6 +4206,30 @@ class DashboardPage(QWidget):
             base = f"Body {index + 1}"
         mode_label = "HTML" if widget.mode_text() == "HTML Message" else "Text"
         return f"{base} [{mode_label}]"
+
+    def _body_record_title(self, record: dict[str, object], index: int) -> str:
+        details = self._decode_setting_value(record.get("details_json"))
+        title = str(record.get("title") or "").strip()
+        source_file = ""
+        if isinstance(details, dict):
+            source_file = str(details.get("source_file") or "").strip()
+        title_normalized = title.lower()
+        if source_file or not title or self._looks_like_auto_body_title(title_normalized):
+            return f"Body {index + 1}"
+        return title
+
+    def _looks_like_auto_body_title(self, title_normalized: str) -> bool:
+        if not title_normalized:
+            return True
+        if title_normalized.startswith("body "):
+            return False
+        if "inv" in title_normalized:
+            return True
+        if "copy" in title_normalized and any(ch.isdigit() for ch in title_normalized):
+            return True
+        if title_normalized.startswith("text body") or title_normalized.startswith("html body"):
+            return True
+        return False
 
     def _refresh_body_tab_labels(self) -> None:
         for index in range(self.body_tabs.count()):
@@ -3118,13 +4273,6 @@ class DashboardPage(QWidget):
         widget = self.body_tabs.widget(index)
         if not isinstance(widget, BodyDraftEditor):
             return
-        if widget.draft_id:
-            try:
-                api_delete_content(self.state.auth_token, int(widget.draft_id))
-            except Exception as exc:
-                self._log_action(f"Failed to delete body: {exc}")
-                self.notify("Unable to remove body")
-                return
         self.body_tabs.removeTab(index)
         if self.body_tabs.count() == 0:
             self._add_body_draft_tab(select=True)
@@ -3132,11 +4280,298 @@ class DashboardPage(QWidget):
             self._refresh_body_tab_labels()
         self._update_body_tab_controls()
         self._sync_active_body_widget_refs()
+        self._persist_subject_body_state()
         self._log_action("Removed body tab")
 
     def _on_body_tab_changed(self, _index: int) -> None:
         self._sync_active_body_widget_refs()
         self._schedule_subject_body_save()
+
+    def _current_attachment_widget(self) -> AttachmentDraftEditor | None:
+        widget = self.attach_tabs.currentWidget()
+        return widget if isinstance(widget, AttachmentDraftEditor) else None
+
+    def _sync_active_attachment_widget_refs(self) -> None:
+        if self.attach_tabs.count() == 0:
+            self._add_attachment_draft_tab(select=True)
+        widget = self._current_attachment_widget()
+        self._active_attachment_widget = widget
+        if widget is not None:
+            self.html_editor = widget.html_editor
+            self.state.html_template_text = widget.html_editor.toPlainText()
+        self._update_attachment_tab_controls()
+
+    def _attachment_tab_label(self, widget: AttachmentDraftEditor, index: int) -> str:
+        title = widget.title_text() or f"Content {index + 1}"
+        return f"{title} [HTML]"
+
+    def _refresh_attachment_tab_labels(self) -> None:
+        for index in range(self.attach_tabs.count()):
+            widget = self.attach_tabs.widget(index)
+            if isinstance(widget, AttachmentDraftEditor):
+                self.attach_tabs.setTabText(index, self._attachment_tab_label(widget, index))
+
+    def _rename_attachment_tab(self, widget: AttachmentDraftEditor, title: str) -> None:
+        index = self.attach_tabs.indexOf(widget)
+        if index < 0:
+            return
+        self.attach_tabs.setTabText(index, self._attachment_tab_label(widget, index))
+
+    def _next_attachment_title(self) -> str:
+        return f"Content {self.attach_tabs.count() + 1}"
+
+    def _looks_like_auto_attachment_title(self, title_normalized: str) -> bool:
+        if not title_normalized:
+            return True
+        if title_normalized.startswith("content "):
+            return True
+        if title_normalized.startswith("html content"):
+            return True
+        if "copy" in title_normalized and any(ch.isdigit() for ch in title_normalized):
+            return True
+        return False
+
+    def _attachment_record_title(self, record: dict[str, object], index: int) -> str:
+        details = self._decode_setting_value(record.get("details_json"))
+        title = str(record.get("title") or "").strip()
+        source_file = ""
+        if isinstance(details, dict):
+            source_file = str(details.get("source_file") or "").strip()
+        title_normalized = title.lower()
+        if source_file or not title or self._looks_like_auto_attachment_title(title_normalized):
+            return f"Content {index + 1}"
+        return title
+
+    def _create_attachment_draft_tab(self, record: dict[str, object] | None = None) -> AttachmentDraftEditor:
+        widget = AttachmentDraftEditor(scale=self._scale)
+        if record:
+            title = self._attachment_record_title(record, self.attach_tabs.count())
+            html_text = str(record.get("html_text") or record.get("body_html") or record.get("body_text") or "")
+            widget.set_content(title, html_text, local_only=True)
+        else:
+            title = self._next_attachment_title()
+            widget.set_content(title, "")
+
+        widget.titleChanged.connect(lambda title_text, w=widget: self._rename_attachment_tab(w, title_text))
+        widget.titleChanged.connect(lambda _title, self=self: self._persist_attachment_state())
+        widget.contentChanged.connect(self._persist_attachment_state)
+        widget.previewRequested.connect(lambda w=widget: self._preview_attachment_editor_html(w))
+        return widget
+
+    def _add_attachment_draft_tab(self, record: dict[str, object] | None = None, select: bool = True) -> AttachmentDraftEditor | None:
+        if self.attach_tabs.count() >= MAX_ATTACHMENT_TABS:
+            self._update_attachment_tab_controls()
+            self.notify("Maximum of 50 content tabs reached")
+            return None
+        widget = self._create_attachment_draft_tab(record)
+        tab_number = self.attach_tabs.count() + 1
+        index = self.attach_tabs.addTab(widget, f"Content {tab_number} [HTML]")
+        self._refresh_attachment_tab_labels()
+        self._update_attachment_tab_controls()
+        if select:
+            self.attach_tabs.setCurrentIndex(index)
+        return widget
+
+    def _new_attachment_draft_tab(self) -> None:
+        self._add_attachment_draft_tab(select=True)
+
+    def _remove_attachment_draft_tab(self, index: int) -> None:
+        widget = self.attach_tabs.widget(index)
+        if not isinstance(widget, AttachmentDraftEditor):
+            return
+        self.attach_tabs.removeTab(index)
+        if self.attach_tabs.count() == 0:
+            self._add_attachment_draft_tab(select=True)
+        else:
+            self._refresh_attachment_tab_labels()
+        self._update_attachment_tab_controls()
+        self._sync_active_attachment_widget_refs()
+        self._persist_attachment_state()
+        self._log_action("Removed attachment tab")
+
+    def _on_attachment_tab_changed(self, _index: int) -> None:
+        self._sync_active_attachment_widget_refs()
+        self._persist_attachment_state()
+
+    def _reset_attachment_tabs(self) -> None:
+        self._show_subject_body_loader("Resetting attachment tabs.")
+        try:
+            _delete_attachment_state()
+            _delete_local_drafts("attachment")
+            self.attach_tabs.blockSignals(True)
+            try:
+                for index in reversed(range(self.attach_tabs.count())):
+                    self.attach_tabs.removeTab(index)
+            finally:
+                self.attach_tabs.blockSignals(False)
+            self._add_attachment_draft_tab(select=True)
+            self._refresh_attachment_tab_labels()
+            self._update_attachment_tab_controls()
+            self._sync_active_attachment_widget_refs()
+            self._log_action("Reset attachment tabs")
+            self.notify("Content tabs reset")
+        except Exception as exc:
+            self._log_action(f"Failed to reset attachment tabs: {exc}")
+            self.notify("Unable to reset content tabs")
+        finally:
+            self._hide_subject_body_loader()
+
+    def _import_html_attachment_file(self, path: Path) -> int:
+        html_text = self._read_text_template_file(path)
+        if not html_text.strip():
+            return 0
+        title = self._next_attachment_title()
+        self._create_and_store_attachment_tab(title=title, html_text=html_text, source_name=path.name)
+        return 1
+
+    def _create_and_store_attachment_tab(self, *, title: str, html_text: str, source_name: str = "") -> AttachmentDraftEditor | None:
+        if self.attach_tabs.count() >= MAX_ATTACHMENT_TABS:
+            return None
+        record = {
+            "title": title[:64] or "Content",
+            "html_text": html_text,
+        }
+        widget = self._add_attachment_draft_tab(record, select=False)
+        if widget is None:
+            return None
+        self._refresh_attachment_tab_labels()
+        self._update_attachment_tab_controls()
+        self._persist_attachment_state()
+        return widget
+
+    def _upload_attachment_files(self) -> None:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload attachment content",
+            "",
+            "HTML files (*.html *.htm);;All files (*)",
+        )
+        if not file_paths:
+            return
+
+        imported = 0
+        self._show_subject_body_loader("Uploading attachment files.")
+        self._workspace_loading = True
+        try:
+            for file_name in file_paths:
+                if self.attach_tabs.count() >= MAX_ATTACHMENT_TABS:
+                    self.notify("Maximum of 50 content tabs reached")
+                    break
+                path = Path(file_name)
+                if path.suffix.lower() in {".html", ".htm"}:
+                    imported += self._import_html_attachment_file(path)
+                else:
+                    self._log_action(f"Skipped unsupported content file: {path.name}")
+        except Exception as exc:
+            self._log_action(f"Failed to upload attachment files: {exc}")
+            self.notify(f"Unable to upload content: {exc}")
+        finally:
+            self._workspace_loading = False
+            self._hide_subject_body_loader()
+
+        if self.attach_tabs.count() == 0:
+            self._add_attachment_draft_tab(select=True)
+        else:
+            self._refresh_attachment_tab_labels()
+            self._update_attachment_tab_controls()
+            self._sync_active_attachment_widget_refs()
+
+        if imported > 0:
+            self._log_action(f"Uploaded {imported} attachment content(s)")
+            self.notify(f"Uploaded {imported} content(s)")
+        self._persist_attachment_state()
+
+    def _load_attachment_tabs_from_local(self) -> None:
+        state_payload = _load_attachment_state()
+        _delete_local_drafts("attachment")
+        tab_rows = state_payload.get("tabs") if isinstance(state_payload, dict) else []
+        if not isinstance(tab_rows, list):
+            tab_rows = []
+        selected_index = int(state_payload.get("selected_index") or 0) if isinstance(state_payload, dict) else 0
+        self.attach_tabs.blockSignals(True)
+        try:
+            for index in reversed(range(self.attach_tabs.count())):
+                self.attach_tabs.removeTab(index)
+            for row in tab_rows:
+                if isinstance(row, dict):
+                    self._add_attachment_draft_tab(row, select=False)
+            if self.attach_tabs.count() == 0:
+                self._add_attachment_draft_tab(select=True)
+            else:
+                self.attach_tabs.setCurrentIndex(min(max(selected_index, 0), self.attach_tabs.count() - 1))
+            convert_enabled = bool(state_payload.get("convert_enabled", True)) if isinstance(state_payload, dict) else True
+            format_value = str(state_payload.get("format_value") or self.attach_format_value or "PDF document") if isinstance(state_payload, dict) else self.attach_format_value
+            self.attach_convert_checkbox.blockSignals(True)
+            try:
+                self.attach_convert_checkbox.setChecked(convert_enabled)
+            finally:
+                self.attach_convert_checkbox.blockSignals(False)
+            self.attach_format_value = format_value or "PDF document"
+            self.attach_format_label.setText(self._attachment_format_summary(self.attach_format_value))
+        finally:
+            self.attach_tabs.blockSignals(False)
+        self._refresh_attachment_tab_labels()
+        self._update_attachment_tab_controls()
+        self._sync_active_attachment_widget_refs()
+
+    def _schedule_attachment_save(self) -> None:
+        if self._workspace_loading:
+            return
+        self._attachment_save_timer.start()
+
+    def _persist_attachment_state(self) -> None:
+        if self._workspace_loading:
+            return
+        try:
+            if self.attach_tabs.count() == 0:
+                self._add_attachment_draft_tab(select=True)
+            tabs_payload: list[dict[str, object]] = []
+            for index in range(self.attach_tabs.count()):
+                widget = self.attach_tabs.widget(index)
+                if not isinstance(widget, AttachmentDraftEditor):
+                    continue
+                payload = widget.payload()
+                title = payload["title"] or f"Content {index + 1}"
+                html_text = payload["html_text"]
+                tabs_payload.append(
+                    {
+                        "title": title[:64] or "Content",
+                        "html_text": html_text,
+                        "kind": "attachment",
+                    }
+                )
+                widget.local_only = True
+                self.attach_tabs.setTabText(index, self._attachment_tab_label(widget, index))
+            active_widget = self._current_attachment_widget()
+            if active_widget is not None:
+                self.state.html_template_text = active_widget.html_editor.toPlainText()
+            _delete_local_drafts("attachment")
+            _upsert_attachment_state(
+                {
+                    "tabs": tabs_payload,
+                    "selected_index": self.attach_tabs.currentIndex(),
+                    "convert_enabled": self.attach_convert_checkbox.isChecked(),
+                    "format_value": self.attach_format_value,
+                }
+            )
+        except Exception as exc:
+            self._log_action(f"Failed to save attachment content: {exc}")
+
+    def _preview_attachment_editor_html(self, widget: AttachmentDraftEditor | None) -> None:
+        if widget is None:
+            self.notify("No attachment content available")
+            return
+        html_content = widget.html_editor.toPlainText().strip()
+        if not html_content:
+            self.notify("Add HTML content first")
+            return
+        title = widget.title_text() or "HTML Content Preview"
+        dialog = self._build_preview_dialog(title, html_content, "Previewing the selected HTML attachment content.")
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._log_action(f"Opened attachment preview: {title}")
+        self.notify("Content preview opened")
 
     def _complete_launch(self, target: int) -> None:
         self.window().hide_launch_loader()
@@ -3229,7 +4664,7 @@ class DashboardPage(QWidget):
             self,
             "Load subject template",
             "",
-            "Text files (*.txt *.csv);;All files (*)",
+            "CSV files (*.csv);;All files (*)",
         )
         if not file_path:
             return
@@ -3237,8 +4672,22 @@ class DashboardPage(QWidget):
         path = Path(file_path)
         self._show_subject_body_loader(f"Loading subject template from {path.name}.")
         try:
+            if path.suffix.lower() != ".csv":
+                raise ValueError("Please choose a CSV file.")
             raw_text = self._read_text_template_file(path)
-            subjects = [line.strip() for line in raw_text.splitlines() if line.strip()]
+            subjects = []
+            for row in csv.reader(raw_text.splitlines()):
+                for value in row:
+                    subject = str(value or "").strip()
+                    if subject:
+                        subjects.append(subject)
+            if len(subjects) > 100:
+                raise ValueError("CSV can contain at most 100 subjects.")
+            if self.subject_drafts_list.count() + len(subjects) > MAX_SUBJECTS:
+                raise ValueError("Total subjects cannot exceed 100.")
+            for subject in subjects:
+                if len(subject) > 300:
+                    raise ValueError("Each subject must be 300 characters or less.")
             if not subjects:
                 subjects = [path.stem.replace("_", " ").strip() or "Subject"]
 
@@ -3246,17 +4695,15 @@ class DashboardPage(QWidget):
             self.subject_drafts_list.blockSignals(True)
             try:
                 for subject in subjects:
-                    payload = api_save_content(
-                        self.state.auth_token,
-                        "subject",
-                        subject[:64] or "Subject",
-                        subject=subject,
-                        details={"kind": "subject", "source_file": path.name},
-                    )
-                    record = payload.get("content") or {}
                     item = QListWidgetItem()
-                    record_id = int(record.get("id") or 0) if isinstance(record, dict) else None
-                    self._set_subject_item_data(item, record_id, subject[:64] or "Subject", subject)
+                    self._set_subject_item_data(
+                        item,
+                        None,
+                        subject[:64] or "Subject",
+                        subject,
+                        local_only=True,
+                        local_draft_id=None,
+                    )
                     self.subject_drafts_list.addItem(item)
                 self.subject_drafts_list.setCurrentRow(self.subject_drafts_list.count() - 1)
             finally:
@@ -3265,7 +4712,9 @@ class DashboardPage(QWidget):
             if current is not None:
                 self.subject_input.setText(self._subject_item_subject(current))
                 self.state.subject_text = self.subject_input.text().strip()
-            self.subject_count_label.setText(f"{self.subject_drafts_list.count()} subjects")
+            self._update_subject_count_label()
+            self._update_subject_toggle_visibility()
+            self._persist_subject_body_state()
             self._log_action(f"Loaded {len(subjects)} subject(s) from {path.name}")
             self.notify(f"Loaded {len(subjects)} subject(s)")
         except Exception as exc:
@@ -3274,7 +4723,6 @@ class DashboardPage(QWidget):
         finally:
             self._workspace_loading = False
             self._hide_subject_body_loader()
-        self._schedule_subject_body_save()
 
     def _load_body_from_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -3291,20 +4739,17 @@ class DashboardPage(QWidget):
         try:
             body = self._read_text_template_file(path)
             is_html = path.suffix.lower() in {".html", ".htm"} or "<html" in body.lower()
-            title = path.stem.replace("_", " ").strip() or "Body"
-            payload = api_save_content(
-                self.state.auth_token,
-                "body",
-                title[:64],
-                body_text="" if is_html else body,
-                body_html=body if is_html else "",
-                details={"kind": "body", "body_mode": "HTML Body" if is_html else "Plain Text", "source_file": path.name},
-            )
-            record = payload.get("content") or {}
+            title = self._next_body_title()
             self._workspace_loading = True
-            body_widget = self._add_body_draft_tab(record if isinstance(record, dict) else None, select=True)
-            if isinstance(record, dict) and record.get("id"):
-                body_widget.draft_id = int(record.get("id"))
+            body_widget = self._create_and_store_body_tab(
+                title=title,
+                mode="HTML Message" if is_html else "Normal Message",
+                plain_text="" if is_html else body,
+                html_text=body if is_html else "",
+                source_name=path.name,
+            )
+            if body_widget is None:
+                return
             if is_html:
                 body_widget.set_content(title, "HTML Message", "", body)
             else:
@@ -3318,7 +4763,6 @@ class DashboardPage(QWidget):
         finally:
             self._workspace_loading = False
             self._hide_subject_body_loader()
-        self._schedule_subject_body_save()
 
     def _upload_body_files(self) -> None:
         if not self.state.logged_in or not self.state.auth_token:
@@ -3370,6 +4814,9 @@ class DashboardPage(QWidget):
             self.notify(f"Uploaded {imported} body(s)")
         self._schedule_subject_body_save()
 
+    def _next_body_title(self) -> str:
+        return f"Body {self.body_tabs.count() + 1}"
+
     def _import_csv_body_file(self, path: Path) -> int:
         imported = 0
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -3383,7 +4830,7 @@ class DashboardPage(QWidget):
             if not cells:
                 continue
             body_text = cells[0]
-            title = f"{path.stem.replace('_', ' ').strip() or 'Body'} {index}" if len(rows) > 1 else path.stem.replace("_", " ").strip() or "Body"
+            title = self._next_body_title()
             self._create_and_store_body_tab(
                 title=title,
                 mode="Normal Message",
@@ -3398,7 +4845,7 @@ class DashboardPage(QWidget):
         body = self._read_text_template_file(path)
         if not body.strip():
             return 0
-        title = path.stem.replace("_", " ").strip() or "HTML Body"
+        title = self._next_body_title()
         self._create_and_store_body_tab(
             title=title,
             mode="HTML Message",
@@ -3419,27 +4866,18 @@ class DashboardPage(QWidget):
     ) -> BodyDraftEditor | None:
         if self.body_tabs.count() >= MAX_BODY_TABS:
             return None
-
-        details = {"kind": "body", "body_mode": "HTML Body" if mode == "HTML Message" else "Plain Text"}
-        if source_name:
-            details["source_file"] = source_name
-        payload = api_save_content(
-            self.state.auth_token,
-            "body",
-            title[:64] or "Body",
-            body_text=plain_text,
-            body_html=html_text if mode == "HTML Message" else "",
-            details=details,
-        )
-        record = payload.get("content") or {}
-        widget = self._add_body_draft_tab(record if isinstance(record, dict) else None, select=False)
+        record = {
+            "title": title[:64] or "Body",
+            "mode": mode,
+            "plain_text": plain_text,
+            "html_text": html_text if mode == "HTML Message" else "",
+        }
+        widget = self._add_body_draft_tab(record, select=False)
         if widget is None:
             return None
-        widget.set_content(title, mode, plain_text, html_text if mode == "HTML Message" else "")
-        if isinstance(record, dict) and record.get("id"):
-            widget.draft_id = int(record.get("id"))
         self._refresh_body_tab_labels()
         self._update_body_tab_controls()
+        self._persist_subject_body_state()
         return widget
 
     def _persist_subject_body_state(self) -> None:
@@ -3449,79 +4887,75 @@ class DashboardPage(QWidget):
         subject = self.subject_input.text().strip()
         current_subject = self._selected_subject_item()
         current_body = self._current_body_widget()
+        current_attachment = self._current_attachment_widget()
         if current_body is None:
             current_body = self._add_body_draft_tab(select=True)
-        body_payload = current_body.payload()
-        body_mode = body_payload["mode"]
-        plain_body = body_payload["plain_text"]
-        html_body = body_payload["html_text"]
-        body_title = body_payload["title"] or "Body"
+        body_payload = current_body.payload() if current_body is not None else {"mode": "Normal Message", "plain_text": "", "html_text": "", "title": "Body"}
+        body_mode = str(body_payload["mode"])
+        plain_body = str(body_payload["plain_text"])
+        html_body = str(body_payload["html_text"])
+        body_title = str(body_payload["title"] or "Body")
+        attachment_html = current_attachment.html_editor.toPlainText() if current_attachment is not None else ""
 
         self.state.subject_text = subject
         self.state.plain_body_text = plain_body
         self.state.html_message_text = html_body
         self.state.body_mode = body_mode
-        self.state.html_template_text = self.html_editor.toPlainText()
+        self.state.html_template_text = attachment_html
 
         try:
+            subject_rows = []
+            for index in range(self.subject_drafts_list.count()):
+                item = self.subject_drafts_list.item(index)
+                if item is None:
+                    continue
+                row_subject = self._subject_item_subject(item).strip() or item.text().strip()
+                if row_subject:
+                    subject_rows.append({"title": row_subject[:64] or "Subject", "subject": row_subject})
             if subject:
-                subject_title = subject[:64] or "Subject"
-                if current_subject is not None and current_subject.data(Qt.UserRole):
-                    subject_id = int(current_subject.data(Qt.UserRole))
-                    api_update_content(
-                        self.state.auth_token,
-                        subject_id,
-                        "subject",
-                        subject_title,
-                        subject=subject,
-                        details={"kind": "subject"},
-                    )
-                    self._set_subject_item_data(current_subject, subject_id, subject_title, subject)
+                if current_subject is not None:
+                    current_index = self.subject_drafts_list.row(current_subject)
+                    if current_index >= 0 and current_index < len(subject_rows):
+                        subject_rows[current_index] = {"title": subject[:64] or "Subject", "subject": subject}
+                    else:
+                        subject_rows.append({"title": subject[:64] or "Subject", "subject": subject})
                 else:
-                    payload = api_save_content(
-                        self.state.auth_token,
-                        "subject",
-                        subject_title,
-                        subject=subject,
-                        details={"kind": "subject"},
-                    )
-                    record = payload.get("content") or {}
-                    subject_id = int(record.get("id") or 0) if isinstance(record, dict) else None
-                    item = QListWidgetItem()
-                    self._set_subject_item_data(item, subject_id, subject_title, subject)
-                    self.subject_drafts_list.addItem(item)
-                    self.subject_drafts_list.setCurrentItem(item)
+                    subject_rows.append({"title": subject[:64] or "Subject", "subject": subject})
+            _upsert_ui_state(
+                LOCAL_SUBJECT_STATE_KEY,
+                {
+                    "subjects": subject_rows,
+                    "selected_index": max(self.subject_drafts_list.currentRow(), 0) if self.subject_drafts_list.count() > 0 else -1,
+                },
+            )
 
-            if current_body.draft_id:
-                api_update_content(
-                    self.state.auth_token,
-                    int(current_body.draft_id),
-                    "body",
-                    body_title[:64] or "Body",
-                    body_text=plain_body,
-                    body_html=html_body if body_mode == "HTML Body" else "",
-                    details={"kind": "body", "body_mode": body_mode},
+            body_rows = []
+            for index in range(self.body_tabs.count()):
+                widget = self.body_tabs.widget(index)
+                if not isinstance(widget, BodyDraftEditor):
+                    continue
+                payload = widget.payload()
+                mode = payload["mode"]
+                title = payload["title"] or f"Body {index + 1}"
+                plain = payload["plain_text"]
+                html_text = payload["html_text"]
+                body_rows.append(
+                    {
+                        "title": title[:64] or "Body",
+                        "mode": mode,
+                        "plain_text": plain,
+                        "html_text": html_text if mode == "HTML Message" else "",
+                    }
                 )
-            else:
-                payload = api_save_content(
-                    self.state.auth_token,
-                    "body",
-                    body_title[:64] or "Body",
-                    body_text=plain_body,
-                    body_html=html_body if body_mode == "HTML Body" else "",
-                    details={"kind": "body", "body_mode": body_mode},
-                )
-                record = payload.get("content") or {}
-                if isinstance(record, dict) and record.get("id"):
-                    current_body.draft_id = int(record.get("id"))
-                    self._rename_body_tab(current_body, body_title[:64] or "Body")
+            _upsert_ui_state(
+                LOCAL_BODY_STATE_KEY,
+                {
+                    "tabs": body_rows,
+                    "selected_index": self.body_tabs.currentIndex(),
+                },
+            )
 
-            upsert_setting(self.state.username, "subject_text", subject, user_id=None)
-            upsert_setting(self.state.username, "plain_body_text", plain_body, user_id=None)
-            upsert_setting(self.state.username, "html_message_text", html_body, user_id=None)
-            upsert_setting(self.state.username, "html_template_text", self.state.html_template_text, user_id=None)
-            upsert_setting(self.state.username, "body_mode", body_mode, user_id=None)
-            upsert_setting(self.state.username, "subject_body_last_saved", QDateTime.currentDateTime().toString(Qt.ISODate), user_id=None)
+            self._rename_body_tab(current_body, body_title)
         except Exception as exc:
             self._log_action(f"Failed to save subject/body state: {exc}")
 
@@ -3552,16 +4986,100 @@ class DashboardPage(QWidget):
                 return raw_value
         return raw_value
 
+    def _update_subject_count_label(self) -> None:
+        self.subject_count_label.setText(_subject_count_text(self.subject_drafts_list.count()))
+
+    def _load_subjects(self) -> None:
+        self._workspace_loading = True
+        try:
+            payload = _load_ui_state(LOCAL_SUBJECT_STATE_KEY)
+            subject_rows = payload.get("subjects") or []
+            if not isinstance(subject_rows, list):
+                subject_rows = []
+
+            self.subject_drafts_list.blockSignals(True)
+            try:
+                self.subject_drafts_list.clear()
+                for row in reversed(subject_rows):
+                    if not isinstance(row, dict):
+                        continue
+                    item = QListWidgetItem()
+                    title = str(row.get("title") or row.get("subject") or "Subject")
+                    subject = str(row.get("subject") or row.get("title") or "")
+                    self._set_subject_item_data(
+                        item,
+                        None,
+                        title,
+                        subject,
+                        local_only=True,
+                        local_draft_id=None,
+                    )
+                    self.subject_drafts_list.addItem(item)
+                if self.subject_drafts_list.count() > 0:
+                    self.subject_drafts_list.setCurrentRow(self.subject_drafts_list.count() - 1)
+            finally:
+                self.subject_drafts_list.blockSignals(False)
+
+            current_subject = self.subject_drafts_list.currentItem()
+            if current_subject is not None:
+                subject = self._subject_item_subject(current_subject)
+                self.subject_input.blockSignals(True)
+                try:
+                    self.subject_input.setText(subject)
+                finally:
+                    self.subject_input.blockSignals(False)
+                self.state.subject_text = subject
+
+            self._update_subject_count_label()
+            self._update_subject_toggle_visibility()
+        finally:
+            self._workspace_loading = False
+
     def _sync_subject_body_widgets(self) -> None:
         self._workspace_loading = True
         try:
             if self.body_tabs.count() == 0:
-                self._add_body_draft_tab(select=True)
+                self._load_body_tabs_from_state()
             self._sync_active_body_widget_refs()
-            self.subject_count_label.setText(f"{self.subject_drafts_list.count()} subjects")
             self._update_body_tab_controls()
+            self._sync_active_attachment_widget_refs()
         finally:
             self._workspace_loading = False
+
+    def _load_body_tabs_from_state(self) -> None:
+        payload = _load_ui_state(LOCAL_BODY_STATE_KEY)
+        tab_rows = payload.get("tabs") or []
+        if not isinstance(tab_rows, list):
+            tab_rows = []
+        selected_index = int(payload.get("selected_index") or -1)
+
+        self.body_tabs.blockSignals(True)
+        try:
+            for index in reversed(range(self.body_tabs.count())):
+                self.body_tabs.removeTab(index)
+            for row in tab_rows:
+                if not isinstance(row, dict):
+                    continue
+                self._add_body_draft_tab(
+                    {
+                        "title": str(row.get("title") or row.get("label") or "Body"),
+                        "mode": str(row.get("mode") or "Normal Message"),
+                        "plain_text": str(row.get("plain_text") or ""),
+                        "html_text": str(row.get("html_text") or ""),
+                    },
+                    select=False,
+                )
+            if self.body_tabs.count() == 0:
+                self._add_body_draft_tab(select=True)
+            elif 0 <= selected_index < self.body_tabs.count():
+                self.body_tabs.setCurrentIndex(selected_index)
+            else:
+                self.body_tabs.setCurrentIndex(self.body_tabs.count() - 1)
+        finally:
+            self.body_tabs.blockSignals(False)
+        self._refresh_body_tab_labels()
+        self._update_body_tab_controls()
+        self._sync_active_body_widget_refs()
 
     def load_user_workspace(self) -> None:
         if not self.state.logged_in or not self.state.auth_token:
@@ -3570,7 +5088,6 @@ class DashboardPage(QWidget):
         self._workspace_loading = True
         try:
             settings_payload = api_get_settings(self.state.auth_token)
-            content_payload = api_get_content(self.state.auth_token)
         except Exception:
             self._workspace_loading = False
             return
@@ -3589,79 +5106,10 @@ class DashboardPage(QWidget):
             self.state.plain_body_text = str(settings_map.get("plain_body_text") or self.state.plain_body_text or "")
             self.state.html_message_text = str(settings_map.get("html_message_text") or self.state.html_message_text or "")
             self.state.html_template_text = str(settings_map.get("html_template_text") or self.state.html_template_text or "")
-
-            content_rows = content_payload.get("content") or []
-            subject_rows: list[dict[str, object]] = []
-            body_rows: list[dict[str, object]] = []
-            legacy_rows: list[dict[str, object]] = []
-            for row in content_rows:
-                if not isinstance(row, dict):
-                    continue
-                details = self._decode_setting_value(row.get("details_json"))
-                content_type = str(row.get("content_type") or "")
-                kind = ""
-                if isinstance(details, dict):
-                    kind = str(details.get("kind") or "")
-                if content_type in {"subject", "subject-draft"} or kind in {"subject", "subject-draft"}:
-                    subject_rows.append(row)
-                elif content_type in {"body", "body-draft"} or kind in {"body", "body-draft"}:
-                    body_rows.append(row)
-                else:
-                    legacy_rows.append(row)
-
-            self.subject_drafts_list.blockSignals(True)
-            try:
-                self.subject_drafts_list.clear()
-                for row in reversed(subject_rows):
-                    item = QListWidgetItem()
-                    record_id = int(row.get("id") or 0) or None
-                    title = str(row.get("title") or row.get("subject") or "Subject")
-                    subject = str(row.get("subject") or row.get("title") or "")
-                    self._set_subject_item_data(item, record_id, title, subject)
-                    self.subject_drafts_list.addItem(item)
-                if self.subject_drafts_list.count() > 0:
-                    self.subject_drafts_list.setCurrentRow(self.subject_drafts_list.count() - 1)
-            finally:
-                self.subject_drafts_list.blockSignals(False)
-
-            while self.body_tabs.count() > 0:
-                self.body_tabs.removeTab(0)
-
-            body_row = body_rows[0] if body_rows else (legacy_rows[0] if legacy_rows else None)
-            if body_row is not None:
-                self._add_body_draft_tab(body_row, select=True)
-            if self.body_tabs.count() == 0:
-                self._add_body_draft_tab(select=True)
-            else:
-                self.body_tabs.setCurrentIndex(0)
-            self._refresh_body_tab_labels()
-            self._update_body_tab_controls()
-
-            current_subject = self.subject_drafts_list.currentItem()
-            if current_subject is not None:
-                subject = self._subject_item_subject(current_subject)
-                self.subject_input.blockSignals(True)
-                try:
-                    self.subject_input.setText(subject)
-                finally:
-                    self.subject_input.blockSignals(False)
-                self.state.subject_text = subject
-            elif self.state.subject_text:
-                self.subject_input.blockSignals(True)
-                try:
-                    self.subject_input.setText(self.state.subject_text)
-                finally:
-                    self.subject_input.blockSignals(False)
-
-            self._sync_active_body_widget_refs()
-            active_body = self._current_body_widget()
-            if active_body is not None:
-                payload = active_body.payload()
-                self.state.body_mode = payload["mode"]
-                self.state.plain_body_text = payload["plain_text"]
-                self.state.html_message_text = payload["html_text"]
-                self.state.subject_text = self.subject_input.text().strip() or self.state.subject_text
-            self.subject_count_label.setText(f"{self.subject_drafts_list.count()} subjects")
+            self._load_sending_settings_state(settings_map)
+            self._load_subjects()
+            self._load_body_tabs_from_state()
+            self._load_attachment_tabs_from_local()
         finally:
             self._workspace_loading = False
             self._sync_subject_body_widgets()
@@ -3853,6 +5301,43 @@ class DashboardPage(QWidget):
         self.normal_button.setChecked(self.state.browser_mode == "Normal")
         self.normal_message_button.setChecked(self.state.body_mode == "Normal Message")
         self.html_message_button.setChecked(self.state.body_mode == "HTML Message")
+        self.sender_limit.blockSignals(True)
+        self.sender_limit.setValue(int(getattr(self.state, "sender_limit", 500)))
+        self.sender_limit.blockSignals(False)
+        self.delay_from.blockSignals(True)
+        self.delay_from.setValue(float(getattr(self.state, "delay_from", 0.5)))
+        self.delay_from.blockSignals(False)
+        self.delay_to.blockSignals(True)
+        self.delay_to.setValue(float(getattr(self.state, "delay_to", 1.0)))
+        self.delay_to.blockSignals(False)
+        self.retry_count.blockSignals(True)
+        self.retry_count.setValue(int(getattr(self.state, "retry_count", 3)))
+        self.retry_count.blockSignals(False)
+        self.retry_enable_checkbox.blockSignals(True)
+        self.retry_enable_checkbox.setChecked(bool(getattr(self.state, "retry_enabled", True)))
+        self.retry_enable_checkbox.blockSignals(False)
+        self.delay_fixed_radio.blockSignals(True)
+        self.delay_random_radio.blockSignals(True)
+        self.delay_human_radio.blockSignals(True)
+        delay_type = getattr(self.state, "delay_type", "Random range")
+        self.delay_fixed_radio.setChecked(delay_type == "Fixed")
+        self.delay_random_radio.setChecked(delay_type != "Fixed" and delay_type != "Human-like pattern")
+        self.delay_human_radio.setChecked(delay_type == "Human-like pattern")
+        self.delay_fixed_radio.blockSignals(False)
+        self.delay_random_radio.blockSignals(False)
+        self.delay_human_radio.blockSignals(False)
+        self.send_seq_radio.blockSignals(True)
+        self.send_rand_radio.blockSignals(True)
+        self.send_seq_radio.setChecked(getattr(self.state, "email_send_order", "Sequential") != "Random shuffle")
+        self.send_rand_radio.setChecked(getattr(self.state, "email_send_order", "Sequential") == "Random shuffle")
+        self.send_seq_radio.blockSignals(False)
+        self.send_rand_radio.blockSignals(False)
+        self.window_parallel_radio.blockSignals(True)
+        self.window_sequential_radio.blockSignals(True)
+        self.window_parallel_radio.setChecked(getattr(self.state, "window_send_mode", "Parallel") != "Sequential")
+        self.window_sequential_radio.setChecked(getattr(self.state, "window_send_mode", "Parallel") == "Sequential")
+        self.window_parallel_radio.blockSignals(False)
+        self.window_sequential_radio.blockSignals(False)
         current_body = self._current_body_widget()
         if current_body is not None:
             current_body.set_mode(self.state.body_mode)
@@ -3862,6 +5347,9 @@ class DashboardPage(QWidget):
         self.ai_provider_combo.blockSignals(True)
         self.ai_provider_combo.setCurrentText(self.state.ai_provider)
         self.ai_provider_combo.blockSignals(False)
+        self.ai_api_key_input.blockSignals(True)
+        self.ai_api_key_input.setText(getattr(self.state, "ai_api_key", ""))
+        self.ai_api_key_input.blockSignals(False)
         self._refresh_ai_models()
         self._sync_ai_connection_ui()
 
@@ -4566,6 +6054,10 @@ class MainWindow(QMainWindow):
         if self.state.logged_in and self.state.username:
             self.dashboard_page._log_action("User signed out")
         self.hide_launch_loader()
+        try:
+            self.dashboard_page._persist_sending_settings_state()
+        except Exception:
+            pass
         self.dashboard_page._terminate_browser_sessions()
         self.state = AppState()
         self.dashboard_page.state = self.state
@@ -4575,6 +6067,16 @@ class MainWindow(QMainWindow):
         self.login_page.error_label.setText("")
         self.show_login()
         self.show_toast("Logged out", "warning")
+
+    def closeEvent(self, event) -> None:
+        try:
+            if hasattr(self, "dashboard_page"):
+                self.dashboard_page._persist_subject_body_state()
+                self.dashboard_page._persist_attachment_state()
+                self.dashboard_page._persist_sending_settings_state()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def main() -> int:

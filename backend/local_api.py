@@ -13,12 +13,15 @@ from typing import Any
 import jwt
 import pymysql
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
 
 API_HOST = "127.0.0.1"
+# Fixed local API port used by the desktop app and docs UI.
 API_PORT = 8765
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 
@@ -44,6 +47,8 @@ app = FastAPI(
     title="EzyMailer Local API",
     version="1.0.0",
     description="Local development API for login, users, and app bootstrapping.",
+    docs_url=None,
+    redoc_url=None,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -98,6 +103,201 @@ class ContentRequest(BaseModel):
 
 class ContentUpdateRequest(ContentRequest):
     content_id: int = Field(gt=0)
+
+
+@app.get("/docs", include_in_schema=False)
+def custom_docs() -> HTMLResponse:
+    response = get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        swagger_js_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js",
+        swagger_css_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css",
+        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+        oauth2_redirect_url="/docs/oauth2-redirect",
+        init_oauth=None,
+        swagger_ui_parameters={
+            "docExpansion": "none",
+            "defaultModelsExpandDepth": -1,
+            "displayRequestDuration": True,
+            "filter": True,
+            "syntaxHighlight.theme": "monokai",
+        },
+    )
+    dark_css = """
+    <style>
+      :root {
+        color-scheme: dark;
+        --ez-bg: #0f1115;
+        --ez-panel: #151a21;
+        --ez-panel-2: #1b2230;
+        --ez-border: #2c3442;
+        --ez-text: #e5e7eb;
+        --ez-muted: #9aa6b2;
+        --ez-accent: #4ea1ff;
+        --ez-success: #25c06d;
+        --ez-danger: #f87171;
+      }
+      html, body {
+        background: var(--ez-bg) !important;
+        color: var(--ez-text) !important;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+      }
+      .swagger-ui, .swagger-ui .wrapper {
+        background: var(--ez-bg) !important;
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui .topbar {
+        background: linear-gradient(180deg, #111725 0%, #0f1115 100%) !important;
+        border-bottom: 1px solid var(--ez-border);
+      }
+      .swagger-ui .topbar a {
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui .info .title,
+      .swagger-ui .info .title small,
+      .swagger-ui .opblock-tag,
+      .swagger-ui .opblock-summary-path,
+      .swagger-ui .opblock-summary-description,
+      .swagger-ui .parameter__name,
+      .swagger-ui .parameter__type,
+      .swagger-ui .parameter__in,
+      .swagger-ui .response-col_status,
+      .swagger-ui .response-col_links,
+      .swagger-ui .response-col_description,
+      .swagger-ui .model-title,
+      .swagger-ui .model-box,
+      .swagger-ui .tab li,
+      .swagger-ui .tab button,
+      .swagger-ui .btn,
+      .swagger-ui .auth-wrapper .btn,
+      .swagger-ui .modal-ux-header h3,
+      .swagger-ui .scheme-container,
+      .swagger-ui .parameter__extension,
+      .swagger-ui .required,
+      .swagger-ui .renderedMarkdown {
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui .scheme-container,
+      .swagger-ui .opblock,
+      .swagger-ui .opblock.opblock-get,
+      .swagger-ui .opblock.opblock-post,
+      .swagger-ui .opblock.opblock-put,
+      .swagger-ui .opblock.opblock-delete,
+      .swagger-ui .opblock.opblock-patch,
+      .swagger-ui .opblock.opblock-options,
+      .swagger-ui .opblock.opblock-head,
+      .swagger-ui .opblock.opblock-trace,
+      .swagger-ui .btn,
+      .swagger-ui input[type=text],
+      .swagger-ui input[type=password],
+      .swagger-ui input[type=email],
+      .swagger-ui textarea,
+      .swagger-ui select,
+      .swagger-ui .modal-ux {
+        background: var(--ez-panel) !important;
+        border-color: var(--ez-border) !important;
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui .opblock .opblock-summary,
+      .swagger-ui .opblock .opblock-summary:hover {
+        background: var(--ez-panel) !important;
+      }
+      .swagger-ui .opblock.opblock-get .opblock-summary-method { background: #276ef1 !important; }
+      .swagger-ui .opblock.opblock-post .opblock-summary-method { background: #22c55e !important; }
+      .swagger-ui .opblock.opblock-put .opblock-summary-method { background: #f59e0b !important; }
+      .swagger-ui .opblock.opblock-delete .opblock-summary-method { background: #ef4444 !important; }
+      .swagger-ui .opblock .opblock-summary-method {
+        border: none !important;
+        color: #fff !important;
+        font-weight: 700 !important;
+      }
+      .swagger-ui .opblock .opblock-summary-path,
+      .swagger-ui .opblock .opblock-summary-description {
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui table thead tr th,
+      .swagger-ui table tbody tr td,
+      .swagger-ui .responses-wrapper,
+      .swagger-ui .responses-inner,
+      .swagger-ui .response-col_status,
+      .swagger-ui .response-col_description,
+      .swagger-ui .response-col_media_type,
+      .swagger-ui .parameters-col_description,
+      .swagger-ui .parameter__name,
+      .swagger-ui .parameter__default,
+      .swagger-ui .parameter__in,
+      .swagger-ui .parameter__type,
+      .swagger-ui .col_header {
+        background: transparent !important;
+        color: var(--ez-text) !important;
+        border-color: var(--ez-border) !important;
+      }
+      .swagger-ui .model,
+      .swagger-ui .model-box {
+        background: #10151d !important;
+        border-color: var(--ez-border) !important;
+      }
+      .swagger-ui .model-box .property {
+        color: var(--ez-text) !important;
+      }
+      .swagger-ui .btn.authorize {
+        background: linear-gradient(180deg, #1f7de0 0%, #155fb4 100%) !important;
+        border-color: #1f7de0 !important;
+      }
+      .swagger-ui .btn.execute {
+        background: linear-gradient(180deg, #25c06d 0%, #159957 100%) !important;
+        border-color: #25c06d !important;
+      }
+      .swagger-ui .btn:hover,
+      .swagger-ui .btn:focus {
+        filter: brightness(1.08);
+      }
+      .swagger-ui .dialog-ux,
+      .swagger-ui .dialog-ux .backdrop-ux {
+        background: rgba(0, 0, 0, 0.72) !important;
+      }
+      .swagger-ui section.models {
+        border-color: var(--ez-border) !important;
+      }
+      .swagger-ui textarea,
+      .swagger-ui input,
+      .swagger-ui select {
+        box-shadow: none !important;
+      }
+      .swagger-ui .opblock.opblock-get .opblock-summary {
+        border-color: rgba(38, 99, 235, 0.6) !important;
+      }
+      .swagger-ui .opblock.opblock-post .opblock-summary {
+        border-color: rgba(34, 197, 94, 0.6) !important;
+      }
+      .swagger-ui .opblock.opblock-put .opblock-summary {
+        border-color: rgba(245, 158, 11, 0.6) !important;
+      }
+      .swagger-ui .opblock.opblock-delete .opblock-summary {
+        border-color: rgba(239, 68, 68, 0.6) !important;
+      }
+      .swagger-ui .opblock-summary-control:focus,
+      .swagger-ui .btn:focus,
+      .swagger-ui input:focus,
+      .swagger-ui select:focus,
+      .swagger-ui textarea:focus {
+        outline: 1px solid rgba(78, 161, 255, 0.45) !important;
+        box-shadow: 0 0 0 3px rgba(78, 161, 255, 0.14) !important;
+      }
+      .swagger-ui .footer {
+        background: transparent !important;
+      }
+    </style>
+    """
+    content = response.body.decode("utf-8").replace("</head>", f"{dark_css}</head>")
+    return HTMLResponse(content=content, status_code=response.status_code)
+
+
+@app.get("/docs/oauth2-redirect", include_in_schema=False)
+def swagger_oauth2_redirect() -> HTMLResponse:
+    return get_swagger_ui_oauth2_redirect_html()
 
 
 def _connect(database: str | None = None):
