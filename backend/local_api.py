@@ -4,6 +4,8 @@ import json
 import hashlib
 import hmac
 import os
+from pathlib import Path
+import re
 import secrets
 import threading
 import urllib.error
@@ -26,10 +28,47 @@ API_HOST = os.getenv("EZYM_MAILER_API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("EZYM_MAILER_API_PORT", "8765"))
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 
-DB_HOST = os.getenv("EZYM_MAILER_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("EZYM_MAILER_DB_PORT", "3306"))
-DB_USER = os.getenv("EZYM_MAILER_DB_USER", "root")
-DB_PASSWORD = os.getenv("EZYM_MAILER_DB_PASSWORD", "")
+_DB_CREDENTIALS_PATH = Path(__file__).resolve().parents[1] / "server_credentials" / "Database_Credentials"
+
+
+def _normalize_db_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _load_db_credentials() -> dict[str, str]:
+    credentials: dict[str, str] = {}
+    if not _DB_CREDENTIALS_PATH.exists():
+        return credentials
+    for raw_line in _DB_CREDENTIALS_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        separator = ":" if ":" in line else "=" if "=" in line else None
+        if separator is None:
+            continue
+        key, value = line.split(separator, 1)
+        credentials[_normalize_db_key(key)] = value.strip()
+    return credentials
+
+
+_LIVE_DB_CREDENTIALS = _load_db_credentials()
+
+
+def _db_config_value(env_name: str, fallback_keys: tuple[str, ...], default: str = "") -> str:
+    env_value = os.getenv(env_name)
+    if env_value not in {None, ""}:
+        return env_value
+    for key in fallback_keys:
+        fallback_value = _LIVE_DB_CREDENTIALS.get(key)
+        if fallback_value not in {None, ""}:
+            return fallback_value
+    return default
+
+
+DB_HOST = _db_config_value("EZYM_MAILER_DB_HOST", ("endpoint", "host"))
+DB_PORT = int(_db_config_value("EZYM_MAILER_DB_PORT", ("port",), "3306"))
+DB_USER = _db_config_value("EZYM_MAILER_DB_USER", ("user_name", "username", "user"))
+DB_PASSWORD = _db_config_value("EZYM_MAILER_DB_PASSWORD", ("password",))
 DB_NAME = os.getenv("EZYM_MAILER_DB_NAME", "ezymailer")
 
 DEFAULT_ADMIN_USERNAME = "admin"
@@ -331,6 +370,8 @@ def swagger_oauth2_redirect() -> HTMLResponse:
 
 
 def _connect(database: str | None = None):
+    if not DB_HOST or not DB_USER or not DB_PASSWORD:
+        raise RuntimeError("Live database credentials are not configured.")
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,

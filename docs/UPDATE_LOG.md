@@ -8,9 +8,9 @@
 - Added persistent audit tables for login history, browser sessions, settings, content, and activities
 - Added local API routes and Swagger documentation for the new audit and session data
 - Added a localhost login API for the desktop app
-- Created the MySQL-backed `ezymailer.user_db` table and seeded the `admin / admin` user
+- Created the AWS MySQL-backed `ezymailer.user_db` table and seeded the `admin / admin` user
 - Switched the sign-in screen from hardcoded validation to API-based authentication
-- Added a reusable SQL schema for importing the local database in phpMyAdmin
+- Added a reusable SQL schema for applying the live database migration
 
 ## 2026-08-12
 

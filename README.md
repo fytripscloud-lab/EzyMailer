@@ -14,7 +14,7 @@ EzyMailer now has multiple targets and deployment paths.
 
 ## Live Deployment
 
-- [`LIVE_DEPLOYMENT_NOTES.md`](/Users/koushikmondal/ezymailer/LIVE_DEPLOYMENT_NOTES.md) documents the Ubuntu-hosted live API/admin frontend setup and the live database sync rule.
+- [`LIVE_DEPLOYMENT_NOTES.md`](/Users/koushikmondal/ezymailer/LIVE_DEPLOYMENT_NOTES.md) documents the Ubuntu-hosted live API/admin frontend setup and the live database rule.
 - [`deployment/ubuntu/README.md`](/Users/koushikmondal/ezymailer/deployment/ubuntu/README.md) contains the service and environment file layout for the Ubuntu host.
 
 ## Current Local Services
@@ -38,3 +38,4 @@ EzyMailer now has multiple targets and deployment paths.
 
 - The repo includes dedicated markdown notes for future scope control.
 - Live credentials are stored under `server_credentials/` and should not be copied into documentation.
+- The hosted backend always uses the dedicated AWS database. Do not point the hosted stack at a local XAMPP/MySQL instance.

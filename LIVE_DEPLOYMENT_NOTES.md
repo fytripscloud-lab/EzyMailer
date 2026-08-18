@@ -14,12 +14,12 @@ These notes describe the live production setup and how the repository should be 
 
 ## Database Layout
 
-- Dedicated live database: production database used by the hosted API and admin frontend
-- Local MySQL database: development and desktop build-time database
+- Dedicated live database: production database used by the hosted API, admin frontend, and development builds
+- Local SQL database: local app-side state and cache storage only
 
 ## Sync Rule
 
-- Before each macOS or Windows build, sync the local MySQL database with the dedicated live database.
+- Before each macOS or Windows build, use the dedicated live database as the source of truth for schema and application data.
 - Only new schemas should be applied to the live database.
 - Do not overwrite live data unless the change is an intentional schema migration.
 
@@ -44,7 +44,7 @@ These notes describe the live production setup and how the repository should be 
   - API deployment
   - admin frontend deployment
   - dedicated live database schema management
-- Keep desktop packaging connected to the synced local MySQL state.
+- Keep desktop packaging connected to the dedicated live database and local SQL state where required.
 
 ## Deployment Assets
 

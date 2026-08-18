@@ -11,6 +11,7 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 - Gmail integration will use API-based authentication instead of direct password handling
 - Persistent audit storage is required for login history, browser sessions, content, settings, and activity logs
 - Keep all milestone decisions in markdown files for traceability
+- The backend and hosted frontend must always target the dedicated AWS MySQL database
 
 ## UI goals
 
@@ -49,7 +50,7 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 
 ## Authentication placeholder
 
-- Local API login for development
+- API login for development and hosted deployment
 - Username: `admin`
 - Password: `admin`
 - JWT bearer auth is used by the local API

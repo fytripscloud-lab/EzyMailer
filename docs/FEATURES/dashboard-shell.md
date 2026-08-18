@@ -25,4 +25,4 @@ Provide the main application shell shown after login with a modern dark layout.
 - Browser mode: Incognito or Normal
 - Active sessions list
 - Activity log
-- Browser state and activity events persist to the local MySQL database
+- Browser state and activity events persist through the backend API into the dedicated AWS MySQL database

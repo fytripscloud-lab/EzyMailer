@@ -26,7 +26,7 @@ This repository has multiple separate deliverables. Keep work scoped to the corr
 - Admin backend/API: shared API for admin portal and desktop apps
 - Desktop macOS app: local packaged app for Apple systems
 - Desktop Windows app: local packaged app for Windows systems
-- MySQL database: main persistent backend database
+- MySQL database: dedicated AWS live database used by the hosted backend and the app builds
 - Local SQL database: local app-side state and cache storage
 
 ## Live Deployment

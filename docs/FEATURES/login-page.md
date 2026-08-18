@@ -14,5 +14,5 @@ Provide a Windows desktop login screen for the first design milestone.
 
 ## Notes
 
-- Login is backed by the local API and MySQL `user_db` table
-- The app seeds an initial `admin / admin` user for development
+- Login is backed by the backend API and the dedicated AWS MySQL `user_db` table
+- The app seeds an initial `admin / admin` user for development and live bootstrap
