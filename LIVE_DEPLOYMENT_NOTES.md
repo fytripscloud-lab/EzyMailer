@@ -77,3 +77,9 @@ These notes describe the live production setup and how the repository should be 
 - The hosted admin frontend talks only to the backend API.
 - The hosted backend must not point to the local development database when deployed on Ubuntu.
 - Use the live database credentials from `server_credentials/` only for the hosted environment.
+
+## Build Rule
+
+- On macOS development machines, use the frontend, backend, and desktop app source only for development work.
+- Before building any `.dmg` or `.exe`, first update and verify the live server backend and frontend.
+- The produced build artifact must be configured to use the live API and the dedicated live database.

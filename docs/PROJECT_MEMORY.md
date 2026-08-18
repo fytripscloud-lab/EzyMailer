@@ -12,6 +12,7 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 - Persistent audit storage is required for login history, browser sessions, content, settings, and activity logs
 - Keep all milestone decisions in markdown files for traceability
 - The backend and hosted frontend must always target the dedicated AWS MySQL database
+- Before any `.dmg` or `.exe` build, first update the live server frontend and backend, then package the app against the live API and live database
 
 ## UI goals
 
