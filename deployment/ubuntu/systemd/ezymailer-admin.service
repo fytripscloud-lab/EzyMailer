@@ -1,0 +1,15 @@
+[Unit]
+Description=EzyMailer Admin Frontend
+After=network.target
+Requires=ezymailer-backend.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ezymailer
+EnvironmentFile=/etc/ezymailer/ezymailer.env
+ExecStart=/opt/ezymailer/.venv/bin/uvicorn admin_site:app --host 0.0.0.0 --port 8780
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

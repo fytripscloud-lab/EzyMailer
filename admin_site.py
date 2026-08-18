@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -9,7 +11,8 @@ from backend.local_api import ensure_api_server
 
 SITE_HOST = "127.0.0.1"
 SITE_PORT = 8780
-API_BASE_URL = "http://127.0.0.1:8765"
+API_BASE_URL = os.getenv("EZYM_MAILER_ADMIN_API_BASE_URL", "http://127.0.0.1:8765")
+BOOTSTRAP_API = os.getenv("EZYM_MAILER_BOOTSTRAP_API", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 app = FastAPI(
@@ -22,7 +25,8 @@ app = FastAPI(
 
 @app.on_event("startup")
 def _startup() -> None:
-    ensure_api_server()
+    if BOOTSTRAP_API:
+        ensure_api_server()
 
 
 @app.get("/health")

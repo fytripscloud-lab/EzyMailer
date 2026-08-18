@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import os
 import secrets
 import threading
 import urllib.error
@@ -20,23 +21,23 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 
-API_HOST = "127.0.0.1"
+API_HOST = os.getenv("EZYM_MAILER_API_HOST", "127.0.0.1")
 # Fixed local API port used by the desktop app and docs UI.
-API_PORT = 8765
+API_PORT = int(os.getenv("EZYM_MAILER_API_PORT", "8765"))
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 
-DB_HOST = "127.0.0.1"
-DB_PORT = 3306
-DB_USER = "root"
-DB_PASSWORD = ""
-DB_NAME = "ezymailer"
+DB_HOST = os.getenv("EZYM_MAILER_DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("EZYM_MAILER_DB_PORT", "3306"))
+DB_USER = os.getenv("EZYM_MAILER_DB_USER", "root")
+DB_PASSWORD = os.getenv("EZYM_MAILER_DB_PASSWORD", "")
+DB_NAME = os.getenv("EZYM_MAILER_DB_NAME", "ezymailer")
 
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
 PASSWORD_ITERATIONS = 210000
 PASSWORD_ALGORITHM = "sha256"
 
-JWT_SECRET = "ezymailer-local-development-secret"
+JWT_SECRET = os.getenv("EZYM_MAILER_JWT_SECRET", "ezymailer-local-development-secret")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_MINUTES = 24 * 60
 

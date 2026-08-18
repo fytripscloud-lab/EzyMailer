@@ -1,44 +1,40 @@
 # EzyMailer
 
-Desktop email automation app in Python.
+EzyMailer now has multiple targets and deployment paths.
 
-## Current milestone
+## Project Map
 
-- Login page with default credentials
-- Modern dashboard shell with sidebar, top bar, activity log, and tabbed workspace
-- Complete design pass for Data, Subject + Body, Content, Settings, Campaign, and Tags
-- Project memory and update logs in Markdown
+- [`PROJECT_TARGETS.md`](/Users/koushikmondal/ezymailer/PROJECT_TARGETS.md) lists the full project split:
+  - admin frontend
+  - admin/API backend
+  - macOS desktop app
+  - Windows desktop app
+  - MySQL database
+  - local SQL database
 
-## Default login
+## Live Deployment
+
+- [`LIVE_DEPLOYMENT_NOTES.md`](/Users/koushikmondal/ezymailer/LIVE_DEPLOYMENT_NOTES.md) documents the Ubuntu-hosted live API/admin frontend setup and the live database sync rule.
+- [`deployment/ubuntu/README.md`](/Users/koushikmondal/ezymailer/deployment/ubuntu/README.md) contains the service and environment file layout for the Ubuntu host.
+
+## Current Local Services
+
+- Admin frontend: `http://127.0.0.1:8780`
+- Backend API: `http://127.0.0.1:8765`
+- Swagger UI: `http://127.0.0.1:8765/docs`
+
+## Default Local Login
 
 - Username: `admin`
 - Password: `admin`
 
-## Local API
+## Desktop App
 
-- The app starts a localhost login API automatically
-- Database name: `ezymailer`
-- User table: `user_db`
-- Seed user: `admin / admin`
-- API base URL: `http://127.0.0.1:8765`
-- Swagger UI: `http://127.0.0.1:8765/docs`
-- JWT bearer tokens are issued from the login endpoint
+- Run `main.py` for the packaged desktop application source.
+- Build Windows: `build.bat`
+- Build macOS: `bash build-macos.sh`
 
-## Run
+## Notes
 
-Install dependencies, then launch `main.py`.
-
-## Build EXE
-
-Run `build.bat` on Windows to create `dist\\EzyMailer.exe`.
-
-## Build DMG
-
-Run `./build-macos.sh` on macOS to create `dist/EzyMailer-macOS.dmg`.
-
-## Next milestone
-
-- Gmail OAuth login
-- Session launch/stop/reset behavior
-- Database, subject, content, settings, sender, and tag workflows
-- Packaging into Windows `.exe` and macOS `.dmg`
+- The repo includes dedicated markdown notes for future scope control.
+- Live credentials are stored under `server_credentials/` and should not be copied into documentation.

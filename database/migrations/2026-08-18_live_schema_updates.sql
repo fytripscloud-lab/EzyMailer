@@ -1,0 +1,46 @@
+-- EzyMailer live schema updates
+-- Apply this file to the dedicated live MySQL database.
+-- Keep the migration additive and only run it when schema fields are new.
+
+USE ezymailer;
+
+ALTER TABLE user_db
+  ADD COLUMN IF NOT EXISTS display_name VARCHAR(128) NOT NULL DEFAULT '',
+  ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1,
+  ADD COLUMN IF NOT EXISTS login_valid_until TIMESTAMP NULL DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS session_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS device_fingerprint VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS device_name VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS device_ip VARCHAR(45) NULL,
+  ADD COLUMN IF NOT EXISTS device_bound_at TIMESTAMP NULL DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP NULL DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) NULL,
+  ADD COLUMN IF NOT EXISTS last_login_device VARCHAR(255) NULL;
+
+ALTER TABLE login_history
+  ADD COLUMN IF NOT EXISTS device_fingerprint VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS device_name VARCHAR(255) NULL;
+
+CREATE TABLE IF NOT EXISTS tag_state (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id INT UNSIGNED NULL,
+    username VARCHAR(64) NOT NULL,
+    state_key VARCHAR(128) NOT NULL DEFAULT 'tag_state',
+    payload_json LONGTEXT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_user_tag_state (username, state_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS customer_variables (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id INT UNSIGNED NULL,
+    username VARCHAR(64) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    variables_json LONGTEXT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_user_customer_variables (username, email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
