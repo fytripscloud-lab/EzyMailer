@@ -10,7 +10,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
 
-pyinstaller --noconfirm --clean --onefile --windowed --name EzyMailer main.py
+pyinstaller --noconfirm --clean --onefile --windowed --name EzyMailer --hidden-import docx --hidden-import pptx --collect-submodules openpyxl --collect-submodules reportlab main.py
 
 echo.
 echo Build complete. Check the dist folder for EzyMailer.exe

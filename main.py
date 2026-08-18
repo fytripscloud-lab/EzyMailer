@@ -1,15 +1,25 @@
 ﻿import sys
 import html
 import csv
+import hashlib
 import json
 import os
 import re
+import platform
+import time
+import secrets
 import subprocess
 import shutil
 import ssl
 import sqlite3
+import socket
+import string
+import uuid
+from datetime import datetime
+from io import BytesIO
 import urllib.error
 import urllib.request
+from urllib.parse import quote_plus
 from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,12 +30,17 @@ from backend.local_api import (
     API_BASE_URL,
     ensure_api_server,
     get_content as api_get_content,
+    get_customer_variables as api_get_customer_variables,
     get_settings as api_get_settings,
+    get_tags as api_get_tags,
     login as api_login,
     record_activity,
-    record_browser_session,
     delete_content as api_delete_content,
+    delete_customer_variables as api_delete_customer_variables,
+    delete_tags as api_delete_tags,
     save_content as api_save_content,
+    save_customer_variables as api_save_customer_variables,
+    save_tags as api_save_tags,
     update_content as api_update_content,
     upsert_setting,
 )
@@ -80,6 +95,18 @@ from PySide6.QtWidgets import (
     QWidget,
     QHeaderView,
 )
+from PIL import Image
+from docx import Document
+from docx.shared import Inches
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenPyxlImage
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.units import inch as reportlab_inch
+from reportlab.pdfgen import canvas
+from pptx import Presentation
+from pptx.util import Inches as PptxInches
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 APP_TITLE = "EzyMailer"
@@ -100,6 +127,10 @@ LOCAL_CACHE_DB = LOCAL_CACHE_DIR / "local_drafts.sqlite3"
 LOCAL_ATTACHMENT_STATE_KEY = "attachment_content_state"
 LOCAL_SUBJECT_STATE_KEY = "subject_content_state"
 LOCAL_BODY_STATE_KEY = "body_content_state"
+LOCAL_PENDING_EMAILS_STATE_KEY = "pending_emails_state"
+LOCAL_TAG_STATE_KEY = "tag_state"
+LOCAL_CUSTOMER_VARIABLES_TABLE = "customer_variables"
+LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
@@ -129,6 +160,19 @@ def _compute_text_scale(screen) -> float:
     height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
     scale = 1.28 + min(0.12, (width_boost + height_boost) * 0.8)
     return max(1.28, min(1.40, scale))
+
+
+def _device_fingerprint() -> str:
+    node = uuid.getnode()
+    hostname = socket.gethostname()
+    machine = platform.machine()
+    system = platform.system()
+    raw = f"{node:x}|{hostname}|{machine}|{system}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _device_name() -> str:
+    return f"{platform.system()} {platform.release()} ({socket.gethostname()})"
 
 
 def _is_subject_content_row(row: dict[str, object]) -> bool:
@@ -182,6 +226,52 @@ def _ensure_local_cache_db() -> None:
             pass
     connection = sqlite3.connect(LOCAL_CACHE_DB)
     try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ui_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tag_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_variables (
+                email TEXT NOT NULL,
+                variables_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (email)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS browser_sessions (
+                session_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                browser_name TEXT NOT NULL,
+                browser_mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                browser_pid INTEGER NULL,
+                launch_preset TEXT NOT NULL DEFAULT 'Default',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at TEXT NULL
+            )
+            """
+        )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS draft_content (
@@ -503,6 +593,220 @@ def _delete_ui_state(state_key: str) -> None:
         connection.close()
 
 
+def _upsert_tag_state(payload: dict[str, object], state_key: str = LOCAL_TAG_STATE_KEY) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            INSERT INTO tag_state (state_key, payload_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (state_key, json.dumps(payload, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _load_tag_state(state_key: str = LOCAL_TAG_STATE_KEY) -> dict[str, object]:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT payload_json
+            FROM tag_state
+            WHERE state_key = ?
+            """,
+            (state_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        raw_payload = str(row["payload_json"] or "")
+        if not raw_payload:
+            return {}
+        try:
+            payload = json.loads(raw_payload)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    finally:
+        connection.close()
+
+
+def _delete_tag_state(state_key: str = LOCAL_TAG_STATE_KEY) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute("DELETE FROM tag_state WHERE state_key = ?", (state_key,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _upsert_customer_variables(email: str, variables: dict[str, object]) -> None:
+    _ensure_local_cache_db()
+    email_key = (email or "").strip().lower()
+    if not email_key:
+        return
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            INSERT INTO customer_variables (email, variables_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(email) DO UPDATE SET
+                variables_json = excluded.variables_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (email_key, json.dumps(variables or {}, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _load_customer_variables(email: str) -> dict[str, object]:
+    _ensure_local_cache_db()
+    email_key = (email or "").strip().lower()
+    if not email_key:
+        return {}
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT variables_json
+            FROM customer_variables
+            WHERE email = ?
+            """,
+            (email_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        raw_payload = str(row["variables_json"] or "")
+        if not raw_payload:
+            return {}
+        try:
+            payload = json.loads(raw_payload)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    finally:
+        connection.close()
+
+
+def _load_all_customer_variables() -> dict[str, dict[str, object]]:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    connection.row_factory = sqlite3.Row
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT email, variables_json
+            FROM customer_variables
+            ORDER BY email ASC
+            """
+        )
+        rows = cursor.fetchall() or []
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            email = str(row["email"] or "").strip().lower()
+            if not email:
+                continue
+            raw_payload = str(row["variables_json"] or "")
+            payload: dict[str, object] = {}
+            if raw_payload:
+                try:
+                    decoded = json.loads(raw_payload)
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except Exception:
+                    payload = {}
+            result[email] = payload
+        return result
+    finally:
+        connection.close()
+
+
+def _delete_customer_variables(email: str | None = None) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        if email:
+            connection.execute("DELETE FROM customer_variables WHERE email = ?", ((email or "").strip().lower(),))
+        else:
+            connection.execute("DELETE FROM customer_variables")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _upsert_local_browser_session(
+    username: str,
+    session_id: str,
+    title: str,
+    browser_name: str,
+    browser_mode: str,
+    status: str,
+    browser_pid: int | None = None,
+    launch_preset: str = "Default",
+    details: dict[str, object] | None = None,
+) -> None:
+    _ensure_local_cache_db()
+    connection = sqlite3.connect(LOCAL_CACHE_DB)
+    try:
+        connection.execute(
+            """
+            INSERT INTO browser_sessions (
+                session_id, username, title, browser_name, browser_mode, status,
+                browser_pid, launch_preset, details_json, started_at, updated_at, closed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                    CASE WHEN ? IN ('Closed', 'Stopped') THEN CURRENT_TIMESTAMP ELSE NULL END)
+            ON CONFLICT(session_id) DO UPDATE SET
+                username = excluded.username,
+                title = excluded.title,
+                browser_name = excluded.browser_name,
+                browser_mode = excluded.browser_mode,
+                status = excluded.status,
+                browser_pid = excluded.browser_pid,
+                launch_preset = excluded.launch_preset,
+                details_json = excluded.details_json,
+                updated_at = CURRENT_TIMESTAMP,
+                closed_at = CASE
+                    WHEN excluded.status IN ('Closed', 'Stopped') THEN CURRENT_TIMESTAMP
+                    ELSE browser_sessions.closed_at
+                END
+            """,
+            (
+                username,
+                session_id,
+                title,
+                browser_name,
+                browser_mode,
+                status,
+                browser_pid,
+                launch_preset,
+                json.dumps(details or {}, ensure_ascii=False),
+                status,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _is_local_draft_item(item: QTableWidgetItem | QListWidgetItem | None) -> bool:
     if item is None:
         return False
@@ -519,6 +823,7 @@ def _local_draft_id_from_item(item: QTableWidgetItem | QListWidgetItem | None) -
 @dataclass
 class AppState:
     username: str = ""
+    role: str = ""
     logged_in: bool = False
     auth_token: str = ""
     browser_mode: str = "Incognito"
@@ -527,6 +832,9 @@ class AppState:
     active_sessions: list[str] = field(default_factory=list)
     activity_log: list[str] = field(default_factory=list)
     pending_recipients: list[str] = field(default_factory=list)
+    custom_tag_1: str = ""
+    custom_tag_2: str = ""
+    tag_samples: dict[str, str] = field(default_factory=dict)
     body_mode: str = "Normal Message"
     subject_text: str = ""
     plain_body_text: str = ""
@@ -555,6 +863,7 @@ class BrowserSessionHandle:
     process: subprocess.Popen[str] | None = None
     status: str = "Starting"
     profile_dir: Path | None = None
+    debug_port: int | None = None
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -1846,10 +2155,19 @@ class OutputOptionsDialog(QDialog):
 
 
 class FileFormatDialog(QDialog):
-    def __init__(self, parent=None, scale: float = 1.0, selected_format: str = "PDF document"):
+    def __init__(
+        self,
+        parent=None,
+        scale: float = 1.0,
+        selected_format: str = "PDF document",
+        file_name_mode: str = "auto",
+        file_name_value: str = "",
+    ):
         super().__init__(parent)
         self._scale = scale
         self._selected_format = selected_format
+        self._file_name_mode = file_name_mode
+        self._file_name_value = file_name_value
         self.setWindowTitle("Choose File Format")
         self.setModal(True)
         self.setObjectName("outputDialog")
@@ -1862,6 +2180,7 @@ class FileFormatDialog(QDialog):
         self._build_ui()
         self._apply_initial_selection()
         self._wire_exclusive_selection()
+        self._apply_initial_file_name_selection()
         self._sync_file_name_controls()
 
     def _build_ui(self) -> None:
@@ -1878,6 +2197,10 @@ class FileFormatDialog(QDialog):
         title = QLabel("FILE FORMAT")
         title.setObjectName("sectionTitle")
         card_layout.addWidget(title)
+        supported = QLabel("Supported: PDF, DOCX, XLSX, XLTX, PPTX, PPSX")
+        supported.setObjectName("sectionHint")
+        supported.setWordWrap(True)
+        card_layout.addWidget(supported)
 
         self._random_checkbox = QCheckBox("Random format")
         self._random_checkbox.setToolTip("Choose a random format from the selected file types")
@@ -1922,7 +2245,8 @@ class FileFormatDialog(QDialog):
         custom_row.setContentsMargins(0, 0, 0, 0)
         custom_row.setSpacing(_scaled_int(8, self._scale))
         self.custom_name_input = QLineEdit()
-        self.custom_name_input.setPlaceholderText("Enter file name")
+        self.custom_name_input.setPlaceholderText("Enter file name or tags, e.g. report-{{first_name}}")
+        self.custom_name_input.setToolTip("Tags like $custom1, $name, and {{first_name}} are allowed")
         self.file_extension_label = QLabel(self._format_extension())
         custom_row.addWidget(self.custom_name)
         custom_row.addWidget(self.custom_name_input, 1)
@@ -2009,6 +2333,29 @@ class FileFormatDialog(QDialog):
             self.custom_name_input.setEnabled(not auto_checked)
         if self.file_extension_label is not None:
             self.file_extension_label.setText(self._format_extension())
+
+    def _apply_initial_file_name_selection(self) -> None:
+        if self.auto_name is None or self.custom_name is None:
+            return
+        if str(self._file_name_mode or "").strip().lower() == "custom":
+            self.custom_name.setChecked(True)
+            if self.custom_name_input is not None:
+                self.custom_name_input.setText(self._file_name_value)
+        else:
+            self.auto_name.setChecked(True)
+            if self.custom_name_input is not None and self._file_name_value:
+                self.custom_name_input.setText(self._file_name_value)
+
+    def uses_custom_file_name(self) -> bool:
+        return bool(self.custom_name and self.custom_name.isChecked())
+
+    def selected_file_name_base(self, default_base: str) -> str:
+        if self.uses_custom_file_name():
+            custom_value = ""
+            if self.custom_name_input is not None:
+                custom_value = self.custom_name_input.text().strip()
+            return custom_value or default_base
+        return default_base
 
 
 class HtmlPreviewDialog(QDialog):
@@ -2255,7 +2602,13 @@ class LoginPage(QWidget):
         self._set_busy(True)
         QApplication.processEvents()
         try:
-            payload = api_login(username, password, timeout=5.0)
+            payload = api_login(
+                username,
+                password,
+                timeout=5.0,
+                device_fingerprint=_device_fingerprint(),
+                device_name=_device_name(),
+            )
         except urllib.error.HTTPError as exc:
             message = "The username or password is incorrect."
             try:
@@ -2276,7 +2629,11 @@ class LoginPage(QWidget):
             return
 
         user = payload.get("user") or {}
-        self.on_login(str(user.get("username", username)), str(payload.get("access_token", "")))
+        self.on_login(
+            str(user.get("username", username)),
+            str(payload.get("access_token", "")),
+            str(user.get("role", "")),
+        )
 
 
 class DashboardPage(QWidget):
@@ -2309,6 +2666,8 @@ class DashboardPage(QWidget):
         self.attach_convert_checkbox = QCheckBox("Convert")
         self.attach_choose_format_button = QPushButton("Choose Format")
         self.attach_format_value = "PDF document"
+        self.attach_file_name_mode = "auto"
+        self.attach_file_name_value = ""
         self.attach_format_label = QLabel(self._attachment_format_summary(self.attach_format_value))
         self.pending_emails_editor = QTextEdit()
         self.subject_input = QLineEdit()
@@ -2322,6 +2681,35 @@ class DashboardPage(QWidget):
         self.launch_preset_label = QLabel("Default")
         self.custom1_input = QLineEdit()
         self.custom2_input = QLineEdit()
+        self.customer_email_input = QLineEdit()
+        self.customer_variable_key_input = QLineEdit()
+        self.customer_variable_value_input = QLineEdit()
+        self.customer_variables_table = QTableWidget(0, 3)
+        self.customer_variables_save_button = QPushButton("Save/Update")
+        self.customer_variables_delete_button = QPushButton("Delete Selected")
+        self.customer_variables_refresh_button = QPushButton("Refresh")
+        self.customer_variables_clear_button = QPushButton("Clear")
+        self.admin_tabs = QTabWidget()
+        self.admin_users_table = QTableWidget(0, 8)
+        self.admin_activity_table = QTableWidget(0, 7)
+        self.admin_login_history_table = QTableWidget(0, 9)
+        self.admin_refresh_users_button = QPushButton("Refresh Users")
+        self.admin_refresh_activity_button = QPushButton("Refresh Activity")
+        self.admin_refresh_login_button = QPushButton("Refresh Login History")
+        self.admin_create_user_button = QPushButton("Create User")
+        self.admin_save_user_button = QPushButton("Save User")
+        self.admin_activate_user_button = QPushButton("Activate")
+        self.admin_deactivate_user_button = QPushButton("Deactivate")
+        self.admin_reset_password_button = QPushButton("Reset Password")
+        self.admin_reset_device_button = QPushButton("Reset Device")
+        self.admin_selected_user_id = QLineEdit()
+        self.admin_username_input = QLineEdit()
+        self.admin_display_name_input = QLineEdit()
+        self.admin_role_input = QLineEdit()
+        self.admin_valid_until_input = QLineEdit()
+        self.admin_new_password_input = QLineEdit()
+        self.admin_clear_device_checkbox = QCheckBox("Clear device binding")
+        self.admin_access_label = QLabel("")
         self.sender_limit = QSpinBox()
         self.delay_from = QDoubleSpinBox()
         self.delay_to = QDoubleSpinBox()
@@ -2347,6 +2735,7 @@ class DashboardPage(QWidget):
         self._browser_watch_timer = QTimer(self)
         self._browser_watch_timer.setInterval(2000)
         self._browser_watch_timer.timeout.connect(self._sync_browser_session_states)
+        self._pending_campaign_payload: dict[str, object] | None = None
         self._subject_body_save_timer = QTimer(self)
         self._subject_body_save_timer.setSingleShot(True)
         self._subject_body_save_timer.setInterval(700)
@@ -2355,6 +2744,14 @@ class DashboardPage(QWidget):
         self._attachment_save_timer.setSingleShot(True)
         self._attachment_save_timer.setInterval(700)
         self._attachment_save_timer.timeout.connect(self._persist_attachment_state)
+        self._pending_emails_save_timer = QTimer(self)
+        self._pending_emails_save_timer.setSingleShot(True)
+        self._pending_emails_save_timer.setInterval(700)
+        self._pending_emails_save_timer.timeout.connect(self._persist_pending_emails_state)
+        self._tags_save_timer = QTimer(self)
+        self._tags_save_timer.setSingleShot(True)
+        self._tags_save_timer.setInterval(700)
+        self._tags_save_timer.timeout.connect(self._persist_tags_state)
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.setInterval(700)
@@ -2362,6 +2759,8 @@ class DashboardPage(QWidget):
         self._subject_manager_dialog: SubjectDraftsDialog | None = None
         self._workspace_loading = False
         self._active_attachment_widget: AttachmentDraftEditor | None = None
+        self._tag_value_labels: dict[str, QLabel] = {}
+        self._tag_definitions: list[dict[str, str]] = self._default_tag_definitions()
         self._row_animations: list[QPropertyAnimation] = []
         self._floating_windows: list[QDialog] = []
         self._browser_sessions: list[BrowserSessionHandle] = []
@@ -2582,6 +2981,7 @@ class DashboardPage(QWidget):
         self.pending_emails_editor.setMinimumHeight(_scaled_int(360, self._scale))
         self.pending_emails_editor.setToolTip("Paste recipient email addresses, one per line")
         self.pending_emails_editor.installEventFilter(self)
+        self.pending_emails_editor.textChanged.connect(self._schedule_pending_emails_save)
         page_layout.addWidget(self.pending_emails_editor, 1)
 
         filter_card, filter_layout = self._card(
@@ -2724,6 +3124,10 @@ class DashboardPage(QWidget):
         content_label.setObjectName("sectionTitle")
         content_header.addWidget(content_label)
         content_header.addStretch()
+        content_hint = QLabel("Upload HTML or paste HTML code, then choose an output format before sending.")
+        content_hint.setObjectName("sectionHint")
+        content_hint.setWordWrap(True)
+        content_layout.addWidget(content_hint)
         self.attach_add_button.setObjectName("secondaryButton")
         self.attach_add_button.setFixedWidth(_scaled_int(34, self._scale))
         self.attach_add_button.setToolTip("Add a new HTML attachment tab")
@@ -3271,7 +3675,7 @@ class DashboardPage(QWidget):
         start_button = QPushButton("Start Campaign")
         start_button.setObjectName("blastButton")
         start_button.setMinimumHeight(_scaled_int(54, self._scale))
-        start_button.clicked.connect(lambda: self._log_action("Start Campaign clicked"))
+        start_button.clicked.connect(lambda: self._start_blast())
         start_button.setToolTip("Start the email sending workflow")
         layout.addWidget(start_button)
 
@@ -3283,6 +3687,406 @@ class DashboardPage(QWidget):
         layout.addWidget(log_card, 1)
 
         return self._tab_scroll(page)
+
+    def _build_admin_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(_scaled_int(10, self._scale))
+
+        layout.addWidget(self._section_title("ADMIN CONSOLE", "Manage users, validity windows, device locks, and audit logs."))
+        self.admin_access_label.setObjectName("sectionSubtitle")
+        self.admin_access_label.setWordWrap(True)
+        layout.addWidget(self.admin_access_label)
+
+        users_card, users_layout = self._card("USERS", "Select a user, edit details, or create a new account.")
+        users_header = QHBoxLayout()
+        self.admin_refresh_users_button.setObjectName("secondaryButton")
+        self.admin_refresh_users_button.clicked.connect(self._admin_refresh_users)
+        users_header.addWidget(self.admin_refresh_users_button)
+        users_header.addStretch()
+        users_layout.addLayout(users_header)
+
+        self.admin_users_table.setHorizontalHeaderLabels(
+            ["ID", "Username", "Display Name", "Role", "Active", "Valid Until", "Device", "Last Login"]
+        )
+        self.admin_users_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.admin_users_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.admin_users_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.admin_users_table.horizontalHeader().setStretchLastSection(True)
+        self.admin_users_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.admin_users_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.admin_users_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.admin_users_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.admin_users_table.itemSelectionChanged.connect(self._admin_load_selected_user)
+        users_layout.addWidget(self.admin_users_table, 1)
+
+        form_card, form_layout = self._card("USER DETAILS", "Edit the selected user or prepare a new one.")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        self.admin_selected_user_id.setReadOnly(True)
+        self.admin_username_input.setPlaceholderText("username")
+        self.admin_display_name_input.setPlaceholderText("display name")
+        self.admin_role_input.setPlaceholderText("admin or user")
+        self.admin_valid_until_input.setPlaceholderText("YYYY-MM-DD HH:MM:SS or blank")
+        self.admin_new_password_input.setPlaceholderText("new password")
+        self.admin_new_password_input.setEchoMode(QLineEdit.Password)
+        form.addRow("User ID", self.admin_selected_user_id)
+        form.addRow("Username", self.admin_username_input)
+        form.addRow("Display Name", self.admin_display_name_input)
+        form.addRow("Role", self.admin_role_input)
+        form.addRow("Login Valid Until", self.admin_valid_until_input)
+        form.addRow("Reset Password", self.admin_new_password_input)
+        form.addRow("", self.admin_clear_device_checkbox)
+        form_layout.addLayout(form)
+
+        actions_row = QHBoxLayout()
+        self.admin_create_user_button.setObjectName("primaryButton")
+        self.admin_create_user_button.clicked.connect(self._admin_create_user)
+        self.admin_save_user_button.setObjectName("secondaryButton")
+        self.admin_save_user_button.clicked.connect(self._admin_save_user)
+        self.admin_activate_user_button.setObjectName("secondaryButton")
+        self.admin_activate_user_button.clicked.connect(lambda: self._admin_toggle_active(True))
+        self.admin_deactivate_user_button.setObjectName("secondaryButton")
+        self.admin_deactivate_user_button.clicked.connect(lambda: self._admin_toggle_active(False))
+        self.admin_reset_password_button.setObjectName("secondaryButton")
+        self.admin_reset_password_button.clicked.connect(self._admin_reset_password)
+        self.admin_reset_device_button.setObjectName("secondaryButton")
+        self.admin_reset_device_button.clicked.connect(self._admin_reset_device)
+        for button in (
+            self.admin_create_user_button,
+            self.admin_save_user_button,
+            self.admin_activate_user_button,
+            self.admin_deactivate_user_button,
+            self.admin_reset_password_button,
+            self.admin_reset_device_button,
+        ):
+            actions_row.addWidget(button)
+        actions_row.addStretch()
+        form_layout.addLayout(actions_row)
+        users_layout.addWidget(form_card)
+
+        activity_card, activity_layout = self._card("ACTIVITY", "Recent actions for all users.")
+        activity_header = QHBoxLayout()
+        self.admin_refresh_activity_button.setObjectName("secondaryButton")
+        self.admin_refresh_activity_button.clicked.connect(self._admin_refresh_activity)
+        activity_header.addWidget(self.admin_refresh_activity_button)
+        activity_header.addStretch()
+        activity_layout.addLayout(activity_header)
+        self.admin_activity_table.setHorizontalHeaderLabels(
+            ["ID", "Username", "Category", "Action", "Details", "IP", "Created"]
+        )
+        self.admin_activity_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.admin_activity_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.admin_activity_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.admin_activity_table.horizontalHeader().setStretchLastSection(True)
+        self.admin_activity_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.admin_activity_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        activity_layout.addWidget(self.admin_activity_table, 1)
+
+        login_card, login_layout = self._card("LOGIN HISTORY", "Login attempts, device bindings, and access validity.")
+        login_header = QHBoxLayout()
+        self.admin_refresh_login_button.setObjectName("secondaryButton")
+        self.admin_refresh_login_button.clicked.connect(self._admin_refresh_login_history)
+        login_header.addWidget(self.admin_refresh_login_button)
+        login_header.addStretch()
+        login_layout.addLayout(login_header)
+        self.admin_login_history_table.setHorizontalHeaderLabels(
+            ["ID", "User ID", "Username", "Success", "IP", "Device Fingerprint", "Device Name", "Agent", "Created"]
+        )
+        self.admin_login_history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.admin_login_history_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.admin_login_history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.admin_login_history_table.horizontalHeader().setStretchLastSection(True)
+        self.admin_login_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.admin_login_history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.admin_login_history_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.admin_login_history_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        login_layout.addWidget(self.admin_login_history_table, 1)
+
+        self.admin_tabs = QTabWidget()
+        self.admin_tabs.addTab(users_card, "Users")
+        self.admin_tabs.addTab(activity_card, "Activity")
+        self.admin_tabs.addTab(login_card, "Login History")
+        layout.addWidget(self.admin_tabs, 1)
+        return self._tab_scroll(page)
+
+    def _admin_table_item(self, value: object) -> QTableWidgetItem:
+        item = QTableWidgetItem("" if value is None else str(value))
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        return item
+
+    def _admin_format_datetime(self, value: object) -> str:
+        if value in {None, ""}:
+            return ""
+        try:
+            if isinstance(value, datetime):
+                dt = value
+            else:
+                text = str(value).strip().replace("Z", "+00:00")
+                dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(value)
+
+    def _admin_parse_datetime(self, value: str) -> datetime | None:
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _admin_current_user_id(self) -> int | None:
+        current_item = self.admin_users_table.currentItem()
+        if current_item is None:
+            return None
+        row = current_item.row()
+        id_item = self.admin_users_table.item(row, 0)
+        if id_item is None:
+            return None
+        try:
+            return int(id_item.text().strip())
+        except Exception:
+            return None
+
+    def _admin_clear_form(self) -> None:
+        for widget in (
+            self.admin_selected_user_id,
+            self.admin_username_input,
+            self.admin_display_name_input,
+            self.admin_role_input,
+            self.admin_valid_until_input,
+            self.admin_new_password_input,
+        ):
+            widget.clear()
+        self.admin_clear_device_checkbox.setChecked(False)
+
+    def _admin_set_form_from_user(self, user: dict[str, object]) -> None:
+        self.admin_selected_user_id.setText(str(user.get("id") or ""))
+        self.admin_username_input.setText(str(user.get("username") or ""))
+        self.admin_display_name_input.setText(str(user.get("display_name") or ""))
+        self.admin_role_input.setText(str(user.get("role") or "user"))
+        self.admin_valid_until_input.setText(self._admin_format_datetime(user.get("login_valid_until")))
+        self.admin_new_password_input.clear()
+        self.admin_clear_device_checkbox.setChecked(False)
+
+    def _admin_refresh_users(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            payload = list_admin_users(self.state.auth_token)
+            users = payload.get("users") or []
+            if not isinstance(users, list):
+                users = []
+            self.admin_users_table.setRowCount(0)
+            for row_index, user in enumerate(users):
+                if not isinstance(user, dict):
+                    continue
+                self.admin_users_table.insertRow(row_index)
+                values = [
+                    user.get("id"),
+                    user.get("username"),
+                    user.get("display_name"),
+                    user.get("role"),
+                    "Yes" if bool(user.get("is_active", True)) else "No",
+                    self._admin_format_datetime(user.get("login_valid_until")),
+                    user.get("device_name") or user.get("device_fingerprint"),
+                    user.get("last_login_at") or user.get("last_login_ip"),
+                ]
+                for col, value in enumerate(values):
+                    self.admin_users_table.setItem(row_index, col, self._admin_table_item(value))
+            if self.admin_users_table.rowCount() > 0 and self.admin_users_table.currentRow() < 0:
+                self.admin_users_table.selectRow(0)
+        except Exception as exc:
+            self._log_action(f"Failed to refresh admin users: {exc}")
+
+    def _admin_refresh_activity(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            payload = list_admin_activity(self.state.auth_token, limit=200)
+            rows = payload.get("activity") or []
+            if not isinstance(rows, list):
+                rows = []
+            self.admin_activity_table.setRowCount(0)
+            for row_index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                self.admin_activity_table.insertRow(row_index)
+                values = [
+                    row.get("id"),
+                    row.get("username"),
+                    row.get("category"),
+                    row.get("action"),
+                    row.get("details_json"),
+                    row.get("ip_address"),
+                    row.get("created_at"),
+                ]
+                for col, value in enumerate(values):
+                    self.admin_activity_table.setItem(row_index, col, self._admin_table_item(value))
+        except Exception as exc:
+            self._log_action(f"Failed to refresh admin activity: {exc}")
+
+    def _admin_refresh_login_history(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            payload = list_admin_login_history(self.state.auth_token, limit=200)
+            rows = payload.get("history") or []
+            if not isinstance(rows, list):
+                rows = []
+            self.admin_login_history_table.setRowCount(0)
+            for row_index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                self.admin_login_history_table.insertRow(row_index)
+                values = [
+                    row.get("id"),
+                    row.get("user_id"),
+                    row.get("username"),
+                    "Yes" if bool(row.get("success")) else "No",
+                    row.get("ip_address"),
+                    row.get("device_fingerprint"),
+                    row.get("device_name"),
+                    row.get("user_agent"),
+                    row.get("created_at"),
+                ]
+                for col, value in enumerate(values):
+                    self.admin_login_history_table.setItem(row_index, col, self._admin_table_item(value))
+        except Exception as exc:
+            self._log_action(f"Failed to refresh login history: {exc}")
+
+    def _admin_load_selected_user(self) -> None:
+        user_id = self._admin_current_user_id()
+        if user_id is None or not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            payload = get_admin_user(self.state.auth_token, user_id)
+            user = payload.get("user") or {}
+            if isinstance(user, dict):
+                self._admin_set_form_from_user(user)
+        except Exception as exc:
+            self._log_action(f"Failed to load selected admin user: {exc}")
+
+    def _admin_create_user(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            return
+        password = self.admin_new_password_input.text().strip()
+        if not password:
+            self.notify("Enter a password to create the user")
+            return
+        payload = {
+            "username": self.admin_username_input.text().strip(),
+            "password": password,
+            "display_name": self.admin_display_name_input.text().strip(),
+            "role": self.admin_role_input.text().strip() or "user",
+            "is_active": True,
+            "login_valid_until": self._admin_parse_datetime(self.admin_valid_until_input.text().strip()),
+        }
+        try:
+            create_admin_user(self.state.auth_token, payload)
+            self.notify("User created")
+            self._admin_refresh_users()
+            self._admin_clear_form()
+        except Exception as exc:
+            self._log_action(f"Failed to create admin user: {exc}")
+            self.notify("Unable to create user")
+
+    def _admin_save_user(self) -> None:
+        user_id = self._admin_current_user_id()
+        if user_id is None or not self.state.logged_in or not self.state.auth_token:
+            self.notify("Select a user first")
+            return
+        payload: dict[str, object] = {
+            "username": self.admin_username_input.text().strip(),
+            "display_name": self.admin_display_name_input.text().strip(),
+            "role": self.admin_role_input.text().strip() or "user",
+            "login_valid_until": self._admin_parse_datetime(self.admin_valid_until_input.text().strip()),
+            "clear_device_binding": self.admin_clear_device_checkbox.isChecked(),
+        }
+        password = self.admin_new_password_input.text().strip()
+        if password:
+            payload["reset_password"] = password
+        try:
+            update_admin_user(self.state.auth_token, user_id, payload)
+            self.notify("User updated")
+            self._admin_refresh_users()
+        except Exception as exc:
+            self._log_action(f"Failed to save admin user: {exc}")
+            self.notify("Unable to save user")
+
+    def _admin_toggle_active(self, is_active: bool) -> None:
+        user_id = self._admin_current_user_id()
+        if user_id is None or not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            update_admin_user(self.state.auth_token, user_id, {"is_active": is_active})
+            self._admin_refresh_users()
+            self.notify("User activated" if is_active else "User deactivated")
+        except Exception as exc:
+            self._log_action(f"Failed to change user state: {exc}")
+
+    def _admin_reset_password(self) -> None:
+        user_id = self._admin_current_user_id()
+        password = self.admin_new_password_input.text().strip()
+        if user_id is None or not self.state.logged_in or not self.state.auth_token:
+            return
+        if not password:
+            self.notify("Enter a new password first")
+            return
+        try:
+            reset_admin_user_password(self.state.auth_token, user_id, password)
+            self.notify("Password reset")
+            self._admin_refresh_users()
+        except Exception as exc:
+            self._log_action(f"Failed to reset password: {exc}")
+
+    def _admin_reset_device(self) -> None:
+        user_id = self._admin_current_user_id()
+        if user_id is None or not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            reset_admin_user_device(self.state.auth_token, user_id)
+            self.notify("Device binding cleared")
+            self._admin_refresh_users()
+        except Exception as exc:
+            self._log_action(f"Failed to reset device binding: {exc}")
+
+    def _sync_admin_access(self) -> None:
+        is_admin = self.state.logged_in and self.state.role == "admin"
+        index = self.tabs.indexOf(self.admin_tabs)
+        if index >= 0:
+            self.tabs.setTabEnabled(index, is_admin)
+        self.admin_access_label.setText(
+            "Admin features are enabled for this account."
+            if is_admin
+            else "Admin features are disabled for this account."
+        )
+        for widget in (
+            self.admin_users_table,
+            self.admin_activity_table,
+            self.admin_login_history_table,
+            self.admin_refresh_users_button,
+            self.admin_refresh_activity_button,
+            self.admin_refresh_login_button,
+            self.admin_create_user_button,
+            self.admin_save_user_button,
+            self.admin_activate_user_button,
+            self.admin_deactivate_user_button,
+            self.admin_reset_password_button,
+            self.admin_reset_device_button,
+            self.admin_selected_user_id,
+            self.admin_username_input,
+            self.admin_display_name_input,
+            self.admin_role_input,
+            self.admin_valid_until_input,
+            self.admin_new_password_input,
+            self.admin_clear_device_checkbox,
+        ):
+            widget.setEnabled(is_admin)
 
     def _build_tags_tab(self) -> QWidget:
         page = QWidget()
@@ -3305,34 +4109,14 @@ class DashboardPage(QWidget):
         tag_host_layout = QGridLayout(tag_host)
         tag_host_layout.setContentsMargins(0, 0, 0, 0)
         tag_host_layout.setSpacing(_scaled_int(8, self._scale))
-        samples = [
-            ("VOIS", "$random4", "4 char alphanumeric uppercase"),
-            ("V3EAJO", "$random6", "6 char alphanumeric uppercase"),
-            ("0G2639Q", "$random8", "8 char alphanumeric uppercase"),
-            ("I51VNI166P", "$random10", "10 char alphanumeric uppercase"),
-            ("I520Z0QQQ7CN", "$random12", "12 char alphanumeric uppercase"),
-            ("VIK", "$word3", "3-letter uppercase word"),
-            ("POPE", "$word4", "4-letter word pattern"),
-            ("FABEQ", "$word5", "5-letter uppercase word"),
-            ("7575", "$num4", "4 digit number"),
-            ("640296", "$num6", "6 digit number"),
-            ("45250809", "$num8", "8 digit number"),
-            ("1-800-181-7889", "$phone", "Phone-style sample"),
-            ("QLRZ", "$word4a", "Alternative 4-letter word"),
-            ("MOTION", "$word6", "6-letter uppercase word"),
-            ("7A4F", "$mix4", "Mixed 4-character token"),
-            ("DX8M2P", "$mix6", "Mixed 6-character token"),
-            ("0314", "$day4", "4 digit day code"),
-            ("202608", "$ym6", "Year-month code"),
-            ("94-221-88", "$id9", "Structured numeric token"),
-            ("support@ezymailer.com", "$email", "Email address sample"),
-            ("https://ezymailer.app", "$url", "Website URL sample"),
-            ("Alice Johnson", "$name", "Full name sample"),
-            ("Seattle", "$city", "City sample"),
-            ("hello-world", "$slug", "Slug sample"),
-        ]
-        for index, (title, token, description) in enumerate(samples):
-            tag_host_layout.addWidget(self._tag_card(title, token, description), index // 3, index % 3)
+        self._tag_value_labels.clear()
+        values = self._tag_sample_values()
+        for index, definition in enumerate(self._tag_definitions):
+            token = definition["token"]
+            title = definition["title"]
+            description = definition["description"]
+            value = values.get(token, definition["default_value"])
+            tag_host_layout.addWidget(self._tag_card(title, token, description, value), index // 3, index % 3)
         tag_scroll.setWidget(tag_host)
         grid_layout.addWidget(tag_scroll)
         layout.addWidget(grid_card)
@@ -3347,9 +4131,9 @@ class DashboardPage(QWidget):
         regenerate_button.setToolTip("Regenerate all sample tag values")
         ai_button.setToolTip("Generate new tag ideas with AI")
         reset_button.setToolTip("Restore the default tag set")
-        regenerate_button.clicked.connect(lambda: self._log_action("Regenerated tags"))
+        regenerate_button.clicked.connect(lambda: self._regenerate_tags())
         ai_button.clicked.connect(lambda: self._log_action("Generated tags with AI"))
-        reset_button.clicked.connect(lambda: self._log_action("Reset tags to default"))
+        reset_button.clicked.connect(lambda: self._reset_tags_to_default())
         actions_row.addWidget(regenerate_button)
         actions_row.addWidget(ai_button)
         actions_row.addWidget(reset_button)
@@ -3362,12 +4146,96 @@ class DashboardPage(QWidget):
         self.custom2_input.setPlaceholderText("$custom2 =")
         self.custom1_input.setToolTip("Define the first manual custom tag value")
         self.custom2_input.setToolTip("Define the second manual custom tag value")
+        self.custom1_input.textEdited.connect(lambda _value: self._schedule_tags_save())
+        self.custom2_input.textEdited.connect(lambda _value: self._schedule_tags_save())
         manual_layout.addWidget(self._line_with_copy(self.custom1_input))
         manual_layout.addWidget(self._line_with_copy(self.custom2_input))
         layout.addWidget(manual_card)
+
+        variables_card, variables_layout = self._card(
+            "CUSTOMER VARIABLES",
+            "Store per-customer values that can be used in Subject, Body, Attachment Content, and File Name.",
+        )
+        variables_form = QFormLayout()
+        variables_form.setLabelAlignment(Qt.AlignLeft)
+        self.customer_email_input.setPlaceholderText("customer@email.com")
+        self.customer_variable_key_input.setPlaceholderText("first_name")
+        self.customer_variable_value_input.setPlaceholderText("John")
+        self.customer_email_input.setToolTip("Email key used to look up variables for a customer")
+        self.customer_variable_key_input.setToolTip("Variable name such as first_name or company")
+        self.customer_variable_value_input.setToolTip("Variable value used when replacing tags")
+        variables_form.addRow("Email", self.customer_email_input)
+        variables_form.addRow("Variable", self.customer_variable_key_input)
+        variables_form.addRow("Value", self.customer_variable_value_input)
+        variables_layout.addLayout(variables_form)
+
+        variables_actions = QHBoxLayout()
+        self.customer_variables_save_button.setObjectName("primaryButton")
+        self.customer_variables_delete_button.setObjectName("dangerButton")
+        self.customer_variables_refresh_button.setObjectName("secondaryButton")
+        self.customer_variables_clear_button.setObjectName("secondaryButton")
+        self.customer_variables_save_button.setToolTip("Save or update the selected customer variable")
+        self.customer_variables_delete_button.setToolTip("Delete the selected customer variable")
+        self.customer_variables_refresh_button.setToolTip("Reload variables from local storage and API")
+        self.customer_variables_clear_button.setToolTip("Clear the editor fields")
+        self.customer_variables_save_button.clicked.connect(self._persist_customer_variable_record)
+        self.customer_variables_delete_button.clicked.connect(self._delete_selected_customer_variable_record)
+        self.customer_variables_refresh_button.clicked.connect(self._load_customer_variables_state)
+        self.customer_variables_clear_button.clicked.connect(self._clear_customer_variable_form)
+        variables_actions.addWidget(self.customer_variables_save_button)
+        variables_actions.addWidget(self.customer_variables_delete_button)
+        variables_actions.addWidget(self.customer_variables_refresh_button)
+        variables_actions.addWidget(self.customer_variables_clear_button)
+        variables_actions.addStretch()
+        variables_layout.addLayout(variables_actions)
+
+        self.customer_variables_table.setObjectName("subjectTable")
+        self.customer_variables_table.setColumnCount(3)
+        self.customer_variables_table.setHorizontalHeaderLabels(["Email", "Variable", "Value"])
+        self.customer_variables_table.verticalHeader().setVisible(False)
+        self.customer_variables_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.customer_variables_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.customer_variables_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.customer_variables_table.horizontalHeader().setStretchLastSection(True)
+        self.customer_variables_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.customer_variables_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.customer_variables_table.itemSelectionChanged.connect(self._populate_customer_variable_form_from_selection)
+        self.customer_variables_table.setMinimumHeight(_scaled_int(240, self._scale))
+        variables_layout.addWidget(self.customer_variables_table, 1)
+        layout.addWidget(variables_card, 1)
         layout.addStretch()
 
+        self._load_tags_state()
+        self._load_customer_variables_state()
         return self._tab_scroll(page)
+
+    def _default_tag_definitions(self) -> list[dict[str, str]]:
+        return [
+            {"title": "VOIS", "token": "$random4", "description": "4 char alphanumeric uppercase", "default_value": "VOIS"},
+            {"title": "V3EAJO", "token": "$random6", "description": "6 char alphanumeric uppercase", "default_value": "V3EAJO"},
+            {"title": "0G2639Q", "token": "$random8", "description": "8 char alphanumeric uppercase", "default_value": "0G2639Q"},
+            {"title": "I51VNI166P", "token": "$random10", "description": "10 char alphanumeric uppercase", "default_value": "I51VNI166P"},
+            {"title": "I520Z0QQQ7CN", "token": "$random12", "description": "12 char alphanumeric uppercase", "default_value": "I520Z0QQQ7CN"},
+            {"title": "VIK", "token": "$word3", "description": "3-letter uppercase word", "default_value": "VIK"},
+            {"title": "POPE", "token": "$word4", "description": "4-letter word pattern", "default_value": "POPE"},
+            {"title": "FABEQ", "token": "$word5", "description": "5-letter uppercase word", "default_value": "FABEQ"},
+            {"title": "7575", "token": "$num4", "description": "4 digit number", "default_value": "7575"},
+            {"title": "640296", "token": "$num6", "description": "6 digit number", "default_value": "640296"},
+            {"title": "45250809", "token": "$num8", "description": "8 digit number", "default_value": "45250809"},
+            {"title": "1-800-181-7889", "token": "$phone", "description": "Phone-style sample", "default_value": "1-800-181-7889"},
+            {"title": "QLRZ", "token": "$word4a", "description": "Alternative 4-letter word", "default_value": "QLRZ"},
+            {"title": "MOTION", "token": "$word6", "description": "6-letter uppercase word", "default_value": "MOTION"},
+            {"title": "7A4F", "token": "$mix4", "description": "Mixed 4-character token", "default_value": "7A4F"},
+            {"title": "DX8M2P", "token": "$mix6", "description": "Mixed 6-character token", "default_value": "DX8M2P"},
+            {"title": "0314", "token": "$day4", "description": "4 digit day code", "default_value": "0314"},
+            {"title": "202608", "token": "$ym6", "description": "Year-month code", "default_value": "202608"},
+            {"title": "94-221-88", "token": "$id9", "description": "Structured numeric token", "default_value": "94-221-88"},
+            {"title": "support@ezymailer.com", "token": "$email", "description": "Email address sample", "default_value": "support@ezymailer.com"},
+            {"title": "https://ezymailer.app", "token": "$url", "description": "Website URL sample", "default_value": "https://ezymailer.app"},
+            {"title": "Alice Johnson", "token": "$name", "description": "Full name sample", "default_value": "Alice Johnson"},
+            {"title": "Seattle", "token": "$city", "description": "City sample", "default_value": "Seattle"},
+            {"title": "hello-world", "token": "$slug", "description": "Slug sample", "default_value": "hello-world"},
+        ]
 
     def _configure_segmented_button(self, button: QPushButton, checked: bool = False) -> None:
         button.setCheckable(True)
@@ -3407,6 +4275,404 @@ class DashboardPage(QWidget):
         row_layout.addWidget(copy_button)
         return row
 
+    def _tag_sample_values(self) -> dict[str, str]:
+        values = dict(self.state.tag_samples or {})
+        for definition in self._tag_definitions:
+            token = definition["token"]
+            if token not in values:
+                values[token] = definition["default_value"]
+        return values
+
+    def _generate_random_tag_value(self, token: str, default_value: str) -> str:
+        token = token.strip()
+        if token.startswith("$random"):
+            length_text = token.removeprefix("$random")
+            try:
+                length = max(3, min(24, int(length_text)))
+            except Exception:
+                length = 8
+            alphabet = string.ascii_uppercase + string.digits
+            return "".join(secrets.choice(alphabet) for _ in range(length))
+        if token.startswith("$word"):
+            length_text = token.removeprefix("$word")
+            try:
+                length = max(3, min(16, int(length_text)))
+            except Exception:
+                length = 5
+            alphabet = string.ascii_uppercase
+            return "".join(secrets.choice(alphabet) for _ in range(length))
+        if token.startswith("$num"):
+            length_text = token.removeprefix("$num")
+            try:
+                length = max(2, min(12, int(length_text)))
+            except Exception:
+                length = 4
+            return "".join(secrets.choice(string.digits) for _ in range(length))
+        if token.startswith("$mix"):
+            length_text = token.removeprefix("$mix")
+            try:
+                length = max(2, min(16, int(length_text)))
+            except Exception:
+                length = 6
+            alphabet = string.ascii_uppercase + string.digits
+            return "".join(secrets.choice(alphabet) for _ in range(length))
+        if token.startswith("$day"):
+            return "".join(secrets.choice(string.digits) for _ in range(4))
+        if token.startswith("$ym"):
+            today = QDateTime.currentDateTime().date()
+            return f"{today.year()}{today.month():02d}"
+        if token.startswith("$id"):
+            return f"{''.join(secrets.choice(string.digits) for _ in range(2))}-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(2))}"
+        if token == "$phone":
+            return f"1-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(4))}"
+        if token == "$email":
+            return f"support{secrets.randbelow(9000) + 1000}@ezymailer.com"
+        if token == "$url":
+            return f"https://ezymailer-{secrets.randbelow(9000) + 1000}.app"
+        if token == "$name":
+            first_names = ["Alice", "Maya", "Jordan", "Sam", "Taylor", "Riley"]
+            last_names = ["Johnson", "Patel", "Smith", "Brown", "Lee", "Walker"]
+            return f"{secrets.choice(first_names)} {secrets.choice(last_names)}"
+        if token == "$city":
+            cities = ["Seattle", "Austin", "Denver", "Miami", "Chennai", "Berlin"]
+            return secrets.choice(cities)
+        if token == "$slug":
+            words = ["hello", "launch", "email", "campaign", "update", "ready"]
+            return f"{secrets.choice(words)}-{secrets.choice(words)}"
+        return default_value
+
+    def _current_tag_state(self) -> dict[str, object]:
+        samples = self._tag_sample_values()
+        return {
+            "custom1": self.custom1_input.text().strip(),
+            "custom2": self.custom2_input.text().strip(),
+            "samples": samples,
+        }
+
+    def _apply_tag_state(self, payload: dict[str, object]) -> None:
+        custom1 = str(payload.get("custom1") or "")
+        custom2 = str(payload.get("custom2") or "")
+        samples_raw = payload.get("samples") or {}
+        samples: dict[str, str] = {}
+        if isinstance(samples_raw, dict):
+            for key, value in samples_raw.items():
+                key_text = str(key).strip()
+                value_text = str(value).strip()
+                if key_text:
+                    samples[key_text] = value_text
+        self.custom1_input.blockSignals(True)
+        self.custom2_input.blockSignals(True)
+        try:
+            self.custom1_input.setText(custom1)
+            self.custom2_input.setText(custom2)
+        finally:
+            self.custom1_input.blockSignals(False)
+            self.custom2_input.blockSignals(False)
+        self.state.custom_tag_1 = custom1
+        self.state.custom_tag_2 = custom2
+        merged_samples = self._tag_sample_values()
+        merged_samples.update(samples)
+        self.state.tag_samples = merged_samples
+        for token, label in self._tag_value_labels.items():
+            label.setText(merged_samples.get(token, label.text()))
+
+    def _schedule_tags_save(self) -> None:
+        if self._workspace_loading:
+            return
+        self._tags_save_timer.start()
+
+    def _persist_tags_state(self) -> None:
+        if self._workspace_loading:
+            return
+        try:
+            payload = self._current_tag_state()
+            _upsert_tag_state(payload)
+            self.state.custom_tag_1 = str(payload.get("custom1") or "")
+            self.state.custom_tag_2 = str(payload.get("custom2") or "")
+            self.state.tag_samples = dict(payload.get("samples") or {})
+            if self.state.logged_in and self.state.auth_token:
+                try:
+                    api_save_tags(self.state.auth_token, payload)
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._log_action(f"Failed to save tags: {exc}")
+
+    def _load_tags_state(self) -> None:
+        payload: dict[str, object] = {}
+        if self.state.logged_in and self.state.auth_token:
+            try:
+                api_payload = api_get_tags(self.state.auth_token)
+                if isinstance(api_payload, dict):
+                    remote = api_payload.get("tag_state")
+                    if isinstance(remote, dict):
+                        payload = remote
+            except Exception:
+                payload = {}
+        if not payload:
+            payload = _load_tag_state()
+        if not payload:
+            payload = self._current_tag_state()
+        self._apply_tag_state(payload)
+
+    def _regenerate_tags(self) -> None:
+        payload = self._current_tag_state()
+        samples = {}
+        for definition in self._tag_definitions:
+            token = definition["token"]
+            default_value = definition["default_value"]
+            samples[token] = self._generate_random_tag_value(token, default_value)
+        payload["samples"] = samples
+        self._apply_tag_state(payload)
+        self._persist_tags_state()
+        self._log_action("Regenerated tag values")
+        self.notify("Tags regenerated")
+
+    def _reset_tags_to_default(self) -> None:
+        payload = {
+            "custom1": "",
+            "custom2": "",
+            "samples": {definition["token"]: definition["default_value"] for definition in self._tag_definitions},
+        }
+        self._apply_tag_state(payload)
+        self._persist_tags_state()
+        self._log_action("Reset tags to default")
+        self.notify("Tags reset to default")
+
+    def _recipient_tag_values(self, recipient: str) -> dict[str, str]:
+        recipient = (recipient or "").strip()
+        if not recipient:
+            return {}
+
+        local_part = recipient.split("@", 1)[0].strip()
+        if not local_part:
+            return {
+                "$email": recipient,
+                "$recipient": recipient,
+                "$recipient_email": recipient,
+            }
+
+        parts = [part for part in re.split(r"[._+-]+", local_part) if part]
+        first_name = parts[0].strip().title() if parts else local_part.title()
+        last_name = parts[1].strip().title() if len(parts) > 1 else ""
+        full_name = " ".join(part.strip().title() for part in parts) if parts else local_part.title()
+        return {
+            "$email": recipient,
+            "$recipient": recipient,
+            "$recipient_email": recipient,
+            "$recipient_local_part": local_part,
+            "$username": local_part,
+            "$first_name": first_name,
+            "$last_name": last_name,
+            "$full_name": full_name,
+        }
+
+    def _customer_variable_values(self, recipient: str) -> dict[str, str]:
+        recipient = (recipient or "").strip().lower()
+        if not recipient:
+            return {}
+
+        payload: dict[str, object] = {}
+        if self.state.logged_in and self.state.auth_token:
+            try:
+                api_payload = api_get_customer_variables(self.state.auth_token, recipient)
+                if isinstance(api_payload, dict):
+                    items = api_payload.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("email") or "").strip().lower() != recipient:
+                                continue
+                            variables = item.get("variables")
+                            if isinstance(variables, dict):
+                                payload.update(variables)
+                                break
+                    else:
+                        variables = api_payload.get("variables")
+                        if isinstance(variables, dict):
+                            payload.update(variables)
+            except Exception:
+                pass
+
+        if not payload:
+            payload.update(_load_customer_variables(recipient))
+
+        normalized: dict[str, str] = {}
+        for key, value in payload.items():
+            key_text = str(key).strip()
+            value_text = str(value).strip()
+            if not key_text or not value_text:
+                continue
+            normalized[key_text] = value_text
+            normalized[key_text.lower()] = value_text
+            if not key_text.startswith("$"):
+                normalized[f"${key_text}"] = value_text
+        return normalized
+
+    def _apply_tags_to_text(self, text: str, recipient: str = "") -> str:
+        result = text or ""
+        replacements = {
+            "$custom1": self.custom1_input.text().strip(),
+            "$custom2": self.custom2_input.text().strip(),
+        }
+        replacements.update(self._tag_sample_values())
+        replacements.update(self._recipient_tag_values(recipient))
+        replacements.update(self._customer_variable_values(recipient))
+
+        brace_lookup = {
+            key.lstrip("$").lower(): value
+            for key, value in replacements.items()
+            if value and key
+        }
+
+        def _replace_brace(match: re.Match[str]) -> str:
+            token = match.group(1).strip().lower()
+            return brace_lookup.get(token, match.group(0))
+
+        result = re.sub(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}", _replace_brace, result)
+
+        for token, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            if token.startswith("$") and value:
+                result = result.replace(token, value)
+        return result
+
+    def _customer_variable_records(self) -> dict[str, dict[str, str]]:
+        records: dict[str, dict[str, str]] = {}
+        if self.state.logged_in and self.state.auth_token:
+            try:
+                api_payload = api_get_customer_variables(self.state.auth_token)
+                if isinstance(api_payload, dict):
+                    items = api_payload.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            email = str(item.get("email") or "").strip().lower()
+                            variables = item.get("variables")
+                            if not email or not isinstance(variables, dict):
+                                continue
+                            merged = records.setdefault(email, {})
+                            for key, value in variables.items():
+                                key_text = str(key).strip()
+                                value_text = str(value).strip()
+                                if key_text and value_text:
+                                    merged[key_text] = value_text
+            except Exception:
+                pass
+
+        if records:
+            return records
+
+        return {
+            email: {str(key): str(value) for key, value in variables.items() if str(key).strip() and str(value).strip()}
+            for email, variables in _load_all_customer_variables().items()
+        }
+
+    def _refresh_customer_variables_table(self) -> None:
+        if not hasattr(self, "customer_variables_table"):
+            return
+        records = self._customer_variable_records()
+        rows: list[tuple[str, str, str]] = []
+        for email in sorted(records.keys()):
+            variables = records[email]
+            for key in sorted(variables.keys()):
+                rows.append((email, key, variables[key]))
+
+        self.customer_variables_table.blockSignals(True)
+        try:
+            self.customer_variables_table.setRowCount(0)
+            for row_index, (email, key, value) in enumerate(rows):
+                self.customer_variables_table.insertRow(row_index)
+                for col, text in enumerate((email, key, value)):
+                    item = QTableWidgetItem(text)
+                    item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.customer_variables_table.setItem(row_index, col, item)
+        finally:
+            self.customer_variables_table.blockSignals(False)
+        if self.customer_variables_table.rowCount() > 0:
+            self.customer_variables_table.selectRow(0)
+            self._populate_customer_variable_form_from_selection()
+        else:
+            self._clear_customer_variable_form()
+
+    def _populate_customer_variable_form_from_selection(self) -> None:
+        row = self.customer_variables_table.currentRow() if hasattr(self, "customer_variables_table") else -1
+        if row < 0:
+            return
+        email_item = self.customer_variables_table.item(row, 0)
+        key_item = self.customer_variables_table.item(row, 1)
+        value_item = self.customer_variables_table.item(row, 2)
+        if email_item is None or key_item is None or value_item is None:
+            return
+        self.customer_email_input.setText(email_item.text().strip())
+        self.customer_variable_key_input.setText(key_item.text().strip())
+        self.customer_variable_value_input.setText(value_item.text().strip())
+
+    def _clear_customer_variable_form(self) -> None:
+        self.customer_email_input.clear()
+        self.customer_variable_key_input.clear()
+        self.customer_variable_value_input.clear()
+        if hasattr(self, "customer_variables_table"):
+            self.customer_variables_table.clearSelection()
+
+    def _persist_customer_variable_record(self) -> None:
+        email = self.customer_email_input.text().strip().lower()
+        key = self.customer_variable_key_input.text().strip()
+        value = self.customer_variable_value_input.text().strip()
+        if not email or not key or not value:
+            self.notify("Enter email, variable name, and value")
+            return
+
+        current = self._customer_variable_records().get(email, {})
+        current[key] = value
+        _upsert_customer_variables(email, current)
+        if self.state.logged_in and self.state.auth_token:
+            try:
+                api_save_customer_variables(self.state.auth_token, email, current)
+            except Exception:
+                pass
+        self._refresh_customer_variables_table()
+        self._log_action(f"Saved customer variable {key} for {email}")
+        self.notify("Customer variable saved")
+
+    def _delete_selected_customer_variable_record(self) -> None:
+        row = self.customer_variables_table.currentRow()
+        if row < 0:
+            self.notify("Select a customer variable first")
+            return
+        email_item = self.customer_variables_table.item(row, 0)
+        key_item = self.customer_variables_table.item(row, 1)
+        if email_item is None or key_item is None:
+            return
+        email = email_item.text().strip().lower()
+        key = key_item.text().strip()
+        records = self._customer_variable_records()
+        current = records.get(email, {})
+        if key in current:
+            current.pop(key, None)
+        if current:
+            _upsert_customer_variables(email, current)
+            if self.state.logged_in and self.state.auth_token:
+                try:
+                    api_save_customer_variables(self.state.auth_token, email, current)
+                except Exception:
+                    pass
+        else:
+            _delete_customer_variables(email)
+            if self.state.logged_in and self.state.auth_token:
+                try:
+                    api_delete_customer_variables(self.state.auth_token, email)
+                except Exception:
+                    pass
+        self._refresh_customer_variables_table()
+        self._clear_customer_variable_form()
+        self._log_action(f"Deleted customer variable {key} for {email}")
+        self.notify("Customer variable deleted")
+
+    def _load_customer_variables_state(self) -> None:
+        self._refresh_customer_variables_table()
+
     def _open_output_options_dialog(self, preview: bool = False) -> None:
         dialog = OutputOptionsDialog(self.window(), scale=self._scale)
         if dialog.exec() == QDialog.Accepted:
@@ -3419,10 +4685,18 @@ class DashboardPage(QWidget):
                 self.notify("Export options confirmed")
 
     def _choose_attachment_file_format(self) -> None:
-        dialog = FileFormatDialog(self.window(), scale=self._scale, selected_format=getattr(self, "attach_format_value", "PDF document") or "PDF document")
+        dialog = FileFormatDialog(
+            self.window(),
+            scale=self._scale,
+            selected_format=getattr(self, "attach_format_value", "PDF document") or "PDF document",
+            file_name_mode=getattr(self, "attach_file_name_mode", "auto"),
+            file_name_value=getattr(self, "attach_file_name_value", ""),
+        )
         if dialog.exec() == QDialog.Accepted:
-            selected = dialog.selected_format()
+            selected = self._normalize_attachment_format_value(dialog.selected_format())
             self.attach_format_value = selected
+            self.attach_file_name_mode = "custom" if dialog.uses_custom_file_name() else "auto"
+            self.attach_file_name_value = dialog.custom_name_input.text().strip() if dialog.uses_custom_file_name() and dialog.custom_name_input is not None else ""
             self.attach_format_label.setText(self._attachment_format_summary(selected))
             self._log_action(f"Selected attachment format: {selected}")
             self.notify(f"Format set to {selected}")
@@ -3455,6 +4729,50 @@ class DashboardPage(QWidget):
         short_parts = [summary_map.get(part, part) for part in parts]
         return ", ".join(short_parts)
 
+    def _normalize_attachment_format_value(self, selected: str) -> str:
+        selected = (selected or "").strip()
+        if not selected or selected == "Random format":
+            return "PDF document"
+        parts = [part.strip() for part in selected.split(",") if part.strip()]
+        if not parts:
+            return "PDF document"
+        return parts[0]
+
+    def _attachment_format_extension(self, format_value: str) -> str:
+        format_value = self._normalize_attachment_format_value(format_value)
+        mapping = {
+            "PDF document": ".pdf",
+            "Excel spreadsheet (XLSX)": ".xlsx",
+            "Excel template (XLTX)": ".xltx",
+            "PowerPoint presentation (PPTX)": ".pptx",
+            "PowerPoint slideshow (PPSX)": ".ppsx",
+            "Word document (DOCX)": ".docx",
+        }
+        return mapping.get(format_value, ".out")
+
+    def _attachment_default_name_base(self, recipient: str, subject: str) -> str:
+        bits = [subject.strip() or "attachment"]
+        recipient_name = recipient.split("@", 1)[0].strip() if recipient else ""
+        if recipient_name:
+            bits.append(recipient_name)
+        bits.append(time.strftime("%Y%m%d-%H%M%S"))
+        return self._sanitize_filename("-".join(bits)) or "attachment"
+
+    def _attachment_output_name_base(
+        self,
+        recipient: str,
+        subject: str,
+        format_value: str,
+        file_name_mode: str = "auto",
+        file_name_value: str = "",
+    ) -> str:
+        default_base = self._attachment_default_name_base(recipient, subject)
+        if str(file_name_mode or "").strip().lower() == "custom":
+            custom = self._sanitize_filename(self._apply_tags_to_text(file_name_value or "", recipient))
+            if custom:
+                return custom
+        return default_base
+
     def _wrap_text_as_html(self, text: str, subject: str = "") -> str:
         safe_subject = html.escape(subject.strip())
         safe_text = html.escape(text).replace("\n", "<br>")
@@ -3481,17 +4799,17 @@ class DashboardPage(QWidget):
             self._floating_windows.remove(dialog)
 
     def _preview_subject_body(self) -> None:
-        subject = self.subject_input.text().strip() or "Subject Preview"
+        subject = self._apply_tags_to_text(self.subject_input.text().strip()) or "Subject Preview"
         current_body = self._current_body_widget()
         if current_body is not None:
             body_payload = current_body.payload()
             if body_payload["mode"] == "HTML Message":
-                html_content = body_payload["html_text"].strip()
+                html_content = self._apply_tags_to_text(body_payload["html_text"].strip())
                 source = "Previewing the HTML message content."
                 if not html_content:
                     html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML content available.</body></html>"
             else:
-                body_text = body_payload["plain_text"].strip()
+                body_text = self._apply_tags_to_text(body_payload["plain_text"].strip())
                 source = "Previewing the plain-text message as HTML."
                 if not body_text:
                     body_text = "No message body available."
@@ -3512,7 +4830,7 @@ class DashboardPage(QWidget):
             self.notify("Switch to HTML body first")
             return
 
-        html_content = widget.html_editor.toPlainText().strip()
+        html_content = self._apply_tags_to_text(widget.html_editor.toPlainText().strip())
         if not html_content:
             self.notify("Add HTML content first")
             return
@@ -3529,9 +4847,9 @@ class DashboardPage(QWidget):
         current_widget = self._current_attachment_widget()
         html_content = ""
         if current_widget is not None:
-            html_content = current_widget.html_editor.toPlainText().strip()
+            html_content = self._apply_tags_to_text(current_widget.html_editor.toPlainText().strip())
         elif hasattr(self, "html_editor") and isinstance(self.html_editor, QTextEdit):
-            html_content = self.html_editor.toPlainText().strip()
+            html_content = self._apply_tags_to_text(self.html_editor.toPlainText().strip())
         if not html_content:
             html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML template available.</body></html>"
         dialog = self._build_preview_dialog(
@@ -3545,7 +4863,7 @@ class DashboardPage(QWidget):
         self._log_action(f"Opened {title.lower()}")
         self.notify("HTML preview opened")
 
-    def _tag_card(self, title: str, token: str, description: str) -> QWidget:
+    def _tag_card(self, title: str, token: str, description: str, value: str) -> QWidget:
         card = QFrame()
         card.setObjectName("panelCard")
         layout = QVBoxLayout(card)
@@ -3563,7 +4881,7 @@ class DashboardPage(QWidget):
         layout.addLayout(header)
 
         row = QHBoxLayout()
-        token_value = QLabel(token)
+        token_value = QLabel(value or token)
         token_value.setObjectName("sectionSubtitle")
         remove_button = QPushButton("X")
         remove_button.setObjectName("dangerButton")
@@ -3586,17 +4904,15 @@ class DashboardPage(QWidget):
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
+        self._tag_value_labels[token] = token_value
+
         return card
 
     def _set_browser_mode(self, mode: str) -> None:
         self.state.browser_mode = mode
         self.incognito_button.setChecked(mode == "Incognito")
         self.normal_button.setChecked(mode == "Normal")
-        if self.state.username:
-            try:
-                upsert_setting(self.state.username, "browser_mode", mode)
-            except Exception:
-                pass
+        self._persist_browser_state()
         self._log_action(f"Browser mode set to {mode}")
         self.notify(f"Browser mode changed to {mode}")
 
@@ -3621,13 +4937,39 @@ class DashboardPage(QWidget):
         self.state.launch_preset = preset or ""
         label = preset if preset else "None"
         self.launch_preset_label.setText(label)
-        if self.state.username:
-            try:
-                upsert_setting(self.state.username, "launch_preset", self.state.launch_preset)
-            except Exception:
-                pass
+        self._persist_browser_state()
         self._log_action(f"Launch preset set to {label}")
         self.notify(f"Launch preset updated: {label}")
+
+    def _current_browser_state_payload(self) -> dict[str, object]:
+        return {
+            "browser_mode": self.state.browser_mode,
+            "launch_preset": self.state.launch_preset,
+            "window_count": int(self.state.window_count),
+        }
+
+    def _apply_browser_state_payload(self, payload: dict[str, object]) -> None:
+        browser_mode = str(payload.get("browser_mode") or "Incognito")
+        launch_preset = str(payload.get("launch_preset") or "Default")
+        try:
+            window_count = max(1, int(payload.get("window_count") or 1))
+        except Exception:
+            window_count = 1
+
+        self.state.browser_mode = browser_mode if browser_mode in {"Incognito", "Normal"} else "Incognito"
+        self.state.launch_preset = launch_preset
+        self.state.window_count = window_count
+
+    def _load_browser_state(self) -> None:
+        payload = _load_ui_state(LOCAL_BROWSER_STATE_KEY)
+        if not isinstance(payload, dict):
+            payload = {}
+        self._apply_browser_state_payload(payload)
+
+    def _persist_browser_state(self) -> None:
+        if self._workspace_loading:
+            return
+        _upsert_ui_state(LOCAL_BROWSER_STATE_KEY, self._current_browser_state_payload())
 
     def _window_count_changed(self, value: int) -> None:
         self.state.window_count = max(1, value)
@@ -3670,6 +5012,11 @@ class DashboardPage(QWidget):
         self._seed_browser_profile_dir(profile_dir)
         return profile_dir
 
+    def _reserve_debug_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
     def _seed_browser_profile_dir(self, profile_dir: Path) -> None:
         """Pre-populate a fresh Chrome profile to suppress first-run prompts."""
         try:
@@ -3711,6 +5058,7 @@ class DashboardPage(QWidget):
         session_id = f"chrome-{QDateTime.currentMSecsSinceEpoch()}-{index}"
         title = f"Chrome Window {index}"
         profile_dir = self._create_browser_profile_dir(index)
+        debug_port = self._reserve_debug_port()
         args = [str(binary), "--new-window", f"--user-data-dir={profile_dir}"]
         # Suppress Chrome's first-run welcome dialog and default-browser prompt.
         args.extend(
@@ -3719,6 +5067,8 @@ class DashboardPage(QWidget):
                 "--no-default-browser-check",
                 "--disable-default-apps",
                 "--disable-features=ChromeWhatsNewUI",
+                f"--remote-debugging-port={debug_port}",
+                "--remote-allow-origins=*",
             ]
         )
         if incognito:
@@ -3726,7 +5076,7 @@ class DashboardPage(QWidget):
         x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
-        args.append("about:blank")
+        args.append("https://www.google.com/")
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -3740,6 +5090,7 @@ class DashboardPage(QWidget):
             process=process,
             status="Running",
             profile_dir=profile_dir,
+            debug_port=debug_port,
         )
 
     def _sync_browser_session_states(self) -> None:
@@ -3758,24 +5109,23 @@ class DashboardPage(QWidget):
             self._sync_session_state_from_handles()
             self._refresh_sessions()
             for session in removed_sessions:
-                if self.state.username:
-                    try:
-                        record_browser_session(
-                            self.state.username,
-                            session.session_id,
-                            session.title,
-                            "Google Chrome",
-                            self.state.browser_mode,
-                            "Closed",
-                            None,
-                            self.state.launch_preset or "Default",
-                            {
-                                "browser_mode": self.state.browser_mode,
-                                "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                            },
-                        )
-                    except Exception:
-                        pass
+                try:
+                    _upsert_local_browser_session(
+                        self.state.username,
+                        session.session_id,
+                        session.title,
+                        "Google Chrome",
+                        self.state.browser_mode,
+                        "Closed",
+                        None,
+                        self.state.launch_preset or "Default",
+                        {
+                            "browser_mode": self.state.browser_mode,
+                            "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                        },
+                    )
+                except Exception:
+                    pass
                 self._cleanup_browser_profile_dir(session.profile_dir)
                 self._log_action(f"Browser window closed: {session.title}")
         else:
@@ -3803,24 +5153,23 @@ class DashboardPage(QWidget):
                         process.kill()
                     except Exception:
                         pass
-            if self.state.username:
-                try:
-                    record_browser_session(
-                        self.state.username,
-                        session.session_id,
-                        session.title,
-                        "Google Chrome",
-                        session.mode,
-                        "Closed",
-                        None,
-                        self.state.launch_preset or "Default",
-                        {
-                            "browser_mode": self.state.browser_mode,
-                            "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                        },
-                    )
-                except Exception:
-                    pass
+            try:
+                _upsert_local_browser_session(
+                    self.state.username,
+                    session.session_id,
+                    session.title,
+                    "Google Chrome",
+                    session.mode,
+                    "Closed",
+                    None,
+                    self.state.launch_preset or "Default",
+                    {
+                        "browser_mode": self.state.browser_mode,
+                        "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                    },
+                )
+            except Exception:
+                pass
             self._cleanup_browser_profile_dir(session.profile_dir)
             if log_reason:
                 self._log_action(f"{log_reason}: {session.title}")
@@ -3858,25 +5207,24 @@ class DashboardPage(QWidget):
         self._sync_session_state_from_handles()
         self._refresh_sessions()
         self._browser_watch_timer.start()
-        if self.state.username:
-            for session in self._browser_sessions:
-                try:
-                    record_browser_session(
-                        self.state.username,
-                        session.session_id,
-                        session.title,
-                        "Google Chrome",
-                        session.mode,
-                        session.status,
-                        session.process.pid if session.process is not None else None,
-                        self.state.launch_preset or "Default",
-                        {
-                            "browser_mode": self.state.browser_mode,
-                            "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                        },
-                    )
-                except Exception:
-                    pass
+        for session in self._browser_sessions:
+            try:
+                _upsert_local_browser_session(
+                    self.state.username,
+                    session.session_id,
+                    session.title,
+                    "Google Chrome",
+                    session.mode,
+                    session.status,
+                    session.process.pid if session.process is not None else None,
+                    self.state.launch_preset or "Default",
+                    {
+                        "browser_mode": self.state.browser_mode,
+                        "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                    },
+                )
+            except Exception:
+                pass
         self._log_action("Paused active browser sessions")
         self.notify("Sessions paused")
 
@@ -3900,6 +5248,7 @@ class DashboardPage(QWidget):
         self.ai_provider_combo.setCurrentText("ChatGPT")
         self.ai_provider_combo.blockSignals(False)
         self.ai_api_key_input.clear()
+        self._persist_browser_state()
         self._refresh_controls()
         self._log_action("Reset workspace to defaults")
         self.notify("Workspace reset to defaults")
@@ -3921,30 +5270,520 @@ class DashboardPage(QWidget):
         self._browser_sessions = [item for item in self._browser_sessions if item.session_id != session_id]
         self._sync_session_state_from_handles()
         self._refresh_sessions()
-        if self.state.username:
-            try:
-                record_browser_session(
-                    self.state.username,
-                    session.session_id,
-                    session.title,
-                    "Google Chrome",
-                    session.mode,
-                    "Closed",
-                    None,
-                    self.state.launch_preset or "Default",
-                    {
-                        "browser_mode": self.state.browser_mode,
-                        "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                    },
-                )
-            except Exception:
-                pass
+        try:
+            _upsert_local_browser_session(
+                self.state.username,
+                session.session_id,
+                session.title,
+                "Google Chrome",
+                session.mode,
+                "Closed",
+                None,
+                self.state.launch_preset or "Default",
+                {
+                    "browser_mode": self.state.browser_mode,
+                    "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                },
+            )
+        except Exception:
+            pass
         self._cleanup_browser_profile_dir(session.profile_dir)
         self._log_action(f"Closed browser window {session.title}")
         self.notify(f"Closed {session.title}")
 
     def _start_blast(self) -> None:
-        self._handle_launch()
+        if not self.state.logged_in:
+            self.notify("Sign in first to start a campaign")
+            return
+
+        recipients = self.state.pending_recipients or self._extract_email_candidates(self.pending_emails_editor.toPlainText())
+        subject = self.subject_input.text().strip()
+        current_body = self._current_body_widget()
+        body_text = ""
+        body_html = ""
+        if current_body is not None:
+            payload = current_body.payload()
+            body_text = str(payload.get("plain_text") or "").strip()
+            body_html = str(payload.get("html_text") or "").strip()
+        attachment_widget = self._current_attachment_widget()
+        attachment_html = attachment_widget.html_editor.toPlainText().strip() if attachment_widget is not None else ""
+
+        missing: list[str] = []
+        if not recipients:
+            missing.append("customer emails")
+        if not subject:
+            missing.append("subject")
+        if not (body_text or body_html):
+            missing.append("body content")
+        if not attachment_html:
+            missing.append("attachment content")
+        if missing:
+            joined = ", ".join(missing)
+            self.notify(f"Add {joined} before starting the campaign")
+            self._log_action(f"Campaign blocked: missing {joined}")
+            return
+
+        if not self._browser_sessions:
+            self._log_action("Campaign requested: launching browser windows first")
+            self._pending_campaign_payload = {
+                "recipients": recipients,
+                "subject": subject,
+                "body_text": body_text,
+                "body_html": body_html,
+                "attachment_html": attachment_html,
+                "attachment_format": self.attach_format_value,
+                "attachment_file_name_mode": self.attach_file_name_mode,
+                "attachment_file_name_value": self.attach_file_name_value,
+            }
+            self._handle_launch()
+            return
+
+        self._execute_campaign_send(
+            {
+                "recipients": recipients,
+                "subject": subject,
+                "body_text": body_text,
+                "body_html": body_html,
+                "attachment_html": attachment_html,
+                "attachment_format": self.attach_format_value,
+                "attachment_file_name_mode": self.attach_file_name_mode,
+                "attachment_file_name_value": self.attach_file_name_value,
+            }
+        )
+
+    def _html_to_plain_text(self, value: str) -> str:
+        cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", value or "")
+        cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
+        cleaned = re.sub(r"(?i)</p\s*>", "\n\n", cleaned)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def _campaign_body_text(self, body_text: str, body_html: str) -> str:
+        if body_text.strip():
+            return body_text.strip()
+        if body_html.strip():
+            return self._html_to_plain_text(body_html)
+        return ""
+
+    def _gmail_compose_url(self, recipient: str, subject: str, body_text: str) -> str:
+        return (
+            "https://mail.google.com/mail/?view=cm&fs=1"
+            f"&to={quote_plus(recipient)}"
+            f"&su={quote_plus(subject)}"
+            f"&body={quote_plus(body_text)}"
+        )
+
+    def _browser_cdp_url(self, session: BrowserSessionHandle) -> str:
+        if session.debug_port is None:
+            raise RuntimeError("Browser session does not expose a CDP port.")
+        return f"http://127.0.0.1:{session.debug_port}"
+
+    def _render_html_to_jpg(self, html_content: str, output_path: Path) -> None:
+        html_content = html_content.strip() or "<html><body></body></html>"
+        with sync_playwright() as playwright:
+            binary = self._browser_binary()
+            if binary is None:
+                raise RuntimeError("Google Chrome was not found in /Applications.")
+            browser = playwright.chromium.launch(
+                headless=True,
+                executable_path=str(binary),
+                args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            try:
+                context = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
+                context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet", "xhr", "fetch", "script"}
+                    else route.continue_(),
+                )
+                page = context.new_page()
+                page.set_content(html_content, wait_until="domcontentloaded", timeout=15000)
+                page.emulate_media(media="screen")
+                page.wait_for_timeout(500)
+                width = int(page.evaluate(
+                    """
+                    () => Math.max(
+                        document.body.scrollWidth,
+                        document.documentElement.scrollWidth,
+                        window.innerWidth
+                    )
+                    """
+                ) or 1440)
+                height = int(page.evaluate(
+                    """
+                    () => Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight,
+                        window.innerHeight
+                    )
+                    """
+                ) or 900)
+                width = max(800, min(width + 40, 2400))
+                height = max(600, min(height + 40, 5000))
+                page.set_viewport_size({"width": width, "height": height})
+                page.wait_for_timeout(250)
+                png_path = output_path.with_suffix(".png")
+                page.screenshot(path=str(png_path), full_page=True)
+            finally:
+                browser.close()
+
+        image = Image.open(png_path)
+        try:
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[-1])
+                background.save(output_path, format="JPEG", quality=92, optimize=True)
+            else:
+                image.convert("RGB").save(output_path, format="JPEG", quality=92, optimize=True)
+        finally:
+            image.close()
+            try:
+                png_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return
+
+    def _attachment_image_size(self, jpg_path: Path) -> tuple[int, int]:
+        image = Image.open(jpg_path)
+        try:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Unable to read attachment image size.")
+            return width, height
+        finally:
+            image.close()
+
+    def _attachment_page_dimensions(self, image_width: int, image_height: int) -> tuple[float, float]:
+        if image_width >= image_height:
+            page_width_in = 13.333
+            page_height_in = max(6.0, 13.333 * (float(image_height) / float(image_width)))
+        else:
+            page_height_in = 11.0
+            page_width_in = max(6.0, 11.0 * (float(image_width) / float(image_height)))
+        return page_width_in, page_height_in
+
+    def _export_jpg_to_format(self, jpg_path: Path, format_value: str, output_path: Path) -> Path:
+        format_value = (format_value or "").strip()
+        if format_value == "PDF document":
+            image_width, image_height = self._attachment_image_size(jpg_path)
+            page_width_in, page_height_in = self._attachment_page_dimensions(image_width, image_height)
+            pdf = canvas.Canvas(
+                str(output_path),
+                pagesize=(page_width_in * reportlab_inch, page_height_in * reportlab_inch),
+            )
+            pdf.drawImage(
+                ImageReader(str(jpg_path)),
+                0,
+                0,
+                width=page_width_in * reportlab_inch,
+                height=page_height_in * reportlab_inch,
+            )
+            pdf.showPage()
+            pdf.save()
+            return output_path
+
+        if format_value == "Word document (DOCX)":
+            image_width, image_height = self._attachment_image_size(jpg_path)
+            page_width_in, page_height_in = self._attachment_page_dimensions(image_width, image_height)
+            doc = Document()
+            section = doc.sections[0]
+            section.page_width = Inches(page_width_in)
+            section.page_height = Inches(page_height_in)
+            margin = Inches(0.15)
+            section.top_margin = margin
+            section.bottom_margin = margin
+            section.left_margin = margin
+            section.right_margin = margin
+            available_width = section.page_width - section.left_margin - section.right_margin
+            doc.add_picture(str(jpg_path), width=available_width)
+            doc.save(str(output_path))
+            return output_path
+
+        if format_value == "Excel spreadsheet (XLSX)" or format_value == "Excel template (XLTX)":
+            image_width, image_height = self._attachment_image_size(jpg_path)
+            workbook = Workbook()
+            workbook.template = format_value == "Excel template (XLTX)"
+            sheet = workbook.active
+            sheet.title = "Attachment"
+            sheet.freeze_panes = "A1"
+            sheet.sheet_view.zoomScale = 90
+            sheet.page_setup.orientation = "landscape" if image_width >= image_height else "portrait"
+            sheet.page_setup.fitToWidth = 1
+            sheet.page_setup.fitToHeight = 0
+            sheet.page_margins.left = 0.1
+            sheet.page_margins.right = 0.1
+            sheet.page_margins.top = 0.1
+            sheet.page_margins.bottom = 0.1
+            sheet.column_dimensions["A"].width = max(12, min(60, image_width / 7.0))
+            sheet.row_dimensions[1].height = max(18, min(360, image_height * 0.75))
+            image_copy = OpenPyxlImage(str(jpg_path))
+            max_width = 1100
+            max_height = 1600
+            scale = min(1.0, float(max_width) / float(image_width), float(max_height) / float(image_height))
+            image_copy.width = max(1, int(image_width * scale))
+            image_copy.height = max(1, int(image_height * scale))
+            sheet.add_image(image_copy, "A1")
+            workbook.save(str(output_path))
+            return output_path
+
+        if format_value in {"PowerPoint presentation (PPTX)", "PowerPoint slideshow (PPSX)"}:
+            presentation = Presentation()
+            image_width, image_height = self._attachment_image_size(jpg_path)
+            slide_width_in, slide_height_in = self._attachment_page_dimensions(image_width, image_height)
+            slide_width = PptxInches(slide_width_in)
+            slide_height = PptxInches(slide_height_in)
+            presentation.slide_width = slide_width
+            presentation.slide_height = slide_height
+            slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+            slide.shapes.add_picture(str(jpg_path), 0, 0, width=slide_width, height=slide_height)
+            presentation.save(str(output_path))
+            return output_path
+
+        if format_value == "Random format":
+            return self._export_jpg_to_format(jpg_path, "PDF document", output_path.with_suffix(".pdf"))
+
+        raise RuntimeError(f"Unsupported attachment format: {format_value or 'unknown'}")
+
+    def _compose_attachment_path(
+        self,
+        recipient: str,
+        subject: str,
+        attachment_html: str,
+        format_value: str,
+        file_name_mode: str,
+        file_name_value: str,
+    ) -> Path:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
+        base_name = self._attachment_output_name_base(recipient, subject, format_value, file_name_mode, file_name_value)
+        jpg_path = temp_dir / f"{base_name}.jpg"
+        resolved_attachment_html = self._apply_tags_to_text(attachment_html, recipient)
+        self._render_html_to_jpg(resolved_attachment_html, jpg_path)
+
+        if not self.attach_convert_checkbox.isChecked():
+            html_path = temp_dir / f"{base_name}.html"
+            html_path.write_text(resolved_attachment_html or "<html><body></body></html>", encoding="utf-8")
+            try:
+                jpg_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return html_path
+
+        extension = self._attachment_format_extension(format_value)
+        final_path = temp_dir / f"{base_name}{extension}"
+        self._export_jpg_to_format(jpg_path, format_value, final_path)
+        return final_path
+
+    def _sanitize_filename(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip("-_.")
+        return cleaned[:48]
+
+    def _gmail_page_from_session(self, page, timeout_ms: int = 30000):
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        if "mail.google.com" not in (page.url or ""):
+            page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=timeout_ms)
+        return page
+
+    def _send_compose_with_playwright(
+        self,
+        session: BrowserSessionHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_html: str,
+        attachment_format: str,
+        file_name_mode: str,
+        file_name_value: str,
+    ) -> None:
+        attachment_path = self._compose_attachment_path(
+            recipient,
+            subject,
+            attachment_html,
+            attachment_format,
+            file_name_mode,
+            file_name_value,
+        )
+        try:
+            self._log_action(f"Preparing attachment file for {recipient}")
+            self._send_compose_with_playwright_attachment(session, recipient, subject, body_text, attachment_path)
+        finally:
+            try:
+                shutil.rmtree(attachment_path.parent, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _send_compose_with_playwright_attachment(
+        self,
+        session: BrowserSessionHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_path: Path,
+    ) -> None:
+        try:
+            with sync_playwright() as playwright:
+                browser = None
+                last_exc: Exception | None = None
+                for _attempt in range(20):
+                    try:
+                        browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session))
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        time.sleep(0.5)
+                if browser is None:
+                    if last_exc is not None:
+                        raise last_exc
+                    raise RuntimeError("Unable to connect to Gmail browser.")
+
+                if not browser.contexts:
+                    raise RuntimeError("No browser context was available for Gmail automation.")
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(10000)
+                page.set_default_navigation_timeout(15000)
+                self._gmail_page_from_session(page)
+                page.bring_to_front()
+                self._log_action("Gmail page ready")
+
+                compose_clicked = False
+                try:
+                    compose_button = page.get_by_role("button", name=re.compile(r"^Compose$", re.IGNORECASE))
+                    compose_button.first.click(timeout=8000)
+                    compose_clicked = True
+                except Exception:
+                    try:
+                        page.goto("https://mail.google.com/mail/u/0/#inbox?compose=new", wait_until="domcontentloaded", timeout=10000)
+                        compose_clicked = True
+                    except Exception:
+                        pass
+                if not compose_clicked:
+                    raise RuntimeError("Unable to open Gmail compose window.")
+                self._log_action("Gmail compose opened")
+
+                recipient_box = page.locator(
+                    'input[aria-label^="To"], input[aria-label*="To recipients"], input[name="to"]'
+                ).first
+                recipient_box.wait_for(state="visible", timeout=10000)
+                recipient_box.fill(recipient)
+                recipient_box.press("Enter")
+                self._log_action("Recipient entered")
+
+                subject_box = page.locator('input[name="subjectbox"], input[placeholder*="Subject"]').first
+                subject_box.wait_for(state="visible", timeout=10000)
+                subject_box.fill(subject)
+                self._log_action("Subject entered")
+
+                body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
+                body_box.wait_for(state="visible", timeout=10000)
+                body_box.click()
+                body_box.fill(body_text)
+                self._log_action("Body entered")
+
+                attach_candidates = page.locator('input[type="file"]')
+                if attach_candidates.count() == 0:
+                    attach_button = page.get_by_role("button", name=re.compile(r"Attach files", re.IGNORECASE))
+                    attach_button.first.click(timeout=8000)
+                    attach_candidates = page.locator('input[type="file"]')
+                self._log_action("Attachment picker ready")
+                attach_candidates.last.set_input_files(str(attachment_path))
+                self._log_action(f"Attachment selected: {attachment_path.name}")
+
+                page.wait_for_timeout(1500)
+                send_button = page.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
+                send_button.first.click(timeout=10000)
+                page.wait_for_timeout(1500)
+                self._log_action(f"Gmail send completed for {recipient}")
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(f"Gmail automation timed out: {exc}") from exc
+
+    def _maybe_send_with_playwright(
+        self,
+        session: BrowserSessionHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_html: str,
+        attachment_format: str,
+        file_name_mode: str,
+        file_name_value: str,
+    ) -> None:
+        self._send_compose_with_playwright(
+            session,
+            recipient,
+            subject,
+            body_text,
+            attachment_html,
+            attachment_format,
+            file_name_mode,
+            file_name_value,
+        )
+
+    def _execute_campaign_send(self, payload: dict[str, object]) -> None:
+        recipients_raw = payload.get("recipients") or []
+        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
+        if not recipients:
+            self.notify("Add customer emails before starting the campaign")
+            self._log_action("Campaign blocked: no recipients available")
+            return
+
+        subject_template = str(payload.get("subject") or "").strip()
+        body_template = self._campaign_body_text(
+            str(payload.get("body_text") or ""),
+            str(payload.get("body_html") or ""),
+        )
+        if not body_template:
+            self.notify("Add body content before starting the campaign")
+            self._log_action("Campaign blocked: no body content available")
+            return
+
+        attachment_html = str(payload.get("attachment_html") or "").strip()
+        attachment_format = self._normalize_attachment_format_value(str(payload.get("attachment_format") or self.attach_format_value or "PDF document"))
+        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
+        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
+
+        if not self._browser_sessions:
+            self.notify("Open browser windows first")
+            self._log_action("Campaign blocked: no browser windows available")
+            return
+
+        self._show_launch_loader("Sending campaign", "Opening Gmail compose and sending messages.")
+        try:
+            total = len(recipients)
+            window_count = len(self._browser_sessions)
+            self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
+            self.notify("Sending campaign")
+            for index, recipient in enumerate(recipients, start=1):
+                window_index = ((index - 1) % window_count) + 1
+                session = self._browser_sessions[window_index - 1]
+                if session.debug_port is None:
+                    raise RuntimeError("Browser session is missing a Playwright connection port.")
+                subject = self._apply_tags_to_text(subject_template, recipient)
+                body_text = self._apply_tags_to_text(body_template, recipient)
+                self._log_action(f"Sending campaign email {index}/{total} to {recipient}")
+                self._send_compose_with_playwright(
+                    session,
+                    recipient,
+                    subject,
+                    body_text,
+                    attachment_html,
+                    attachment_format,
+                    file_name_mode,
+                    file_name_value,
+                )
+                self.progress_bar.setValue(int((index / total) * 100))
+                self._log_action(f"Sent campaign email {index}/{total} to {recipient}")
+
+            self._log_action(f"Campaign send completed: {total} recipient(s)")
+            self.notify(f"Sent {total} email(s)")
+        except Exception as exc:
+            self._log_action(f"Campaign send failed: {exc}")
+            self.notify("Campaign send failed")
+        finally:
+            self._pending_campaign_payload = None
+            self._hide_launch_loader()
 
     def _show_launch_loader(self, title: str, subtitle: str) -> None:
         self.window().show_launch_loader(title, subtitle)
@@ -4398,6 +6237,9 @@ class DashboardPage(QWidget):
         try:
             _delete_attachment_state()
             _delete_local_drafts("attachment")
+            self.attach_format_value = "PDF document"
+            self.attach_file_name_mode = "auto"
+            self.attach_file_name_value = ""
             self.attach_tabs.blockSignals(True)
             try:
                 for index in reversed(range(self.attach_tabs.count())):
@@ -4500,13 +6342,17 @@ class DashboardPage(QWidget):
             else:
                 self.attach_tabs.setCurrentIndex(min(max(selected_index, 0), self.attach_tabs.count() - 1))
             convert_enabled = bool(state_payload.get("convert_enabled", True)) if isinstance(state_payload, dict) else True
-            format_value = str(state_payload.get("format_value") or self.attach_format_value or "PDF document") if isinstance(state_payload, dict) else self.attach_format_value
+            format_value = self._normalize_attachment_format_value(str(state_payload.get("format_value") or self.attach_format_value or "PDF document")) if isinstance(state_payload, dict) else self._normalize_attachment_format_value(self.attach_format_value)
+            file_name_mode = str(state_payload.get("file_name_mode") or self.attach_file_name_mode or "auto") if isinstance(state_payload, dict) else self.attach_file_name_mode
+            file_name_value = str(state_payload.get("file_name_value") or self.attach_file_name_value or "") if isinstance(state_payload, dict) else self.attach_file_name_value
             self.attach_convert_checkbox.blockSignals(True)
             try:
                 self.attach_convert_checkbox.setChecked(convert_enabled)
             finally:
                 self.attach_convert_checkbox.blockSignals(False)
             self.attach_format_value = format_value or "PDF document"
+            self.attach_file_name_mode = file_name_mode if file_name_mode in {"auto", "custom"} else "auto"
+            self.attach_file_name_value = file_name_value
             self.attach_format_label.setText(self._attachment_format_summary(self.attach_format_value))
         finally:
             self.attach_tabs.blockSignals(False)
@@ -4552,6 +6398,8 @@ class DashboardPage(QWidget):
                     "selected_index": self.attach_tabs.currentIndex(),
                     "convert_enabled": self.attach_convert_checkbox.isChecked(),
                     "format_value": self.attach_format_value,
+                    "file_name_mode": self.attach_file_name_mode,
+                    "file_name_value": self.attach_file_name_value,
                 }
             )
         except Exception as exc:
@@ -4591,27 +6439,29 @@ class DashboardPage(QWidget):
         self._sync_session_state_from_handles()
         self._refresh_sessions()
         self._browser_watch_timer.start()
-        if self.state.username:
-            for session in self._browser_sessions:
-                try:
-                    record_browser_session(
-                        self.state.username,
-                        session.session_id,
-                        session.title,
-                        "Google Chrome",
-                        session.mode,
-                        session.status,
-                        session.process.pid if session.process is not None else None,
-                        self.state.launch_preset or "Default",
-                        {
-                            "browser_mode": self.state.browser_mode,
-                            "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                        },
-                    )
-                except Exception:
-                    pass
+        for session in self._browser_sessions:
+            try:
+                _upsert_local_browser_session(
+                    self.state.username,
+                    session.session_id,
+                    session.title,
+                    "Google Chrome",
+                    session.mode,
+                    session.status,
+                    session.process.pid if session.process is not None else None,
+                    self.state.launch_preset or "Default",
+                    {
+                        "browser_mode": self.state.browser_mode,
+                        "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                    },
+                )
+            except Exception:
+                pass
         self._log_action(f"Started {len(launched)} browser window(s)")
         self.notify(f"Launch started for {len(launched)} browser window(s)")
+        if self._pending_campaign_payload:
+            payload = self._pending_campaign_payload
+            QTimer.singleShot(2500, lambda p=payload: self._execute_campaign_send(p))
 
     def _clear_subject_body(self) -> None:
         self._subject_body_save_timer.stop()
@@ -5035,6 +6885,58 @@ class DashboardPage(QWidget):
         finally:
             self._workspace_loading = False
 
+    def _schedule_pending_emails_save(self) -> None:
+        if self._workspace_loading:
+            return
+        self._pending_emails_save_timer.start()
+
+    def _persist_pending_emails_state(self) -> None:
+        if self._workspace_loading:
+            return
+        try:
+            source_text = self.pending_emails_editor.toPlainText()
+            emails = self._extract_email_candidates(source_text)
+            gmail_only = self.standard_email_radio.isChecked()
+            if source_text.strip() or emails:
+                _upsert_ui_state(
+                    LOCAL_PENDING_EMAILS_STATE_KEY,
+                    {
+                        "raw_text": source_text,
+                        "emails": emails,
+                        "gmail_only": gmail_only,
+                    },
+                )
+            else:
+                _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
+        except Exception as exc:
+            self._log_action(f"Failed to save pending emails: {exc}")
+
+    def _load_pending_emails_from_local(self) -> None:
+        payload = _load_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
+        raw_text = str(payload.get("raw_text") or "")
+        emails_value = payload.get("emails") or []
+        emails: list[str] = []
+        if isinstance(emails_value, list):
+            for value in emails_value:
+                email = str(value).strip().lower()
+                if email:
+                    emails.append(email)
+        if not raw_text and emails:
+            raw_text = "\n".join(emails)
+
+        self.pending_emails_editor.blockSignals(True)
+        try:
+            self.pending_emails_editor.setPlainText(raw_text)
+        finally:
+            self.pending_emails_editor.blockSignals(False)
+
+        self.state.pending_recipients = emails[:]
+        if emails:
+            self.data_summary_labels["total"].setText(str(len(emails)))
+            self.data_summary_labels["valid"].setText(str(len(emails)))
+            self.data_summary_labels["invalid"].setText("0")
+            self.data_summary_labels["duplicates"].setText("0")
+
     def _sync_subject_body_widgets(self) -> None:
         self._workspace_loading = True
         try:
@@ -5089,8 +6991,7 @@ class DashboardPage(QWidget):
         try:
             settings_payload = api_get_settings(self.state.auth_token)
         except Exception:
-            self._workspace_loading = False
-            return
+            settings_payload = {}
 
         try:
             settings_rows = settings_payload.get("settings") or []
@@ -5107,9 +7008,12 @@ class DashboardPage(QWidget):
             self.state.html_message_text = str(settings_map.get("html_message_text") or self.state.html_message_text or "")
             self.state.html_template_text = str(settings_map.get("html_template_text") or self.state.html_template_text or "")
             self._load_sending_settings_state(settings_map)
+            self._load_browser_state()
             self._load_subjects()
             self._load_body_tabs_from_state()
             self._load_attachment_tabs_from_local()
+            self._load_pending_emails_from_local()
+            self._load_tags_state()
         finally:
             self._workspace_loading = False
             self._sync_subject_body_widgets()
@@ -5117,6 +7021,7 @@ class DashboardPage(QWidget):
     def _clear_pending_emails(self) -> None:
         self.pending_emails_editor.clear()
         self.state.pending_recipients = []
+        _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
         self.data_summary_labels["total"].setText("0")
         self.data_summary_labels["valid"].setText("0")
         self.data_summary_labels["invalid"].setText("0")
@@ -5166,6 +7071,7 @@ class DashboardPage(QWidget):
         finally:
             self.pending_emails_editor.blockSignals(False)
         self.state.pending_recipients = emails[:]
+        self._persist_pending_emails_state()
         self._log_action(f"Loaded pending emails from {path.name}")
         self.notify(f"Loaded {len(emails)} email(s)")
         self._prompt_validate_pending_emails()
@@ -5258,6 +7164,7 @@ class DashboardPage(QWidget):
             self.data_summary_labels["valid"].setText(str(len(accepted)))
             self.data_summary_labels["invalid"].setText(str(len(rejected)))
             self.data_summary_labels["duplicates"].setText(str(duplicates))
+            self._persist_pending_emails_state()
 
             mode_label = "gmail.com only" if gmail_only else "mixed domains"
             self._log_action(
@@ -6040,8 +7947,9 @@ class MainWindow(QMainWindow):
         self.dashboard_page.refresh()
         self.stack.setCurrentWidget(self.dashboard_page)
 
-    def handle_login(self, username: str, auth_token: str = "") -> None:
+    def handle_login(self, username: str, auth_token: str = "", role: str = "") -> None:
         self.state.username = username
+        self.state.role = role
         self.state.logged_in = True
         self.state.auth_token = auth_token
         self.title_bar.set_state(self.state.username, self.state.logged_in)

@@ -43,7 +43,16 @@ pip install -r "$ROOT_DIR/requirements.txt"
 pip install pyinstaller
 
 cleanup_paths
-pyinstaller --noconfirm --clean --windowed --name "$APP_NAME" "$ROOT_DIR/main.py"
+pyinstaller \
+  --noconfirm \
+  --clean \
+  --windowed \
+  --name "$APP_NAME" \
+  --hidden-import docx \
+  --hidden-import pptx \
+  --collect-submodules openpyxl \
+  --collect-submodules reportlab \
+  "$ROOT_DIR/main.py"
 
 mkdir -p "$STAGING_DIR"
 cp -R "$APP_BUNDLE" "$STAGING_DIR/"
