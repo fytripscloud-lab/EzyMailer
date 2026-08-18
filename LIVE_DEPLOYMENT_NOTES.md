@@ -5,6 +5,8 @@ These notes describe the live production setup and how the repository should be 
 ## Live Hosting Target
 
 - Host OS: Ubuntu
+- Live host private IP: `172.26.1.104`
+- Live host public IP: `15.206.161.73`
 - Services to host on the live machine:
   - Backend API
   - Admin frontend
@@ -51,3 +53,20 @@ These notes describe the live production setup and how the repository should be 
 - Systemd service templates:
   - [`deployment/ubuntu/systemd/ezymailer-backend.service`](/Users/koushikmondal/ezymailer/deployment/ubuntu/systemd/ezymailer-backend.service)
   - [`deployment/ubuntu/systemd/ezymailer-admin.service`](/Users/koushikmondal/ezymailer/deployment/ubuntu/systemd/ezymailer-admin.service)
+
+## Verified Live State
+
+- Backend API service is running on `0.0.0.0:8765`
+- Admin frontend service is running on `0.0.0.0:8780`
+- Local health checks on the Ubuntu host are responding:
+  - `http://127.0.0.1:8765/api/health`
+  - `http://127.0.0.1:8780/health`
+- The remaining blocker for browser access is AWS network exposure, not the app process itself.
+- The instance must allow inbound traffic to the live ports from the internet or from the intended proxy / load balancer.
+
+## Required AWS Inbound Access
+
+- Open the following ports in the AWS security group or load balancer rule set for the live instance:
+  - `8765` for the backend API
+  - `8780` for the admin frontend
+- If using a public web entrypoint, place Nginx or a load balancer in front and map standard HTTP/HTTPS traffic to the internal app ports.
