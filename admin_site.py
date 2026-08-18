@@ -78,7 +78,13 @@ def _html() -> str:
       DialogTitle, DialogContent, DialogActions
     } = MaterialUI;
 
-    const API_BASE = "__API_BASE__";
+    const CONFIGURED_API_BASE = "__API_BASE__";
+    const API_BASE = (() => {
+      if (CONFIGURED_API_BASE && !CONFIGURED_API_BASE.includes("127.0.0.1") && !CONFIGURED_API_BASE.includes("localhost") && !CONFIGURED_API_BASE.includes("0.0.0.0")) {
+        return CONFIGURED_API_BASE;
+      }
+      return `${window.location.protocol}//${window.location.hostname}:8765`;
+    })();
     const STORAGE_KEY = "ezymailer_admin_auth";
     const FP_KEY = "ezymailer_admin_device_fp";
     const THEME_KEY = "ezymailer_admin_theme";
