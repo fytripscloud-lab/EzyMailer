@@ -24,6 +24,7 @@ Use the template in `env.example` as the base and fill in the live values from `
 
 - Apply `database/migrations/2026-08-18_live_schema_updates.sql` to the dedicated live database when new schema fields are added.
 - Keep the migration additive. Do not drop live columns or tables unless a backward-compatible plan exists.
+- The hosted API and hosted admin frontend must always point to the dedicated live database, never the local development database.
 
 ## Suggested deployment flow
 

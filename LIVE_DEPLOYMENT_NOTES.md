@@ -70,3 +70,10 @@ These notes describe the live production setup and how the repository should be 
   - `8765` for the backend API
   - `8780` for the admin frontend
 - If using a public web entrypoint, place Nginx or a load balancer in front and map standard HTTP/HTTPS traffic to the internal app ports.
+
+## Hosted Database Rule
+
+- The hosted backend and hosted admin frontend must always use the dedicated live database.
+- The hosted admin frontend talks only to the backend API.
+- The hosted backend must not point to the local development database when deployed on Ubuntu.
+- Use the live database credentials from `server_credentials/` only for the hosted environment.
