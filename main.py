@@ -50,6 +50,7 @@ from PySide6.QtCore import (
     QObject,
     Property,
     QPropertyAnimation,
+    QThread,
     QTimer,
     Qt,
     QEvent,
@@ -163,6 +164,54 @@ def _find_executable(root: Path, names: list[str]) -> Path | None:
         if matches:
             return matches[0]
     return None
+
+
+def _browser_cache_dir() -> Path:
+    override = os.getenv("EZYM_MAILER_BROWSER_CACHE_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return LOCAL_CACHE_DIR / BUILTIN_BROWSER_DIR_NAME
+
+
+class BrowserBootstrapWorker(QObject):
+    progress = Signal(str, str)
+    finished = Signal(bool, str)
+
+    def __init__(self, browser_cache_dir: Path, parent=None):
+        super().__init__(parent)
+        self._browser_cache_dir = browser_cache_dir
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Auto-configuring additional files",
+                "Checking the local browser cache.",
+            )
+            self._browser_cache_dir.mkdir(parents=True, exist_ok=True)
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+            driver_executable, driver_cli = compute_driver_executable()
+            self.progress.emit(
+                "Auto-configuring additional files",
+                "Downloading browser runtime from the CDN.",
+            )
+            env = os.environ.copy()
+            env.update(get_driver_env())
+            env["PLAYWRIGHT_BROWSERS_PATH"] = str(self._browser_cache_dir)
+            completed = subprocess.run(
+                [driver_executable, driver_cli, "install", "chromium"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                error_message = (completed.stderr or completed.stdout or "Playwright install failed.").strip()
+                raise RuntimeError(error_message)
+            self.finished.emit(True, "Browser runtime configured.")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
 
 
 def _scaled_int(value: float, scale: float, minimum: int = 1) -> int:
@@ -1341,6 +1390,7 @@ class LaunchLoaderDialog(QDialog):
     def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
         self._scale = scale
+        self._status_prefix = "Preparing"
         self.setModal(False)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1387,14 +1437,21 @@ class LaunchLoaderDialog(QDialog):
         root.addWidget(card, alignment=Qt.AlignCenter)
         root.addStretch()
 
-    def set_message(self, title: str, subtitle: str | None = None) -> None:
+    def set_message(self, title: str, subtitle: str | None = None, status_prefix: str | None = None) -> None:
         self.loader_title.setText(title)
         if subtitle:
             self.loader_subtitle.setText(subtitle)
+        if status_prefix:
+            self._status_prefix = status_prefix
+            self.loader_status.setText(status_prefix)
+
+    def set_status_prefix(self, prefix: str) -> None:
+        self._status_prefix = prefix
+        self.loader_status.setText(prefix)
 
     def _animate_dots(self) -> None:
         self._dots = (self._dots + 1) % 4
-        self.loader_status.setText("Preparing" + ("." * self._dots))
+        self.loader_status.setText(self._status_prefix + ("." * self._dots))
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -5038,6 +5095,7 @@ class DashboardPage(QWidget):
                 return candidate
 
         bundle_roots = [
+            _browser_cache_dir(),
             _runtime_root() / BUILTIN_BROWSER_DIR_NAME,
             Path.cwd() / BUILTIN_BROWSER_DIR_NAME,
             Path.home() / BUILTIN_BROWSER_DIR_NAME,
@@ -7555,6 +7613,9 @@ class MainWindow(QMainWindow):
         self._toasts = []
         self._pending_launch_target = 0
         self._last_login_username = ""
+        self._browser_bootstrap_thread: QThread | None = None
+        self._browser_bootstrap_worker: BrowserBootstrapWorker | None = None
+        self._browser_bootstrap_running = False
         self._scale = _compute_layout_scale(QApplication.primaryScreen())
         self._text_scale = _compute_text_scale(QApplication.primaryScreen())
         self._centered_once = False
@@ -7602,7 +7663,13 @@ class MainWindow(QMainWindow):
             self._toasts.remove(toast)
 
     def show_launch_loader(self, title: str, subtitle: str) -> None:
-        self.launch_loader.set_message(title, subtitle)
+        self.launch_loader.set_message(title, subtitle, status_prefix="Preparing")
+        self.launch_loader.show()
+        self.launch_loader.raise_()
+        self.launch_loader.activateWindow()
+
+    def show_bootstrap_loader(self, title: str, subtitle: str) -> None:
+        self.launch_loader.set_message(title, subtitle, status_prefix="Configuring")
         self.launch_loader.show()
         self.launch_loader.raise_()
         self.launch_loader.activateWindow()
@@ -7610,6 +7677,57 @@ class MainWindow(QMainWindow):
     def hide_launch_loader(self) -> None:
         if self.launch_loader.isVisible():
             self.launch_loader.close()
+
+    def _start_windows_browser_bootstrap(self) -> None:
+        if self._browser_bootstrap_running or not IS_WINDOWS:
+            return
+        if self._browser_binary() is not None:
+            return
+
+        browser_cache_dir = _browser_cache_dir()
+        self._browser_bootstrap_running = True
+        self.show_bootstrap_loader(
+            "Auto-configuring additional files",
+            "Downloading browser runtime from the CDN for first launch.",
+        )
+
+        thread = QThread(self)
+        worker = BrowserBootstrapWorker(browser_cache_dir)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_browser_bootstrap_message)
+        worker.finished.connect(self._finish_windows_browser_bootstrap)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self._browser_bootstrap_thread = thread
+        self._browser_bootstrap_worker = worker
+        thread.start()
+
+    def _update_browser_bootstrap_message(self, title: str, subtitle: str) -> None:
+        if self.launch_loader.isVisible():
+            self.launch_loader.set_message(title, subtitle, status_prefix="Configuring")
+
+    def _finish_windows_browser_bootstrap(self, success: bool, message: str) -> None:
+        self._browser_bootstrap_running = False
+        self._browser_bootstrap_worker = None
+        self._browser_bootstrap_thread = None
+        self.hide_launch_loader()
+
+        browser_binary = self._browser_binary()
+        if success and browser_binary is not None:
+            self.show_toast("Browser runtime ready", "success")
+            return
+
+        warning_message = message or "Unable to auto-configure the browser runtime."
+        print(f"Windows browser bootstrap failed: {warning_message}")
+        self.show_toast("Browser runtime setup needs attention", "warning")
+        QMessageBox.warning(
+            self,
+            "Browser runtime setup",
+            "The app could not auto-configure the browser runtime on this device.\n\n"
+            "The login screen is still available, but campaign browser automation may require a local Chrome/Chromium installation.",
+        )
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -8227,6 +8345,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, window._start_windows_browser_bootstrap)
     return app.exec()
 
 

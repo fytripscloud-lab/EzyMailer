@@ -14,7 +14,7 @@ Build the desktop app into platform-specific packages using PyInstaller.
 1. Open a terminal in the project root.
 2. Run `build.bat`.
 3. Wait for `dist\EzyMailer.exe` to be created.
-4. Keep the generated `dist\playwright-browsers` folder beside the EXE so the bundled browser runtime is available at launch.
+4. On first launch, the app downloads the browser runtime into the user cache if it is not already available.
 
 ## macOS build steps
 
@@ -25,7 +25,6 @@ Build the desktop app into platform-specific packages using PyInstaller.
 ## Output
 
 - One-file executable: `dist\EzyMailer.exe`
-- Playwright browser runtime folder: `dist\playwright-browsers`
 - Disk image: `dist/EzyMailer-macOS.dmg`
 
 ## Notes
