@@ -106,6 +106,7 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=255)
     device_fingerprint: str | None = Field(default=None, max_length=255)
     device_name: str | None = Field(default=None, max_length=255)
+    force_logout_other_device: bool = False
 
 
 class CreateUserRequest(BaseModel):
@@ -661,6 +662,7 @@ def _authenticate(
     device_fingerprint: str | None = None,
     device_name: str | None = None,
     bypass_device_restriction: bool = False,
+    force_logout_other_device: bool = False,
 ) -> dict[str, str] | None:
     connection = _connect(DB_NAME)
     try:
@@ -681,6 +683,18 @@ def _authenticate(
             if not _verify_password(password, row.get("password_hash"), row.get("password_salt"), row.get("password")):
                 return None
             _assert_user_login_allowed(row, request, device_fingerprint, bypass_device_restriction=bypass_device_restriction)
+            stored_fingerprint = str(row.get("device_fingerprint") or "").strip()
+            incoming_fingerprint = str(device_fingerprint or "").strip()
+            if (
+                stored_fingerprint
+                and incoming_fingerprint
+                and stored_fingerprint != incoming_fingerprint
+                and not force_logout_other_device
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=_login_conflict_payload(row, request, device_fingerprint, device_name),
+                )
             if not row.get("password_hash") or not row.get("password_salt") or row.get("password"):
                 salt, digest = _hash_password(password)
                 cursor.execute(
@@ -968,6 +982,39 @@ def _assert_user_login_allowed(
 
     # Latest successful login always becomes the active session.
     # Device history is tracked for audit and display, but it does not block login.
+
+
+def _login_conflict_payload(
+    row: dict[str, Any],
+    request: Request | None,
+    device_fingerprint: str | None,
+    device_name: str | None,
+) -> dict[str, object]:
+    current_ip = _client_ip(request) or ""
+    current_fingerprint = (device_fingerprint or "").strip()
+    current_name = (device_name or "").strip()
+    registered_fingerprint = str(row.get("device_fingerprint") or "").strip()
+    registered_name = str(row.get("device_name") or "").strip()
+    registered_ip = str(row.get("device_ip") or "").strip()
+    return {
+        "error": "You are already logged in on another device.",
+        "message": "You are already logged in on another device. Do you want to log out from the other device and continue?",
+        "action_required": "confirm_logout_other_device",
+        "current_device": {
+            "device_fingerprint": current_fingerprint,
+            "mac_id": current_fingerprint,
+            "device_name": current_name,
+            "device_ip": current_ip,
+        },
+        "registered_device": {
+            "device_fingerprint": registered_fingerprint,
+            "mac_id": registered_fingerprint,
+            "device_name": registered_name,
+            "device_ip": registered_ip,
+            "last_login_device": str(row.get("last_login_device") or ""),
+            "device_bound_at": row.get("device_bound_at"),
+        },
+    }
 
 
 def _bind_or_refresh_device(
@@ -1399,13 +1446,25 @@ def health() -> dict[str, object]:
 
 @app.post("/api/login")
 def login(payload: LoginRequest, request: Request) -> dict[str, object]:
-    user = _authenticate(
-        payload.username.strip(),
-        payload.password,
-        request=request,
-        device_fingerprint=payload.device_fingerprint,
-        device_name=payload.device_name,
-    )
+    try:
+        user = _authenticate(
+            payload.username.strip(),
+            payload.password,
+            request=request,
+            device_fingerprint=payload.device_fingerprint,
+            device_name=payload.device_name,
+            force_logout_other_device=payload.force_logout_other_device,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {status.HTTP_409_CONFLICT, status.HTTP_403_FORBIDDEN}:
+            _persist_login_history(
+                payload.username.strip(),
+                False,
+                request=request,
+                device_fingerprint=payload.device_fingerprint,
+                device_name=payload.device_name,
+            )
+        raise
     if user is None:
         _persist_login_history(
             payload.username.strip(),
@@ -1435,14 +1494,26 @@ def login(payload: LoginRequest, request: Request) -> dict[str, object]:
 
 @app.post("/api/admin/login")
 def admin_login(payload: LoginRequest, request: Request) -> dict[str, object]:
-    user = _authenticate(
-        payload.username.strip(),
-        payload.password,
-        request=request,
-        device_fingerprint=payload.device_fingerprint,
-        device_name=payload.device_name,
-        bypass_device_restriction=True,
-    )
+    try:
+        user = _authenticate(
+            payload.username.strip(),
+            payload.password,
+            request=request,
+            device_fingerprint=payload.device_fingerprint,
+            device_name=payload.device_name,
+            bypass_device_restriction=True,
+            force_logout_other_device=payload.force_logout_other_device,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {status.HTTP_409_CONFLICT, status.HTTP_403_FORBIDDEN}:
+            _persist_login_history(
+                payload.username.strip(),
+                False,
+                request=request,
+                device_fingerprint=payload.device_fingerprint,
+                device_name=payload.device_name,
+            )
+        raise
     if user is None:
         _persist_login_history(
             payload.username.strip(),
@@ -2136,6 +2207,7 @@ def login(
     timeout: float = 5.0,
     device_fingerprint: str | None = None,
     device_name: str | None = None,
+    force_logout_other_device: bool = False,
 ) -> dict:
     payload = {
         "username": username,
@@ -2145,8 +2217,38 @@ def login(
         payload["device_fingerprint"] = device_fingerprint
     if device_name:
         payload["device_name"] = device_name
+    if force_logout_other_device:
+        payload["force_logout_other_device"] = True
     request = urllib.request.Request(
         f"{API_BASE_URL}/api/login",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def admin_login_request(
+    username: str,
+    password: str,
+    timeout: float = 5.0,
+    device_fingerprint: str | None = None,
+    device_name: str | None = None,
+    force_logout_other_device: bool = False,
+) -> dict:
+    payload = {
+        "username": username,
+        "password": password,
+    }
+    if device_fingerprint:
+        payload["device_fingerprint"] = device_fingerprint
+    if device_name:
+        payload["device_name"] = device_name
+    if force_logout_other_device:
+        payload["force_logout_other_device"] = True
+    request = urllib.request.Request(
+        f"{API_BASE_URL}/api/admin/login",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",

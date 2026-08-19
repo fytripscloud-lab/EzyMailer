@@ -8,3 +8,4 @@ venv/
 .DS_Store
 packaging/.DS_Store
 packaging/macos-dmg/
+server_credentials/

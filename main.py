@@ -33,7 +33,7 @@ from backend.local_api import (
     get_customer_variables as api_get_customer_variables,
     get_settings as api_get_settings,
     get_tags as api_get_tags,
-    login as api_login,
+    admin_login_request as api_admin_login,
     record_activity,
     delete_content as api_delete_content,
     delete_customer_variables as api_delete_customer_variables,
@@ -832,6 +832,7 @@ class AppState:
     active_sessions: list[str] = field(default_factory=list)
     activity_log: list[str] = field(default_factory=list)
     pending_recipients: list[str] = field(default_factory=list)
+    pending_emails_validated: bool = False
     custom_tag_1: str = ""
     custom_tag_2: str = ""
     tag_samples: dict[str, str] = field(default_factory=dict)
@@ -2530,7 +2531,7 @@ class LoginPage(QWidget):
         intro.setObjectName("loginTitle")
         intro.setAlignment(Qt.AlignCenter)
 
-        subtitle = QLabel("Local access for this build only.")
+        subtitle = QLabel("Admin access only.")
         subtitle.setObjectName("loginSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
@@ -2542,11 +2543,11 @@ class LoginPage(QWidget):
         form.setVerticalSpacing(12)
 
         self.username_input.setPlaceholderText("Username")
-        self.username_input.setText(DEFAULT_USERNAME)
+        self.username_input.setText("")
         self.username_input.setToolTip("Enter the local login username")
         self.password_input.setPlaceholderText("Password")
         self.password_input.setEchoMode(QLineEdit.Password)
-        self.password_input.setText(DEFAULT_PASSWORD)
+        self.password_input.setText("")
         self.password_input.setToolTip("Enter the local login password")
 
         form.addRow("Username", self.username_input)
@@ -2561,18 +2562,12 @@ class LoginPage(QWidget):
         self.login_button.clicked.connect(lambda: self._attempt_login())
         self.login_button.setToolTip("Authenticate and open the workspace")
 
-        footer = QLabel("Local login: admin / admin")
-        footer.setObjectName("loginHint")
-        footer.setAlignment(Qt.AlignCenter)
-        footer.setWordWrap(True)
-
         shell_layout.addLayout(header)
         shell_layout.addWidget(intro)
         shell_layout.addWidget(subtitle)
         shell_layout.addLayout(form)
         shell_layout.addWidget(self.error_label)
         shell_layout.addWidget(self.login_button)
-        shell_layout.addWidget(footer)
 
         root.addWidget(shell, alignment=Qt.AlignHCenter)
         root.addStretch()
@@ -2591,49 +2586,111 @@ class LoginPage(QWidget):
             QApplication.restoreOverrideCursor()
 
     def _attempt_login(self) -> None:
-        username = self.username_input.text().strip()
+        username = self.username_input.text()
         password = self.password_input.text()
 
-        if not username or not password:
+        if not username.strip() or not password.strip():
             self.error_label.setText("Please enter both a username and password.")
+            return
+        if re.search(r"\s", username) or re.search(r"\s", password):
+            self.error_label.setText("Username and password cannot contain whitespace.")
             return
 
         self.error_label.setText("")
         self._set_busy(True)
         QApplication.processEvents()
         try:
-            payload = api_login(
-                username,
-                password,
+            payload = api_admin_login(
+                username.strip(),
+                password.strip(),
                 timeout=5.0,
                 device_fingerprint=_device_fingerprint(),
                 device_name=_device_name(),
             )
         except urllib.error.HTTPError as exc:
             message = "The username or password is incorrect."
+            retry_with_force = False
             try:
                 error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", message))
+                if exc.code == 409:
+                    message = str(
+                        error_payload.get("detail", {}).get("message")
+                        if isinstance(error_payload.get("detail"), dict)
+                        else error_payload.get("detail", message)
+                    )
+                    retry_with_force = True
+                else:
+                    detail = error_payload.get("detail")
+                    if isinstance(detail, dict):
+                        message = str(detail.get("error") or detail.get("message") or message)
+                    else:
+                        message = str(detail or message)
             except Exception:
                 pass
-            self.error_label.setText(message)
+            if retry_with_force:
+                reply = QMessageBox.question(
+                    self,
+                    "Logged in on another device",
+                    (
+                        f"{message}\n\n"
+                        "If you continue, the other device will be logged out, "
+                        "and this device will reload the campaign workspace from the dedicated database."
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    self.error_label.setText("Login cancelled.")
+                    return
+                self.error_label.setText("")
+                self._set_busy(True)
+                QApplication.processEvents()
+                try:
+                    payload = api_admin_login(
+                        username.strip(),
+                        password.strip(),
+                        timeout=5.0,
+                        device_fingerprint=_device_fingerprint(),
+                        device_name=_device_name(),
+                        force_logout_other_device=True,
+                    )
+                except urllib.error.HTTPError as retry_exc:
+                    retry_message = "The username or password is incorrect."
+                    try:
+                        retry_payload = json.loads(retry_exc.read().decode("utf-8"))
+                        detail = retry_payload.get("detail")
+                        if isinstance(detail, dict):
+                            retry_message = str(detail.get("error") or detail.get("message") or retry_message)
+                        else:
+                            retry_message = str(detail or retry_message)
+                    except Exception:
+                        pass
+                    self.error_label.setText(retry_message)
+                    return
+                except Exception:
+                    self.error_label.setText("Unable to reach the admin login API.")
+                    return
+                finally:
+                    self._set_busy(False)
+                if not payload.get("ok"):
+                    self.error_label.setText(str(payload.get("error", "Login failed.")))
+                    return
+                user = payload.get("user") or {}
+                self.on_login(
+                    str(user.get("username", username)),
+                    str(payload.get("access_token", "")),
+                    str(user.get("role", "")),
+                    True,
+                )
+                return
+            else:
+                self.error_label.setText(message)
             return
         except Exception:
-            self.error_label.setText("Unable to reach the local login API.")
+            self.error_label.setText("Unable to reach the admin login API.")
             return
         finally:
             self._set_busy(False)
-
-        if not payload.get("ok"):
-            self.error_label.setText(str(payload.get("error", "Login failed.")))
-            return
-
-        user = payload.get("user") or {}
-        self.on_login(
-            str(user.get("username", username)),
-            str(payload.get("access_token", "")),
-            str(user.get("role", "")),
-        )
 
 
 class DashboardPage(QWidget):
@@ -2678,6 +2735,9 @@ class DashboardPage(QWidget):
         self.activity_log_view = QTextEdit()
         self.progress_bar = QProgressBar()
         self.active_windows_value = QLabel("0")
+        self.campaign_progress_text = QLabel("0 / 0 sent")
+        self.start_campaign_button = QPushButton("Start Campaign")
+        self.campaign_reset_all_button = QPushButton("Reset All")
         self.launch_preset_label = QLabel("Default")
         self.custom1_input = QLineEdit()
         self.custom2_input = QLineEdit()
@@ -3661,23 +3721,25 @@ class DashboardPage(QWidget):
         refresh_button.clicked.connect(lambda: self._log_action("Refreshed active Gmail windows"))
         refresh_button.setToolTip("Refresh the active Gmail window count")
         windows_row.addWidget(refresh_button)
+        self.campaign_reset_all_button.setObjectName("secondaryButton")
+        self.campaign_reset_all_button.clicked.connect(self._reset_campaign_form_state)
+        self.campaign_reset_all_button.setToolTip("Clear recipient data, subject/body, and attachment content")
+        windows_row.addWidget(self.campaign_reset_all_button)
         controls_layout.addLayout(windows_row)
 
         controls_layout.addWidget(QLabel("Campaign Progress:"))
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         controls_layout.addWidget(self.progress_bar)
-        progress_text = QLabel("0 / 0 sent")
-        progress_text.setObjectName("sectionHint")
-        controls_layout.addWidget(progress_text)
+        self.campaign_progress_text.setObjectName("sectionHint")
+        controls_layout.addWidget(self.campaign_progress_text)
         layout.addWidget(controls_card)
 
-        start_button = QPushButton("Start Campaign")
-        start_button.setObjectName("blastButton")
-        start_button.setMinimumHeight(_scaled_int(54, self._scale))
-        start_button.clicked.connect(lambda: self._start_blast())
-        start_button.setToolTip("Start the email sending workflow")
-        layout.addWidget(start_button)
+        self.start_campaign_button.setObjectName("blastButton")
+        self.start_campaign_button.setMinimumHeight(_scaled_int(54, self._scale))
+        self.start_campaign_button.clicked.connect(lambda: self._start_blast())
+        self.start_campaign_button.setToolTip("Start the email sending workflow")
+        layout.addWidget(self.start_campaign_button)
 
         log_card, log_layout = self._card("SEND LOG")
         self.send_log_view.setReadOnly(True)
@@ -5253,6 +5315,106 @@ class DashboardPage(QWidget):
         self._log_action("Reset workspace to defaults")
         self.notify("Workspace reset to defaults")
 
+    def _current_campaign_payload(self) -> dict[str, object]:
+        recipients = self.state.pending_recipients if self.state.pending_emails_validated else []
+        subject = self.subject_input.text().strip()
+        current_body = self._current_body_widget()
+        body_text = ""
+        body_html = ""
+        if current_body is not None:
+            payload = current_body.payload()
+            body_text = str(payload.get("plain_text") or "").strip()
+            body_html = str(payload.get("html_text") or "").strip()
+        attachment_widget = self._current_attachment_widget()
+        attachment_html = attachment_widget.html_editor.toPlainText().strip() if attachment_widget is not None else ""
+        return {
+            "recipients": recipients,
+            "subject": subject,
+            "body_text": body_text,
+            "body_html": body_html,
+            "attachment_html": attachment_html,
+            "attachment_format": self.attach_format_value,
+            "attachment_file_name_mode": self.attach_file_name_mode,
+            "attachment_file_name_value": self.attach_file_name_value,
+        }
+
+    def _campaign_missing_fields(self, payload: dict[str, object] | None = None) -> list[str]:
+        payload = payload or self._current_campaign_payload()
+        missing: list[str] = []
+        recipients = payload.get("recipients") or []
+        if not self.state.pending_emails_validated or not isinstance(recipients, list) or not recipients:
+            missing.append("customer emails")
+        if not str(payload.get("subject") or "").strip():
+            missing.append("subject")
+        if not (str(payload.get("body_text") or "").strip() or str(payload.get("body_html") or "").strip()):
+            missing.append("body content")
+        if not str(payload.get("attachment_html") or "").strip():
+            missing.append("attachment content")
+        return missing
+
+    def _refresh_campaign_action_state(self) -> None:
+        can_start = self.state.logged_in and not self._campaign_missing_fields()
+        self.start_campaign_button.setEnabled(can_start)
+        if self._pending_campaign_payload:
+            total = len(self._pending_campaign_payload.get("recipients") or [])
+            sent = 0 if self.progress_bar.value() <= 0 else int(round((self.progress_bar.value() / 100) * total))
+            remaining = max(total - sent, 0)
+            self.campaign_progress_text.setText(f"{sent} / {total} sent • {remaining} remaining")
+        else:
+            self.campaign_progress_text.setText("0 / 0 sent")
+
+    def _reset_campaign_form_state(self, confirm: bool = True) -> None:
+        if confirm:
+            reply = QMessageBox.question(
+                self,
+                "Reset All",
+                "Clear customer emails, subjects + body, and attachment content?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._workspace_loading = True
+        try:
+            self._pending_campaign_payload = None
+            self.progress_bar.setValue(0)
+            self.campaign_progress_text.setText("0 / 0 sent")
+            self._delete_campaign_workspace_state()
+            self._clear_pending_emails()
+            self.subject_drafts_list.blockSignals(True)
+            try:
+                self.subject_drafts_list.clear()
+            finally:
+                self.subject_drafts_list.blockSignals(False)
+            self.subject_input.blockSignals(True)
+            try:
+                self.subject_input.clear()
+            finally:
+                self.subject_input.blockSignals(False)
+            self.state.subject_text = ""
+            self._clear_subject_selection()
+            self._load_body_tabs_from_state()
+            self._clear_subject_body()
+            self._load_attachment_tabs_from_local()
+            self._refresh_sessions()
+            self._refresh_controls()
+        finally:
+            self._workspace_loading = False
+        self._log_action("Reset campaign workspace to defaults")
+        self.notify("Campaign form reset to defaults")
+        self._refresh_campaign_action_state()
+
+    def _delete_campaign_workspace_state(self) -> None:
+        try:
+            _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
+            _delete_ui_state(LOCAL_SUBJECT_STATE_KEY)
+            _delete_ui_state(LOCAL_BODY_STATE_KEY)
+            _delete_attachment_state()
+            _delete_local_drafts("attachment")
+        except Exception as exc:
+            self._log_action(f"Failed to clear campaign workspace state: {exc}")
+
     def _close_session(self, session_id: str) -> None:
         session = next((item for item in self._browser_sessions if item.session_id == session_id), None)
         if session is None:
@@ -5296,60 +5458,39 @@ class DashboardPage(QWidget):
             self.notify("Sign in first to start a campaign")
             return
 
-        recipients = self.state.pending_recipients or self._extract_email_candidates(self.pending_emails_editor.toPlainText())
-        subject = self.subject_input.text().strip()
-        current_body = self._current_body_widget()
-        body_text = ""
-        body_html = ""
-        if current_body is not None:
-            payload = current_body.payload()
-            body_text = str(payload.get("plain_text") or "").strip()
-            body_html = str(payload.get("html_text") or "").strip()
-        attachment_widget = self._current_attachment_widget()
-        attachment_html = attachment_widget.html_editor.toPlainText().strip() if attachment_widget is not None else ""
-
-        missing: list[str] = []
-        if not recipients:
-            missing.append("customer emails")
-        if not subject:
-            missing.append("subject")
-        if not (body_text or body_html):
-            missing.append("body content")
-        if not attachment_html:
-            missing.append("attachment content")
+        payload = self._current_campaign_payload()
+        missing = self._campaign_missing_fields(payload)
         if missing:
             joined = ", ".join(missing)
+            QMessageBox.warning(
+                self,
+                "Missing campaign fields",
+                f"Please complete these fields before starting the campaign:\n\n- " + "\n- ".join(missing),
+            )
             self.notify(f"Add {joined} before starting the campaign")
             self._log_action(f"Campaign blocked: missing {joined}")
+            self._refresh_campaign_action_state()
             return
 
+        reply = QMessageBox.question(
+            self,
+            "Start Campaign",
+            "Start sending the campaign now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log_action("Campaign start cancelled by user")
+            return
+
+        recipients = payload["recipients"]
         if not self._browser_sessions:
             self._log_action("Campaign requested: launching browser windows first")
-            self._pending_campaign_payload = {
-                "recipients": recipients,
-                "subject": subject,
-                "body_text": body_text,
-                "body_html": body_html,
-                "attachment_html": attachment_html,
-                "attachment_format": self.attach_format_value,
-                "attachment_file_name_mode": self.attach_file_name_mode,
-                "attachment_file_name_value": self.attach_file_name_value,
-            }
+            self._pending_campaign_payload = payload
             self._handle_launch()
             return
 
-        self._execute_campaign_send(
-            {
-                "recipients": recipients,
-                "subject": subject,
-                "body_text": body_text,
-                "body_html": body_html,
-                "attachment_html": attachment_html,
-                "attachment_format": self.attach_format_value,
-                "attachment_file_name_mode": self.attach_file_name_mode,
-                "attachment_file_name_value": self.attach_file_name_value,
-            }
-        )
+        self._execute_campaign_send(payload)
 
     def _html_to_plain_text(self, value: str) -> str:
         cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", value or "")
@@ -5755,6 +5896,7 @@ class DashboardPage(QWidget):
             window_count = len(self._browser_sessions)
             self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
             self.notify("Sending campaign")
+            self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
             for index, recipient in enumerate(recipients, start=1):
                 window_index = ((index - 1) % window_count) + 1
                 session = self._browser_sessions[window_index - 1]
@@ -5774,6 +5916,8 @@ class DashboardPage(QWidget):
                     file_name_value,
                 )
                 self.progress_bar.setValue(int((index / total) * 100))
+                remaining = max(total - index, 0)
+                self.campaign_progress_text.setText(f"{index} / {total} sent • {remaining} remaining")
                 self._log_action(f"Sent campaign email {index}/{total} to {recipient}")
 
             self._log_action(f"Campaign send completed: {total} recipient(s)")
@@ -6359,10 +6503,12 @@ class DashboardPage(QWidget):
         self._refresh_attachment_tab_labels()
         self._update_attachment_tab_controls()
         self._sync_active_attachment_widget_refs()
+        self._refresh_campaign_action_state()
 
     def _schedule_attachment_save(self) -> None:
         if self._workspace_loading:
             return
+        self._refresh_campaign_action_state()
         self._attachment_save_timer.start()
 
     def _persist_attachment_state(self) -> None:
@@ -6404,6 +6550,8 @@ class DashboardPage(QWidget):
             )
         except Exception as exc:
             self._log_action(f"Failed to save attachment content: {exc}")
+        finally:
+            self._refresh_campaign_action_state()
 
     def _preview_attachment_editor_html(self, widget: AttachmentDraftEditor | None) -> None:
         if widget is None:
@@ -6504,6 +6652,7 @@ class DashboardPage(QWidget):
     def _schedule_subject_body_save(self) -> None:
         if self._workspace_loading or not self.state.logged_in or not self.state.username:
             return
+        self._refresh_campaign_action_state()
         self._subject_body_save_timer.start()
 
     def _read_text_template_file(self, path: Path) -> str:
@@ -6808,6 +6957,8 @@ class DashboardPage(QWidget):
             self._rename_body_tab(current_body, body_title)
         except Exception as exc:
             self._log_action(f"Failed to save subject/body state: {exc}")
+        finally:
+            self._refresh_campaign_action_state()
 
     def _save_subject_body_draft(self) -> None:
         if not self.state.logged_in or not self.state.username:
@@ -6884,10 +7035,13 @@ class DashboardPage(QWidget):
             self._update_subject_toggle_visibility()
         finally:
             self._workspace_loading = False
+        self._refresh_campaign_action_state()
 
     def _schedule_pending_emails_save(self) -> None:
         if self._workspace_loading:
             return
+        self.state.pending_emails_validated = False
+        self._refresh_campaign_action_state()
         self._pending_emails_save_timer.start()
 
     def _persist_pending_emails_state(self) -> None:
@@ -6904,12 +7058,15 @@ class DashboardPage(QWidget):
                         "raw_text": source_text,
                         "emails": emails,
                         "gmail_only": gmail_only,
+                        "validated": bool(self.state.pending_emails_validated),
                     },
                 )
             else:
                 _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
         except Exception as exc:
             self._log_action(f"Failed to save pending emails: {exc}")
+        finally:
+            self._refresh_campaign_action_state()
 
     def _load_pending_emails_from_local(self) -> None:
         payload = _load_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
@@ -6931,11 +7088,13 @@ class DashboardPage(QWidget):
             self.pending_emails_editor.blockSignals(False)
 
         self.state.pending_recipients = emails[:]
+        self.state.pending_emails_validated = bool(payload.get("validated"))
         if emails:
             self.data_summary_labels["total"].setText(str(len(emails)))
             self.data_summary_labels["valid"].setText(str(len(emails)))
             self.data_summary_labels["invalid"].setText("0")
             self.data_summary_labels["duplicates"].setText("0")
+        self._refresh_campaign_action_state()
 
     def _sync_subject_body_widgets(self) -> None:
         self._workspace_loading = True
@@ -6982,6 +7141,7 @@ class DashboardPage(QWidget):
         self._refresh_body_tab_labels()
         self._update_body_tab_controls()
         self._sync_active_body_widget_refs()
+        self._refresh_campaign_action_state()
 
     def load_user_workspace(self) -> None:
         if not self.state.logged_in or not self.state.auth_token:
@@ -7021,6 +7181,7 @@ class DashboardPage(QWidget):
     def _clear_pending_emails(self) -> None:
         self.pending_emails_editor.clear()
         self.state.pending_recipients = []
+        self.state.pending_emails_validated = False
         _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
         self.data_summary_labels["total"].setText("0")
         self.data_summary_labels["valid"].setText("0")
@@ -7071,6 +7232,7 @@ class DashboardPage(QWidget):
         finally:
             self.pending_emails_editor.blockSignals(False)
         self.state.pending_recipients = emails[:]
+        self.state.pending_emails_validated = False
         self._persist_pending_emails_state()
         self._log_action(f"Loaded pending emails from {path.name}")
         self.notify(f"Loaded {len(emails)} email(s)")
@@ -7155,6 +7317,7 @@ class DashboardPage(QWidget):
                 accepted.append(email)
 
             self.state.pending_recipients = accepted[:]
+            self.state.pending_emails_validated = True
             self.pending_emails_editor.blockSignals(True)
             try:
                 self.pending_emails_editor.setPlainText("\n".join(accepted))
@@ -7330,6 +7493,7 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self._toasts = []
         self._pending_launch_target = 0
+        self._last_login_username = ""
         self._scale = _compute_layout_scale(QApplication.primaryScreen())
         self._text_scale = _compute_text_scale(QApplication.primaryScreen())
         self._centered_once = False
@@ -7947,18 +8111,24 @@ class MainWindow(QMainWindow):
         self.dashboard_page.refresh()
         self.stack.setCurrentWidget(self.dashboard_page)
 
-    def handle_login(self, username: str, auth_token: str = "", role: str = "") -> None:
+    def handle_login(self, username: str, auth_token: str = "", role: str = "", reset_workspace: bool = False) -> None:
+        previous_username = self._last_login_username.strip()
+        should_reset_workspace = bool(reset_workspace or (previous_username and previous_username != username))
         self.state.username = username
         self.state.role = role
         self.state.logged_in = True
         self.state.auth_token = auth_token
+        self._last_login_username = username
         self.title_bar.set_state(self.state.username, self.state.logged_in)
+        if should_reset_workspace:
+            self.dashboard_page._reset_campaign_form_state(confirm=False)
         self.dashboard_page.load_user_workspace()
         self.show_dashboard()
         self.dashboard_page._log_action("User authenticated")
         self.show_toast("Signed in successfully", "success")
 
     def handle_logout(self) -> None:
+        self._last_login_username = self.state.username
         if self.state.logged_in and self.state.username:
             self.dashboard_page._log_action("User signed out")
         self.hide_launch_loader()
@@ -7970,8 +8140,8 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self.dashboard_page.state = self.state
         self.dashboard_page.refresh()
-        self.login_page.username_input.setText(DEFAULT_USERNAME)
-        self.login_page.password_input.setText(DEFAULT_PASSWORD)
+        self.login_page.username_input.clear()
+        self.login_page.password_input.clear()
         self.login_page.error_label.setText("")
         self.show_login()
         self.show_toast("Logged out", "warning")
