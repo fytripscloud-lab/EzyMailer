@@ -40,6 +40,9 @@ def _html() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>EzyMailer CRM Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -180,6 +183,8 @@ def _html() -> str:
       const [selectedUser, setSelectedUser] = React.useState(null);
       const [page, setPage] = React.useState(0);
       const [rowsPerPage, setRowsPerPage] = React.useState(10);
+      const [expiredPage, setExpiredPage] = React.useState(0);
+      const [expiredRowsPerPage, setExpiredRowsPerPage] = React.useState(10);
       const [activityPage, setActivityPage] = React.useState(0);
       const [activityRowsPerPage, setActivityRowsPerPage] = React.useState(10);
       const [historyPage, setHistoryPage] = React.useState(0);
@@ -189,10 +194,14 @@ def _html() -> str:
       const [statRowsPerPage, setStatRowsPerPage] = React.useState(10);
       const [search, setSearch] = React.useState("");
       const [filter, setFilter] = React.useState("all");
+      const [expiredSearch, setExpiredSearch] = React.useState("");
+      const [activitySearch, setActivitySearch] = React.useState("");
+      const [historySearch, setHistorySearch] = React.useState("");
       const [activeSection, setActiveSection] = React.useState("overview");
       const [menuAnchor, setMenuAnchor] = React.useState(null);
       const [menuUser, setMenuUser] = React.useState(null);
       const [editorOpen, setEditorOpen] = React.useState(false);
+      const [createOpen, setCreateOpen] = React.useState(false);
       const [detailOpen, setDetailOpen] = React.useState(false);
       const [detailLoading, setDetailLoading] = React.useState(false);
       const [detailData, setDetailData] = React.useState(null);
@@ -208,6 +217,15 @@ def _html() -> str:
         loginRestriction: "keep",
         password: "",
       });
+      const blankForm = React.useCallback(() => ({
+        id: "",
+        username: "",
+        display_name: "",
+        role: "user",
+        login_valid_until: "",
+        loginRestriction: "keep",
+        password: "",
+      }), []);
 
       React.useEffect(() => {
         localStorage.setItem(THEME_KEY, mode);
@@ -222,6 +240,7 @@ def _html() -> str:
         setDetailData(null);
         setDetailOpen(false);
         setEditorOpen(false);
+        setCreateOpen(false);
         notify(reason, "warning");
       }, []);
 
@@ -309,8 +328,31 @@ def _html() -> str:
       }, [users, search, filter]);
 
       const pagedUsers = React.useMemo(() => filteredUsers.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage), [filteredUsers, page, rowsPerPage]);
-      const pagedActivity = React.useMemo(() => activity.slice(activityPage * activityRowsPerPage, activityPage * activityRowsPerPage + activityRowsPerPage), [activity, activityPage, activityRowsPerPage]);
-      const pagedHistory = React.useMemo(() => history.slice(historyPage * historyRowsPerPage, historyPage * historyRowsPerPage + historyRowsPerPage), [history, historyPage, historyRowsPerPage]);
+      const expiredUsers = React.useMemo(() => users.filter((u) => isExpired(u)), [users]);
+      const filteredExpiredUsers = React.useMemo(() => {
+        const q = expiredSearch.trim().toLowerCase();
+        return expiredUsers.filter((user) => {
+          const haystack = [user.username, user.display_name, user.role, user.device_name, user.device_fingerprint, user.last_login_ip].join(" ").toLowerCase();
+          return !q || haystack.includes(q);
+        });
+      }, [expiredUsers, expiredSearch]);
+      const pagedExpiredUsers = React.useMemo(() => filteredExpiredUsers.slice(expiredPage * expiredRowsPerPage, expiredPage * expiredRowsPerPage + expiredRowsPerPage), [filteredExpiredUsers, expiredPage, expiredRowsPerPage]);
+      const filteredActivity = React.useMemo(() => {
+        const q = activitySearch.trim().toLowerCase();
+        return activity.filter((row) => {
+          const haystack = [row.username, row.category, row.action, row.details_json, row.ip_address, row.location_label].join(" ").toLowerCase();
+          return !q || haystack.includes(q);
+        });
+      }, [activity, activitySearch]);
+      const pagedActivity = React.useMemo(() => filteredActivity.slice(activityPage * activityRowsPerPage, activityPage * activityRowsPerPage + activityRowsPerPage), [filteredActivity, activityPage, activityRowsPerPage]);
+      const filteredHistory = React.useMemo(() => {
+        const q = historySearch.trim().toLowerCase();
+        return history.filter((row) => {
+          const haystack = [row.username, row.ip_address, row.device_name, row.device_fingerprint, row.user_agent, row.success ? "success" : "failed"].join(" ").toLowerCase();
+          return !q || haystack.includes(q);
+        });
+      }, [history, historySearch]);
+      const pagedHistory = React.useMemo(() => filteredHistory.slice(historyPage * historyRowsPerPage, historyPage * historyRowsPerPage + historyRowsPerPage), [filteredHistory, historyPage, historyRowsPerPage]);
       const stats = React.useMemo(() => ({
         total: users.length,
         active: users.filter((u) => !!u.is_active).length,
@@ -336,7 +378,6 @@ def _html() -> str:
         { label: "Expired", value: stats.expired },
         { label: "Admins", value: stats.admins },
       ]), [stats, users]);
-      const expiredUsers = React.useMemo(() => users.filter((u) => isExpired(u)), [users]);
       const statViews = React.useMemo(() => ({
         total: {
           title: "Total Users",
@@ -382,6 +423,13 @@ def _html() -> str:
         return payload;
       };
 
+      const openCreateUser = () => {
+        setSelectedUser(null);
+        setForm(blankForm());
+        setCreateOpen(true);
+        setEditorOpen(true);
+      };
+
       const openEditor = (user) => {
         setSelectedUser(user);
         setForm({
@@ -393,6 +441,7 @@ def _html() -> str:
           loginRestriction: "keep",
           password: "",
         });
+        setCreateOpen(false);
         setEditorOpen(true);
       };
 
@@ -418,11 +467,29 @@ def _html() -> str:
         await openDetails(detailData.user);
       };
 
-      const updateUser = async () => {
-        if (!auth?.access_token || !selectedUser?.id) return notify("Select a user first", "warning");
-        await request(auth, `/api/admin/users/${selectedUser.id}`, { method: "PATCH", body: JSON.stringify(buildUserPayload()) });
-        notify("User updated", "success");
+      const submitUser = async () => {
+        if (!auth?.access_token) return notify("Sign in as admin first", "warning");
+        const payload = buildUserPayload();
+        if (selectedUser?.id) {
+          await request(auth, `/api/admin/users/${selectedUser.id}`, { method: "PATCH", body: JSON.stringify(payload) });
+          notify("User updated", "success");
+        } else {
+          if (!form.password.trim()) return notify("Password is required for new users", "warning");
+          await request(auth, "/api/users", {
+            method: "POST",
+            body: JSON.stringify({
+              username: payload.username,
+              password: form.password.trim(),
+              role: payload.role,
+              display_name: payload.display_name,
+              is_active: payload.is_active !== false,
+              login_valid_until: payload.login_valid_until || null,
+            }),
+          });
+          notify("User created", "success");
+        }
         setEditorOpen(false);
+        setCreateOpen(false);
         await refreshUsers();
       };
 
@@ -596,6 +663,344 @@ def _html() -> str:
         );
       }
 
+      const renderPageHeader = (title, description, actions = []) => (
+        <Stack
+          direction={{ xs: "column", lg: "row" }}
+          justifyContent="space-between"
+          alignItems={{ xs: "stretch", lg: "center" }}
+          spacing={2}
+        >
+          <Box>
+            <Typography variant="h5" fontWeight={900}>{title}</Typography>
+            <Typography color="text.secondary">{description}</Typography>
+          </Box>
+          <Stack direction="row" spacing={1.25} flexWrap="wrap" justifyContent={{ xs: "flex-start", lg: "flex-end" }}>
+            {actions}
+          </Stack>
+        </Stack>
+      );
+
+      const renderOverviewPage = () => (
+        <Stack spacing={2.5}>
+          <Grid container spacing={2}>
+            {[
+              ["Total Users", stats.total, "All users loaded from the admin API."],
+              ["Active Users", stats.active, "Users currently allowed to sign in."],
+              ["Expired Validity", stats.expired, "Users whose login validity expired."],
+              ["Admin Users", stats.admins, "Users with admin permissions."],
+            ].map(([label, value, hint]) => (
+              <Grid item xs={12} sm={6} lg={3} key={label}>
+                <Paper sx={{ p: 2.5, height: "100%", borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
+                  <Typography variant="overline" color="text.secondary" letterSpacing={2}>{label}</Typography>
+                  <Typography variant="h3" fontWeight={900} sx={{ mt: 1 }}>{value}</Typography>
+                  <Typography color="text.secondary" sx={{ mt: 2 }}>{hint}</Typography>
+                </Paper>
+              </Grid>
+            ))}
+          </Grid>
+
+          <Grid container spacing={2}>
+            <Grid item xs={12} lg={8}>
+              <MiniChart
+                title="Login Trend"
+                subtitle="Login activity for the last 7 days, grouped from the login history table."
+                legend={[
+                  chartLegendItem("#42a5f5", "Login attempts"),
+                  chartLegendItem("#22c55e", "Success / failure grouped from history"),
+                ]}
+              >
+                <LineChart values={trendValues} labels={days.map((d) => d.label)} />
+              </MiniChart>
+            </Grid>
+            <Grid item xs={12} lg={4}>
+              <MiniChart
+                title="User Breakdown"
+                subtitle="Current status mix across active, inactive, expired, and admin accounts."
+                legend={breakdown.map((item, index) => chartLegendItem(["#42a5f5", "#22c55e", "#f59e0b", "#a855f7"][index], `${item.label} ${item.value}`))}
+              >
+                <BarChart items={breakdown} />
+              </MiniChart>
+            </Grid>
+          </Grid>
+        </Stack>
+      );
+
+      const renderUsersPage = () => (
+        <Stack spacing={2.5}>
+          {renderPageHeader(
+            "Users",
+            "Search, paginate, and manage permissions, login restrictions, device binding, and validity.",
+            [
+              <Button key="refresh" variant="outlined" onClick={() => refreshUsers(auth)}>Refresh Users</Button>,
+              <Button key="create" variant="contained" onClick={openCreateUser}>Create User</Button>,
+            ],
+          )}
+
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+            <TextField label="Search username, name, role, device..." value={search} onChange={(e) => { setSearch(e.target.value); setPage(0); }} fullWidth />
+            <FormControl sx={{ minWidth: 180 }}>
+              <InputLabel>Filter</InputLabel>
+              <Select label="Filter" value={filter} onChange={(e) => { setFilter(e.target.value); setPage(0); }}>
+                <MenuItem value="all">All users</MenuItem>
+                <MenuItem value="active">Active</MenuItem>
+                <MenuItem value="inactive">Inactive</MenuItem>
+                <MenuItem value="admin">Admins</MenuItem>
+                <MenuItem value="expired">Expired validity</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl sx={{ minWidth: 140 }}>
+              <InputLabel>Rows</InputLabel>
+              <Select label="Rows" value={rowsPerPage} onChange={(e) => { setRowsPerPage(Number(e.target.value)); setPage(0); }}>
+                {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Stack>
+
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, borderColor: "divider", overflowX: "auto" }}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Actions"].map((head) => (
+                    <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                  ))}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pagedUsers.map((user) => (
+                  <TableRow key={user.id} hover selected={selectedUser?.id === user.id}>
+                    <TableCell>{user.id}</TableCell>
+                    <TableCell>{fmt(user.username)}</TableCell>
+                    <TableCell>{fmt(user.display_name)}</TableCell>
+                    <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
+                    <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
+                    <TableCell>{formatDate(user.login_valid_until)}</TableCell>
+                    <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
+                    <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
+                    <TableCell>
+                      <Button size="small" variant="outlined" onClick={(event) => { setMenuAnchor(event.currentTarget); setMenuUser(user); setSelectedUser(user); }}>⋮</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {!pagedUsers.length && (
+                  <TableRow>
+                    <TableCell colSpan={9}>
+                      <Typography color="text.secondary">No users found for the current search and filter.</Typography>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          <TablePagination
+            component="div"
+            count={filteredUsers.length}
+            page={page}
+            onPageChange={(_, nextPage) => setPage(nextPage)}
+            rowsPerPage={rowsPerPage}
+            onRowsPerPageChange={(e) => { setRowsPerPage(Number(e.target.value)); setPage(0); }}
+            rowsPerPageOptions={[5, 10, 20, 50]}
+          />
+        </Stack>
+      );
+
+      const renderExpiredPage = () => (
+        <Stack spacing={2.5}>
+          {renderPageHeader(
+            "Validity Expired",
+            "Accounts whose login validity is already expired.",
+            [<Button key="refresh" variant="outlined" onClick={() => refreshUsers(auth)}>Refresh Expired</Button>],
+          )}
+
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+            <TextField label="Search username, name, role, device..." value={expiredSearch} onChange={(e) => { setExpiredSearch(e.target.value); setExpiredPage(0); }} fullWidth />
+            <FormControl sx={{ minWidth: 140 }}>
+              <InputLabel>Rows</InputLabel>
+              <Select label="Rows" value={expiredRowsPerPage} onChange={(e) => { setExpiredRowsPerPage(Number(e.target.value)); setExpiredPage(0); }}>
+                {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Stack>
+
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, borderColor: "divider", overflowX: "auto" }}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Actions"].map((head) => (
+                    <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                  ))}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pagedExpiredUsers.map((user) => (
+                  <TableRow key={user.id} hover selected={selectedUser?.id === user.id}>
+                    <TableCell>{user.id}</TableCell>
+                    <TableCell>{fmt(user.username)}</TableCell>
+                    <TableCell>{fmt(user.display_name)}</TableCell>
+                    <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
+                    <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
+                    <TableCell>{formatDate(user.login_valid_until)}</TableCell>
+                    <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
+                    <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
+                    <TableCell>
+                      <Button size="small" variant="outlined" onClick={(event) => { setMenuAnchor(event.currentTarget); setMenuUser(user); setSelectedUser(user); }}>⋮</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {!pagedExpiredUsers.length && (
+                  <TableRow>
+                    <TableCell colSpan={9}>
+                      <Typography color="text.secondary">No expired users match the search.</Typography>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          <TablePagination
+            component="div"
+            count={filteredExpiredUsers.length}
+            page={expiredPage}
+            onPageChange={(_, nextPage) => setExpiredPage(nextPage)}
+            rowsPerPage={expiredRowsPerPage}
+            onRowsPerPageChange={(e) => { setExpiredRowsPerPage(Number(e.target.value)); setExpiredPage(0); }}
+            rowsPerPageOptions={[5, 10, 20, 50]}
+          />
+        </Stack>
+      );
+
+      const renderActivityPage = () => (
+        <Stack spacing={2.5}>
+          {renderPageHeader(
+            "Activity",
+            "Recent backend activity across all accounts.",
+            [<Button key="refresh" variant="outlined" onClick={() => refreshActivity(auth)}>Refresh Activity</Button>],
+          )}
+
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+            <TextField label="Search username, category, action, IP, or location..." value={activitySearch} onChange={(e) => { setActivitySearch(e.target.value); setActivityPage(0); }} fullWidth />
+            <FormControl sx={{ minWidth: 140 }}>
+              <InputLabel>Rows</InputLabel>
+              <Select label="Rows" value={activityRowsPerPage} onChange={(e) => { setActivityRowsPerPage(Number(e.target.value)); setActivityPage(0); }}>
+                {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Stack>
+
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  {["ID", "Username", "Category", "Action", "Details", "IP", "Location", "Created"].map((head) => <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>)}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pagedActivity.map((row) => (
+                  <TableRow key={row.id} hover>
+                    <TableCell>{row.id}</TableCell>
+                    <TableCell>{fmt(row.username)}</TableCell>
+                    <TableCell>{fmt(row.category)}</TableCell>
+                    <TableCell>{fmt(row.action)}</TableCell>
+                    <TableCell>{fmt(row.details_json)}</TableCell>
+                    <TableCell>{fmt(row.ip_address)}</TableCell>
+                    <TableCell>{fmt(row.location_label)}</TableCell>
+                    <TableCell>{formatDate(row.created_at)}</TableCell>
+                  </TableRow>
+                ))}
+                {!pagedActivity.length && (
+                  <TableRow>
+                    <TableCell colSpan={8}>
+                      <Typography color="text.secondary">No activity rows match the search.</Typography>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          <TablePagination
+            component="div"
+            count={filteredActivity.length}
+            page={activityPage}
+            onPageChange={(_, nextPage) => setActivityPage(nextPage)}
+            rowsPerPage={activityRowsPerPage}
+            onRowsPerPageChange={(e) => { setActivityRowsPerPage(Number(e.target.value)); setActivityPage(0); }}
+            rowsPerPageOptions={[5, 10, 20, 50]}
+          />
+        </Stack>
+      );
+
+      const renderHistoryPage = () => (
+        <Stack spacing={2.5}>
+          {renderPageHeader(
+            "Login History",
+            "Login attempts, device fingerprints, and access decisions.",
+            [<Button key="refresh" variant="outlined" onClick={() => refreshHistory(auth)}>Refresh History</Button>],
+          )}
+
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+            <TextField label="Search username, IP, device, agent, or success..." value={historySearch} onChange={(e) => { setHistorySearch(e.target.value); setHistoryPage(0); }} fullWidth />
+            <FormControl sx={{ minWidth: 140 }}>
+              <InputLabel>Rows</InputLabel>
+              <Select label="Rows" value={historyRowsPerPage} onChange={(e) => { setHistoryRowsPerPage(Number(e.target.value)); setHistoryPage(0); }}>
+                {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Stack>
+
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  {["ID", "User ID", "Username", "Success", "IP", "Device Fingerprint", "Device Name", "Agent", "Created"].map((head) => <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>)}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {pagedHistory.map((row) => (
+                  <TableRow key={row.id} hover>
+                    <TableCell>{row.id}</TableCell>
+                    <TableCell>{row.user_id}</TableCell>
+                    <TableCell>{fmt(row.username)}</TableCell>
+                    <TableCell><Chip size="small" label={row.success ? "Success" : "Failed"} color={row.success ? "success" : "error"} /></TableCell>
+                    <TableCell>{fmt(row.ip_address)}</TableCell>
+                    <TableCell>{fmt(row.device_fingerprint)}</TableCell>
+                    <TableCell>{fmt(row.device_name)}</TableCell>
+                    <TableCell>{fmt(row.user_agent)}</TableCell>
+                    <TableCell>{formatDate(row.created_at)}</TableCell>
+                  </TableRow>
+                ))}
+                {!pagedHistory.length && (
+                  <TableRow>
+                    <TableCell colSpan={9}>
+                      <Typography color="text.secondary">No login history rows match the search.</Typography>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          <TablePagination
+            component="div"
+            count={filteredHistory.length}
+            page={historyPage}
+            onPageChange={(_, nextPage) => setHistoryPage(nextPage)}
+            rowsPerPage={historyRowsPerPage}
+            onRowsPerPageChange={(e) => { setHistoryRowsPerPage(Number(e.target.value)); setHistoryPage(0); }}
+            rowsPerPageOptions={[5, 10, 20, 50]}
+          />
+        </Stack>
+      );
+
+      const renderActiveSection = () => {
+        if (activeSection === "users") return renderUsersPage();
+        if (activeSection === "expired") return renderExpiredPage();
+        if (activeSection === "activity") return renderActivityPage();
+        if (activeSection === "history") return renderHistoryPage();
+        return renderOverviewPage();
+      };
+
       if (!auth?.access_token) {
         return (
           <ThemeProvider theme={theme}>
@@ -645,18 +1050,9 @@ def _html() -> str:
       }
 
       const sidebar = (
-        <Box sx={{ p: 2.25, height: "100%", display: "flex", flexDirection: "column", gap: 2 }}>
-          <Paper sx={{ p: 2.25, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-            <Stack spacing={1}>
-              <Typography variant="h5" fontWeight={900}>EzyMailer CRM</Typography>
-              <Typography variant="body2" color="text.secondary">
-                Separate server-side admin dashboard for users, validity, permissions, login restrictions, and audit trails.
-              </Typography>
-            </Stack>
-          </Paper>
-              <Paper sx={{ p: 2, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-            <Typography variant="overline" letterSpacing={2} fontWeight={800} color="text.secondary">Navigation</Typography>
-            <List dense sx={{ mt: 1 }}>
+        <Box sx={{ p: 2.25, height: "100%", display: "flex", flexDirection: "column" }}>
+          <Paper sx={{ p: 1.5, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
+            <List dense>
               {[
                 ["overview", "Overview"],
                 ["users", "Users"],
@@ -670,7 +1066,6 @@ def _html() -> str:
                   onClick={() => {
                     setActiveSection(key);
                     if (!isDesktop) setMobileOpen(false);
-                    document.getElementById(key)?.scrollIntoView({ behavior: "smooth", block: "start" });
                   }}
                   sx={{ borderRadius: 1.5, mb: 1 }}
                 >
@@ -678,29 +1073,6 @@ def _html() -> str:
                 </ListItemButton>
               ))}
             </List>
-          </Paper>
-          <Paper sx={{ p: 2, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-            <Typography variant="overline" letterSpacing={2} fontWeight={800} color="text.secondary">Quick Stats</Typography>
-            <Stack spacing={1.5} sx={{ mt: 1.5 }}>
-              {[
-                ["Total Users", stats.total],
-                ["Active", stats.active],
-                ["Expired", stats.expired],
-                ["Admins", stats.admins],
-                ["Failures", stats.failures],
-              ].map(([label, value]) => (
-                <Box key={label} sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", py: 1, borderBottom: "1px solid", borderColor: "divider", "&:last-child": { borderBottom: 0 } }}>
-                  <Typography color="text.secondary">{label}</Typography>
-                  <Typography fontWeight={900}>{value}</Typography>
-                </Box>
-              ))}
-            </Stack>
-          </Paper>
-          <Paper sx={{ p: 2, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider", mt: "auto" }}>
-            <Typography variant="overline" letterSpacing={2} fontWeight={800} color="text.secondary">Status</Typography>
-            <Typography sx={{ mt: 1 }} color="text.secondary">
-              {auth?.user ? `Signed in as ${auth.user.username}` : "Sign in as admin to manage access."}
-            </Typography>
           </Paper>
         </Box>
       );
@@ -761,245 +1133,7 @@ def _html() -> str:
             <Box component="main" sx={{ flexGrow: 1, p: { xs: 1.5, sm: 2, md: 3 }, width: { md: `calc(100% - ${drawerWidth}px)` } }}>
               <Toolbar />
               <Stack spacing={2.5}>
-                <Paper id="overview" sx={{ p: { xs: 2, md: 3 }, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Grid container spacing={2}>
-                    {[
-                      ["Total Users", stats.total, "All users loaded from the admin API."],
-                      ["Active Users", stats.active, "Users currently allowed to sign in."],
-                      ["Expired Validity", stats.expired, "Users whose login validity expired."],
-                      ["Admin Users", stats.admins, "Users with admin permissions."],
-                    ].map(([label, value, hint]) => (
-                      <Grid item xs={12} md={6} lg={3} key={label}>
-                        <Paper sx={{ p: 2.5, height: "100%", borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                          <Typography variant="overline" color="text.secondary" letterSpacing={2}>{label}</Typography>
-                          <Typography variant="h3" fontWeight={900} sx={{ mt: 1 }}>{value}</Typography>
-                          <Typography color="text.secondary" sx={{ mt: 2 }}>{hint}</Typography>
-                        </Paper>
-                      </Grid>
-                    ))}
-                  </Grid>
-                </Paper>
-
-                <Grid container spacing={2}>
-                  <Grid item xs={12} lg={8}>
-                    <MiniChart
-                      title="Login Trend"
-                      subtitle="Login activity for the last 7 days, grouped from the login history table."
-                      legend={[
-                        chartLegendItem("#42a5f5", "Login attempts"),
-                        chartLegendItem("#22c55e", "Success / failure grouped from history"),
-                      ]}
-                    >
-                      <LineChart values={trendValues} labels={days.map((d) => d.label)} />
-                    </MiniChart>
-                  </Grid>
-                  <Grid item xs={12} lg={4}>
-                    <MiniChart
-                      title="User Breakdown"
-                      subtitle="Current status mix across active, inactive, expired, and admin accounts."
-                      legend={breakdown.map((item, index) => chartLegendItem(["#42a5f5", "#22c55e", "#f59e0b", "#a855f7"][index], `${item.label} ${item.value}`))}
-                    >
-                      <BarChart items={breakdown} />
-                    </MiniChart>
-                  </Grid>
-                </Grid>
-
-                <Paper id="users" sx={{ p: { xs: 2, md: 3 }, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Stack spacing={2}>
-                    <Stack direction={{ xs: "column", lg: "row" }} justifyContent="space-between" spacing={2} alignItems={{ xs: "stretch", lg: "center" }}>
-                      <Box>
-                        <Typography variant="h5" fontWeight={900}>Users</Typography>
-                        <Typography color="text.secondary">Search, paginate, and manage permissions, login restrictions, device binding, and validity.</Typography>
-                      </Box>
-                      <Button variant="outlined" onClick={() => refreshUsers(auth)}>Refresh Users</Button>
-                    </Stack>
-
-                    <Grid container spacing={2}>
-                      <Grid item xs={12}>
-                        <Stack spacing={2}>
-                          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-                            <TextField label="Search username, name, role, device..." value={search} onChange={(e) => { setSearch(e.target.value); setPage(0); }} fullWidth />
-                            <FormControl sx={{ minWidth: 180 }}>
-                              <InputLabel>Filter</InputLabel>
-                              <Select label="Filter" value={filter} onChange={(e) => { setFilter(e.target.value); setPage(0); }}>
-                                <MenuItem value="all">All users</MenuItem>
-                                <MenuItem value="active">Active</MenuItem>
-                                <MenuItem value="inactive">Inactive</MenuItem>
-                                <MenuItem value="admin">Admins</MenuItem>
-                                <MenuItem value="expired">Expired validity</MenuItem>
-                              </Select>
-                            </FormControl>
-                            <FormControl sx={{ minWidth: 140 }}>
-                              <InputLabel>Rows</InputLabel>
-                              <Select label="Rows" value={rowsPerPage} onChange={(e) => { setRowsPerPage(Number(e.target.value)); setPage(0); }}>
-                                {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
-                              </Select>
-                            </FormControl>
-                          </Stack>
-
-                          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, borderColor: "divider", overflowX: "auto" }}>
-                            <Table stickyHeader size="small">
-                              <TableHead>
-                                <TableRow>
-                                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Actions"].map((head) => (
-                                    <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
-                                  ))}
-                                </TableRow>
-                              </TableHead>
-                              <TableBody>
-                                {pagedUsers.map((user) => (
-                                  <TableRow key={user.id} hover selected={selectedUser?.id === user.id}>
-                                    <TableCell>{user.id}</TableCell>
-                                    <TableCell>{fmt(user.username)}</TableCell>
-                                    <TableCell>{fmt(user.display_name)}</TableCell>
-                                    <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
-                                    <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
-                                    <TableCell>{formatDate(user.login_valid_until)}</TableCell>
-                                    <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
-                                    <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
-                                    <TableCell>
-                                      <Button size="small" variant="outlined" onClick={(event) => { setMenuAnchor(event.currentTarget); setMenuUser(user); setSelectedUser(user); }}>⋮</Button>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </TableContainer>
-
-                          <TablePagination
-                            component="div"
-                            count={filteredUsers.length}
-                            page={page}
-                            onPageChange={(_, nextPage) => setPage(nextPage)}
-                            rowsPerPage={rowsPerPage}
-                            onRowsPerPageChange={(e) => { setRowsPerPage(Number(e.target.value)); setPage(0); }}
-                            rowsPerPageOptions={[5, 10, 20, 50]}
-                          />
-                        </Stack>
-                      </Grid>
-                    </Grid>
-                  </Stack>
-                </Paper>
-
-                <Paper id="expired" sx={{ p: { xs: 2, md: 3 }, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2} sx={{ mb: 2 }}>
-                    <Box>
-                      <Typography variant="h5" fontWeight={900}>Validity Expired</Typography>
-                      <Typography color="text.secondary">Accounts whose login validity is already expired.</Typography>
-                    </Box>
-                    <Button variant="outlined" onClick={() => refreshUsers(auth)}>Refresh Expired</Button>
-                  </Stack>
-                  <Grid container spacing={1.5}>
-                    {expiredUsers.length ? expiredUsers.slice(0, 12).map((user) => (
-                      <Grid item xs={12} sm={6} xl={4} key={user.id}>
-                        <Card variant="outlined" sx={{ borderRadius: 1.5, height: "100%" }}>
-                          <CardContent>
-                            <Stack direction="row" justifyContent="space-between" spacing={2}>
-                              <Box>
-                                <Typography fontWeight={900}>{user.username}</Typography>
-                                <Typography variant="body2" color="text.secondary">{fmt(user.display_name) || "No display name"}</Typography>
-                              </Box>
-                              <Chip label="Expired" color="error" size="small" />
-                            </Stack>
-                            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>{formatDate(user.login_valid_until)}</Typography>
-                          </CardContent>
-                        </Card>
-                      </Grid>
-                    )) : (
-                      <Grid item xs={12}>
-                        <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5 }}>
-                          <Typography fontWeight={800}>No expired users</Typography>
-                          <Typography color="text.secondary">All active users have a valid login window.</Typography>
-                        </Paper>
-                      </Grid>
-                    )}
-                  </Grid>
-                </Paper>
-
-                <Paper id="activity" sx={{ p: { xs: 2, md: 3 }, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2} sx={{ mb: 2 }}>
-                    <Box>
-                      <Typography variant="h5" fontWeight={900}>Activity</Typography>
-                      <Typography color="text.secondary">Recent backend activity across all accounts.</Typography>
-                    </Box>
-                    <Button variant="outlined" onClick={() => refreshActivity(auth)}>Refresh Activity</Button>
-                  </Stack>
-                  <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
-                    <Table stickyHeader size="small">
-                      <TableHead>
-                        <TableRow>
-                          {["ID", "Username", "Category", "Action", "Details", "IP", "Location", "Created"].map((head) => <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>)}
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {pagedActivity.map((row) => (
-                          <TableRow key={row.id} hover>
-                            <TableCell>{row.id}</TableCell>
-                            <TableCell>{fmt(row.username)}</TableCell>
-                            <TableCell>{fmt(row.category)}</TableCell>
-                            <TableCell>{fmt(row.action)}</TableCell>
-                            <TableCell>{fmt(row.details_json)}</TableCell>
-                            <TableCell>{fmt(row.ip_address)}</TableCell>
-                            <TableCell>{fmt(row.location_label)}</TableCell>
-                            <TableCell>{formatDate(row.created_at)}</TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                  <TablePagination
-                    component="div"
-                    count={activity.length}
-                    page={activityPage}
-                    onPageChange={(_, nextPage) => setActivityPage(nextPage)}
-                    rowsPerPage={activityRowsPerPage}
-                    onRowsPerPageChange={(e) => { setActivityRowsPerPage(Number(e.target.value)); setActivityPage(0); }}
-                    rowsPerPageOptions={[5, 10, 20, 50]}
-                  />
-                </Paper>
-
-                <Paper id="history" sx={{ p: { xs: 2, md: 3 }, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2} sx={{ mb: 2 }}>
-                    <Box>
-                      <Typography variant="h5" fontWeight={900}>Login History</Typography>
-                      <Typography color="text.secondary">Login attempts, device fingerprints, and access decisions.</Typography>
-                    </Box>
-                    <Button variant="outlined" onClick={() => refreshHistory(auth)}>Refresh History</Button>
-                  </Stack>
-                  <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
-                    <Table stickyHeader size="small">
-                      <TableHead>
-                        <TableRow>
-                          {["ID", "User ID", "Username", "Success", "IP", "Device Fingerprint", "Device Name", "Agent", "Created"].map((head) => <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>)}
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {pagedHistory.map((row) => (
-                          <TableRow key={row.id} hover>
-                            <TableCell>{row.id}</TableCell>
-                            <TableCell>{row.user_id}</TableCell>
-                            <TableCell>{fmt(row.username)}</TableCell>
-                            <TableCell><Chip size="small" label={row.success ? "Success" : "Failed"} color={row.success ? "success" : "error"} /></TableCell>
-                            <TableCell>{fmt(row.ip_address)}</TableCell>
-                            <TableCell>{fmt(row.device_fingerprint)}</TableCell>
-                            <TableCell>{fmt(row.device_name)}</TableCell>
-                            <TableCell>{fmt(row.user_agent)}</TableCell>
-                            <TableCell>{formatDate(row.created_at)}</TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                  <TablePagination
-                    component="div"
-                    count={history.length}
-                    page={historyPage}
-                    onPageChange={(_, nextPage) => setHistoryPage(nextPage)}
-                    rowsPerPage={historyRowsPerPage}
-                    onRowsPerPageChange={(e) => { setHistoryRowsPerPage(Number(e.target.value)); setHistoryPage(0); }}
-                    rowsPerPageOptions={[5, 10, 20, 50]}
-                  />
-                </Paper>
+                {renderActiveSection()}
               </Stack>
             </Box>
 
@@ -1239,7 +1373,7 @@ def _html() -> str:
 
             <Dialog open={editorOpen} onClose={() => setEditorOpen(false)} fullWidth maxWidth="md">
               <DialogTitle sx={{ fontWeight: 900 }}>
-                Edit User
+                {createOpen ? "Create User" : "Edit User"}
               </DialogTitle>
               <DialogContent dividers>
                 <Stack spacing={2} sx={{ pt: 1 }}>
@@ -1281,7 +1415,7 @@ def _html() -> str:
               </DialogContent>
               <DialogActions sx={{ p: 2 }}>
                 <Button onClick={() => setEditorOpen(false)}>Cancel</Button>
-                <Button variant="contained" onClick={updateUser}>Save Changes</Button>
+                <Button variant="contained" onClick={submitUser}>{createOpen ? "Create User" : "Save Changes"}</Button>
               </DialogActions>
             </Dialog>
 
@@ -1301,7 +1435,14 @@ def _html() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse(_html())
+    return HTMLResponse(
+        _html(),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 if __name__ == "__main__":

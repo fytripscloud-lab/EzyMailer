@@ -55,13 +55,15 @@ _LIVE_DB_CREDENTIALS = _load_db_credentials()
 
 
 def _db_config_value(env_name: str, fallback_keys: tuple[str, ...], default: str = "") -> str:
-    env_value = os.getenv(env_name)
-    if env_value not in {None, ""}:
-        return env_value
+    # Production/dev should prefer the dedicated live database credentials.
+    # Environment overrides are still allowed only when the live file is absent.
     for key in fallback_keys:
         fallback_value = _LIVE_DB_CREDENTIALS.get(key)
         if fallback_value not in {None, ""}:
             return fallback_value
+    env_value = os.getenv(env_name)
+    if env_value not in {None, ""}:
+        return env_value
     return default
 
 
@@ -370,11 +372,15 @@ def swagger_oauth2_redirect() -> HTMLResponse:
 
 
 def _connect(database: str | None = None):
-    if not DB_HOST or not DB_USER or not DB_PASSWORD:
+    tunnel_host = os.getenv("EZYM_MAILER_DB_TUNNEL_HOST")
+    tunnel_port = os.getenv("EZYM_MAILER_DB_TUNNEL_PORT")
+    host = tunnel_host or DB_HOST
+    port = int(tunnel_port or DB_PORT)
+    if not host or not DB_USER or not DB_PASSWORD:
         raise RuntimeError("Live database credentials are not configured.")
     return pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
+        host=host,
+        port=port,
         user=DB_USER,
         password=DB_PASSWORD,
         database=database,
