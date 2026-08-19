@@ -1,0 +1,33 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build EXE
+        shell: cmd
+        env:
+          EZYM_MAILER_API_BASE_URL: http://15.206.161.73:8765
+          EZYM_MAILER_BOOTSTRAP_API: "0"
+        run: build.bat
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EzyMailer-Windows-EXE
+          path: dist\EzyMailer.exe
+          if-no-files-found: error
