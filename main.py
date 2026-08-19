@@ -33,7 +33,7 @@ from backend.local_api import (
     get_customer_variables as api_get_customer_variables,
     get_settings as api_get_settings,
     get_tags as api_get_tags,
-    admin_login_request as api_admin_login,
+    login as api_login,
     record_activity,
     delete_content as api_delete_content,
     delete_customer_variables as api_delete_customer_variables,
@@ -2531,7 +2531,7 @@ class LoginPage(QWidget):
         intro.setObjectName("loginTitle")
         intro.setAlignment(Qt.AlignCenter)
 
-        subtitle = QLabel("Admin access only.")
+        subtitle = QLabel("Admin and user access.")
         subtitle.setObjectName("loginSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
@@ -2544,11 +2544,11 @@ class LoginPage(QWidget):
 
         self.username_input.setPlaceholderText("Username")
         self.username_input.setText("")
-        self.username_input.setToolTip("Enter the local login username")
+        self.username_input.setToolTip("Enter your login username")
         self.password_input.setPlaceholderText("Password")
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setText("")
-        self.password_input.setToolTip("Enter the local login password")
+        self.password_input.setToolTip("Enter your login password")
 
         form.addRow("Username", self.username_input)
         form.addRow("Password", self.password_input)
@@ -2600,7 +2600,7 @@ class LoginPage(QWidget):
         self._set_busy(True)
         QApplication.processEvents()
         try:
-            payload = api_admin_login(
+            payload = api_login(
                 username.strip(),
                 password.strip(),
                 timeout=5.0,
@@ -2646,7 +2646,7 @@ class LoginPage(QWidget):
                 self._set_busy(True)
                 QApplication.processEvents()
                 try:
-                    payload = api_admin_login(
+                    payload = api_login(
                         username.strip(),
                         password.strip(),
                         timeout=5.0,
