@@ -6,6 +6,8 @@ if not exist ".venv" (
 )
 
 call .venv\Scripts\activate.bat
+set EZYM_MAILER_API_BASE_URL=http://15.206.161.73:8765
+set EZYM_MAILER_BOOTSTRAP_API=0
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller

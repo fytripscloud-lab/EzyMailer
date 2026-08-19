@@ -10,6 +10,7 @@ import secrets
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -24,9 +25,9 @@ import uvicorn
 
 
 API_HOST = os.getenv("EZYM_MAILER_API_HOST", "127.0.0.1")
-# Fixed local API port used by the desktop app and docs UI.
+# Fixed local API port used by the hosted backend service.
 API_PORT = int(os.getenv("EZYM_MAILER_API_PORT", "8765"))
-API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
+API_BASE_URL = os.getenv("EZYM_MAILER_API_BASE_URL", "http://15.206.161.73:8765")
 
 _DB_CREDENTIALS_PATH = Path(__file__).resolve().parents[1] / "server_credentials" / "Database_Credentials"
 
@@ -84,6 +85,12 @@ JWT_EXPIRES_MINUTES = 24 * 60
 
 _server_thread: threading.Thread | None = None
 _bootstrap_lock = threading.Lock()
+
+
+def _api_target_is_local() -> bool:
+    parsed = urlparse(API_BASE_URL)
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"", "127.0.0.1", "localhost", "::1"}
 
 app = FastAPI(
     title="EzyMailer Local API",
@@ -2172,6 +2179,9 @@ def ensure_api_server() -> None:
 
     with _bootstrap_lock:
         if _server_thread is not None and _server_thread.is_alive():
+            return
+
+        if not _api_target_is_local():
             return
 
         try:

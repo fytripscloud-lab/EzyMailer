@@ -33,6 +33,7 @@ EzyMailer now has multiple targets and deployment paths.
 - Run `main.py` for the packaged desktop application source.
 - Build Windows: `build.bat`
 - Build macOS: `bash build-macos.sh`
+- Desktop builds default to the live API at `http://15.206.161.73:8765` and the dedicated AWS database.
 
 ## Notes
 
