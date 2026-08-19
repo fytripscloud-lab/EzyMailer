@@ -34,6 +34,8 @@ EzyMailer now has multiple targets and deployment paths.
 - Build Windows: `build.bat`
 - Build macOS: `bash build-macos.sh`
 - Desktop builds default to the live API at `http://15.206.161.73:8765` and the dedicated AWS database.
+- Windows rebuild flow: pull `main` on the Windows machine, run `build.bat`, and rebuild only the Windows app from that machine.
+- Windows first launch downloads the browser runtime into the local cache if Chromium is not already available.
 
 ## Notes
 
