@@ -19,7 +19,8 @@ These notes describe the live production setup and how the repository should be 
 
 ## Sync Rule
 
-- Before each macOS or Windows build, use the dedicated live database as the source of truth for schema and application data.
+- Before each macOS or Windows build, update the live backend, admin frontend, and dedicated live database schema first.
+- Use the dedicated live database as the source of truth for schema and application data.
 - Only new schemas should be applied to the live database.
 - Do not overwrite live data unless the change is an intentional schema migration.
 
@@ -82,4 +83,4 @@ These notes describe the live production setup and how the repository should be 
 
 - On macOS development machines, use the frontend, backend, and desktop app source only for development work.
 - Before building any `.dmg` or `.exe`, first update and verify the live server backend and frontend.
-- The produced build artifact must be configured to use the live API and the dedicated live database.
+- The produced build artifact must be configured to use the live API and the dedicated live database, never the local backend.

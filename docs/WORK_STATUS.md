@@ -115,5 +115,6 @@ Use this as the source of truth when asking for pending items.
 ## Notes
 
 - The hosted backend and hosted admin frontend must always target the dedicated live AWS MySQL database.
-- Before any `.dmg` or `.exe` build, update and verify the live backend and admin frontend first.
+- Before any `.dmg` or `.exe` build, update and verify the live backend, admin frontend, and schema changes first.
+- The rebuild artifact must use the live API and live database, not the local development backend.
 - Do not place secrets in this file.
