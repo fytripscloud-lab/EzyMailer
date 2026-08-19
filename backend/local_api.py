@@ -714,10 +714,14 @@ def _authenticate(
                     """,
                     (digest, salt, row["id"]),
                 )
-            if not str(row.get("device_fingerprint") or "").strip():
-                session_version = _bind_or_refresh_device(int(row["id"]), device_fingerprint, device_name, request)
-            else:
-                session_version = _bind_or_refresh_device(int(row["id"]), row.get("device_fingerprint"), row.get("device_name"), request)
+            bind_device_fingerprint = (device_fingerprint or "").strip() or row.get("device_fingerprint")
+            bind_device_name = (device_name or "").strip() or row.get("device_name")
+            session_version = _bind_or_refresh_device(
+                int(row["id"]),
+                bind_device_fingerprint,
+                bind_device_name,
+                request,
+            )
             return {
                 "id": str(row["id"]),
                 "username": str(row["username"]),

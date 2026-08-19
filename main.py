@@ -2575,6 +2575,12 @@ class LoginPage(QWidget):
         self.username_input.returnPressed.connect(self._attempt_login)
         self.password_input.returnPressed.connect(self._attempt_login)
 
+    def _show_login_error(self, message: str, title: str = "Login failed") -> None:
+        self.error_label.setText(message)
+        self.error_label.setVisible(True)
+        QApplication.processEvents()
+        QMessageBox.warning(self, title, message)
+
     def _set_busy(self, busy: bool) -> None:
         self.username_input.setEnabled(not busy)
         self.password_input.setEnabled(not busy)
@@ -2590,15 +2596,16 @@ class LoginPage(QWidget):
         password = self.password_input.text()
 
         if not username.strip() or not password.strip():
-            self.error_label.setText("Please enter both a username and password.")
+            self._show_login_error("Please enter both a username and password.")
             return
         if re.search(r"\s", username) or re.search(r"\s", password):
-            self.error_label.setText("Username and password cannot contain whitespace.")
+            self._show_login_error("Username and password cannot contain whitespace.")
             return
 
         self.error_label.setText("")
         self._set_busy(True)
         QApplication.processEvents()
+        payload: dict[str, object] | None = None
         try:
             payload = api_login(
                 username.strip(),
@@ -2640,11 +2647,8 @@ class LoginPage(QWidget):
                     QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
-                    self.error_label.setText("Login cancelled.")
+                    self._show_login_error("Login cancelled.")
                     return
-                self.error_label.setText("")
-                self._set_busy(True)
-                QApplication.processEvents()
                 try:
                     payload = api_login(
                         username.strip(),
@@ -2665,32 +2669,32 @@ class LoginPage(QWidget):
                             retry_message = str(detail or retry_message)
                     except Exception:
                         pass
-                    self.error_label.setText(retry_message)
+                    self._show_login_error(retry_message)
                     return
                 except Exception:
-                    self.error_label.setText("Unable to reach the admin login API.")
+                    self._show_login_error("Unable to reach the admin login API.", "Connection error")
                     return
-                finally:
-                    self._set_busy(False)
-                if not payload.get("ok"):
-                    self.error_label.setText(str(payload.get("error", "Login failed.")))
-                    return
-                user = payload.get("user") or {}
-                self.on_login(
-                    str(user.get("username", username)),
-                    str(payload.get("access_token", "")),
-                    str(user.get("role", "")),
-                    True,
-                )
-                return
             else:
-                self.error_label.setText(message)
+                self._show_login_error(message)
             return
         except Exception:
-            self.error_label.setText("Unable to reach the admin login API.")
+            self._show_login_error("Unable to reach the admin login API.", "Connection error")
             return
         finally:
             self._set_busy(False)
+
+        if payload is None:
+            return
+        if not payload.get("ok"):
+            self._show_login_error(str(payload.get("error", "Login failed.")))
+            return
+        user = payload.get("user") or {}
+        self.on_login(
+            str(user.get("username", username)),
+            str(payload.get("access_token", "")),
+            str(user.get("role", "")),
+            True,
+        )
 
 
 class DashboardPage(QWidget):

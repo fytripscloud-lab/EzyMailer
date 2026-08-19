@@ -7,6 +7,8 @@ These notes describe the live production setup and how the repository should be 
 - Host OS: Ubuntu
 - Live host private IP: `172.26.1.104`
 - Live host public IP: `15.206.161.73`
+- Live backend API: `http://15.206.161.73:8765/`
+- Live admin frontend: `http://15.206.161.73:8780/`
 - Services to host on the live machine:
   - Backend API
   - Admin frontend
@@ -78,6 +80,7 @@ These notes describe the live production setup and how the repository should be 
 - The hosted admin frontend talks only to the backend API.
 - The hosted backend must not point to the local development database when deployed on Ubuntu.
 - Use the live database credentials from `server_credentials/` only for the hosted environment.
+- All desktop builds must also point at the live backend API and the dedicated live database, never localhost.
 
 ## Build Rule
 

@@ -115,6 +115,30 @@ def _html() -> str:
       try { return JSON.parse(text); } catch { return null; }
     }
 
+    function extractApiMessage(payload, fallback = "Request failed") {
+      const candidates = [
+        payload?.detail,
+        payload?.message,
+        payload?.error,
+        payload?.raw,
+      ];
+      for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (typeof candidate === "string") return candidate;
+        if (typeof candidate === "object") {
+          const nested = candidate.message || candidate.detail || candidate.error || candidate.reason;
+          if (nested) return String(nested);
+          try {
+            return JSON.stringify(candidate);
+          } catch {
+            return fallback;
+          }
+        }
+      }
+      if (typeof payload === "string") return payload;
+      return fallback;
+    }
+
     function useLocalStorageState(key, fallback) {
       const [value, setValue] = React.useState(() => {
         try {
@@ -147,9 +171,15 @@ def _html() -> str:
       const raw = await response.text();
       const payload = raw ? (safeJson(raw) || { raw }) : {};
       if (response.status === 401 && typeof window.__ezymailerLogout === "function") {
-        window.__ezymailerLogout(payload.detail || "Session expired");
+        window.__ezymailerLogout(extractApiMessage(payload, "Session expired"));
       }
-      if (!response.ok) throw new Error(payload.detail || payload.error || `Request failed (${response.status})`);
+      if (!response.ok) {
+        const message = extractApiMessage(payload, `Request failed (${response.status})`);
+        const error = new Error(message);
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+      }
       return payload;
     }
 
@@ -207,7 +237,9 @@ def _html() -> str:
       const [detailData, setDetailData] = React.useState(null);
       const [loading, setLoading] = React.useState(false);
       const [message, setMessage] = React.useState({ open: false, severity: "info", text: "" });
-      const [loginForm, setLoginForm] = React.useState({ username: "admin", password: "admin" });
+      const [loginConflict, setLoginConflict] = React.useState(null);
+      const [loginSubmitting, setLoginSubmitting] = React.useState(false);
+      const [loginForm, setLoginForm] = React.useState({ username: "", password: "" });
       const [form, setForm] = React.useState({
         id: "",
         username: "",
@@ -296,22 +328,49 @@ def _html() -> str:
         }
       }
 
-      const loadAuthLogin = async () => {
-        const response = await fetch(`${API_BASE}/api/admin/login`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            username: loginForm.username.trim(),
-            password: loginForm.password,
-            device_fingerprint: getFingerprint(),
-            device_name: navigator.userAgent,
-          }),
-        });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.detail || payload.error || "Login failed");
-        setAuth(payload);
-        notify("Admin login successful", "success");
-        await refreshAll(payload);
+      const loadAuthLogin = async (forceLogoutOtherDevice = false) => {
+        const username = loginForm.username.trim();
+        const password = loginForm.password;
+        if (!username || !password) {
+          notify("Username and password are required.", "warning");
+          return;
+        }
+        setLoginSubmitting(true);
+        try {
+          const response = await fetch(`${API_BASE}/api/admin/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username,
+              password,
+              device_fingerprint: getFingerprint(),
+              device_name: navigator.userAgent,
+              force_logout_other_device: forceLogoutOtherDevice,
+            }),
+          });
+          const raw = await response.text();
+          const payload = raw ? (safeJson(raw) || { raw }) : {};
+          if (!response.ok) {
+            const message = extractApiMessage(payload, "Login failed");
+            if (response.status === 409) {
+              const conflict = payload?.detail && typeof payload.detail === "object"
+                ? payload.detail
+                : payload;
+              setLoginConflict(conflict);
+              notify(extractApiMessage(conflict, message), "warning");
+              return;
+            }
+            throw new Error(message);
+          }
+          setLoginConflict(null);
+          setAuth(payload);
+          notify("Admin login successful", "success");
+          await refreshAll(payload);
+        } catch (error) {
+          notify(extractApiMessage(error?.payload || {}, error?.message || "Login failed"), "error");
+        } finally {
+          setLoginSubmitting(false);
+        }
       };
 
       const filteredUsers = React.useMemo(() => {
@@ -1034,14 +1093,38 @@ def _html() -> str:
                       <TextField label="Username" value={loginForm.username} onChange={(e) => setLoginForm((prev) => ({ ...prev, username: e.target.value }))} fullWidth />
                       <TextField label="Password" type="password" value={loginForm.password} onChange={(e) => setLoginForm((prev) => ({ ...prev, password: e.target.value }))} fullWidth />
                       <Stack direction="row" spacing={1.5}>
-                        <Button variant="contained" onClick={loadAuthLogin}>Sign In</Button>
-                        <Button variant="outlined" onClick={() => notify("Use admin / admin on first run or your current admin credentials.", "info")}>Help</Button>
+                        <Button variant="contained" onClick={() => loadAuthLogin(false)} disabled={loginSubmitting}>
+                          {loginSubmitting ? "Signing In..." : "Sign In"}
+                        </Button>
+                        <Button variant="outlined" onClick={() => notify("Use your current authorized credentials.", "info")}>Help</Button>
                       </Stack>
                     </Stack>
                   </Grid>
                 </Grid>
               </Paper>
             </Box>
+            <Dialog open={!!loginConflict} onClose={() => setLoginConflict(null)} maxWidth="sm" fullWidth>
+              <DialogTitle>Already logged in on another device</DialogTitle>
+              <DialogContent>
+                <Typography color="text.secondary">
+                  {extractApiMessage(loginConflict, "You are already logged in on another device. Do you want to log out from the other device and continue?")}
+                </Typography>
+              </DialogContent>
+              <DialogActions>
+                <Button onClick={() => setLoginConflict(null)} variant="outlined">
+                  No
+                </Button>
+                <Button
+                  onClick={() => {
+                    setLoginConflict(null);
+                    loadAuthLogin(true);
+                  }}
+                  variant="contained"
+                >
+                  Yes, log out other device
+                </Button>
+              </DialogActions>
+            </Dialog>
             <Snackbar open={message.open} autoHideDuration={3500} onClose={closeMessage}>
               <Alert severity={message.severity} onClose={closeMessage} variant="filled">{message.text}</Alert>
             </Snackbar>

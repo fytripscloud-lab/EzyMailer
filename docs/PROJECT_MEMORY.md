@@ -13,6 +13,12 @@ Build a Windows GUI email automation tool in Python that ultimately packages int
 - Keep all milestone decisions in markdown files for traceability
 - The backend and hosted frontend must always target the dedicated AWS MySQL database
 - Before any `.dmg` or `.exe` build, first update the live server frontend, backend, and any schema changes on the dedicated AWS database, then package the app so the build uses the live API and live database
+- Live endpoints to remember:
+  - Backend API: `http://15.206.161.73:8765/`
+  - Admin frontend: `http://15.206.161.73:8780/`
+- Any valid user in the database may log in on macOS or Windows
+- Only one device session may stay active at a time
+- On a new-device login, the new device becomes active and the previous device logs out after confirmation
 
 ## UI goals
 
