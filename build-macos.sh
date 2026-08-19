@@ -58,7 +58,7 @@ pyinstaller \
   "$ROOT_DIR/main.py"
 
 mkdir -p "$STAGING_DIR"
-cp -R "$APP_BUNDLE" "$STAGING_DIR/"
+cp -cR "$APP_BUNDLE" "$STAGING_DIR/"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 export DMG_PATH

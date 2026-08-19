@@ -113,6 +113,7 @@ APP_TITLE = "EzyMailer"
 DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin"
 IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform.startswith("win")
 MAX_BODY_TABS = 50
 MAX_ATTACHMENT_TABS = 50
 MAX_SUBJECTS = 100
@@ -134,6 +135,34 @@ LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
+BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
+
+
+def _runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _find_first_existing(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def _find_executable(root: Path, names: list[str]) -> Path | None:
+    for name in names:
+        direct = root / name
+        if direct.exists():
+            return direct
+    if not root.exists():
+        return None
+    for name in names:
+        matches = list(root.rglob(name))
+        if matches:
+            return matches[0]
+    return None
 
 
 def _scaled_int(value: float, scale: float, minimum: int = 1) -> int:
@@ -1071,45 +1100,33 @@ class TitleBar(QWidget):
 
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
-        if IS_MAC:
-            layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(1, self._scale), _scaled_int(8, self._scale), _scaled_int(1, self._scale))
-            layout.setSpacing(_scaled_int(4, self._scale))
-        else:
-            layout.setContentsMargins(_scaled_int(4, self._scale), _scaled_int(2, self._scale), _scaled_int(4, self._scale), _scaled_int(2, self._scale))
-            layout.setSpacing(_scaled_int(6, self._scale))
+        layout.setContentsMargins(
+            _scaled_int(8, self._scale),
+            _scaled_int(1, self._scale),
+            _scaled_int(8, self._scale),
+            _scaled_int(1, self._scale),
+        )
+        layout.setSpacing(_scaled_int(4, self._scale))
 
-        controls = None
-        if IS_MAC:
-            controls = QHBoxLayout()
-            controls.setSpacing(_scaled_int(5, self._scale))
-            self.close_button = MacTrafficLightButton("close", self._scale)
-            self.close_button.clicked.connect(self._on_close)
-            self.minimize_button = MacTrafficLightButton("minimize", self._scale)
-            self.minimize_button.clicked.connect(self._window.showMinimized)
-            self.maximize_button = MacTrafficLightButton("maximize", self._scale)
-            self.maximize_button.clicked.connect(self._toggle_maximize)
-            controls.addWidget(self.close_button)
-            controls.addWidget(self.minimize_button)
-            controls.addWidget(self.maximize_button)
-            controls.addSpacing(_scaled_int(6, self._scale))
+        controls = QHBoxLayout()
+        controls.setSpacing(_scaled_int(5, self._scale))
+        self.close_button = MacTrafficLightButton("close", self._scale)
+        self.close_button.clicked.connect(self._on_close)
+        self.minimize_button = MacTrafficLightButton("minimize", self._scale)
+        self.minimize_button.clicked.connect(self._window.showMinimized)
+        self.maximize_button = MacTrafficLightButton("maximize", self._scale)
+        self.maximize_button.clicked.connect(self._toggle_maximize)
+        controls.addWidget(self.close_button)
+        controls.addWidget(self.minimize_button)
+        controls.addWidget(self.maximize_button)
+        controls.addSpacing(_scaled_int(6, self._scale))
 
         brand = QHBoxLayout()
         brand.setSpacing(_scaled_int(6, self._scale))
-        self.logo = AnimatedLogoBadge(scale=self._scale)
-        title_block = QVBoxLayout()
-        title_block.setSpacing(0)
         title = QLabel("EzyMailer")
         title.setObjectName("brandTitle")
-        subtitle = QLabel("Desktop workspace for email automation")
-        subtitle.setObjectName("brandSubtitle")
-        if IS_MAC:
-            title.setStyleSheet("font-weight: 800;")
-            brand.addWidget(title)
-        else:
-            title_block.addWidget(title)
-            title_block.addWidget(subtitle)
-            brand.addWidget(self.logo)
-            brand.addLayout(title_block)
+        title.setStyleSheet("font-weight: 800;")
+        brand.addWidget(title)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1124,47 +1141,21 @@ class TitleBar(QWidget):
             badge.setAlignment(Qt.AlignCenter)
         version_badge.setToolTip("Application version")
         self.status_badge.setToolTip("Current login status")
-        if IS_MAC:
-            version_badge.hide()
-            self.status_badge.hide()
+        version_badge.hide()
+        self.status_badge.hide()
 
         self.logout_button = QPushButton("Logout")
         self.logout_button.setObjectName("secondaryButton")
-        self.logout_button.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
-        self.logout_button.setMinimumWidth(_scaled_int(58 if IS_MAC else 64, self._scale))
+        self.logout_button.setFixedHeight(_scaled_int(24, self._scale))
+        self.logout_button.setMinimumWidth(_scaled_int(58, self._scale))
         self.logout_button.setToolTip("Sign out and return to login")
 
-        if not IS_MAC:
-            self.minimize_button = QPushButton("−")
-            self.minimize_button.setObjectName("windowControlButton")
-            self.minimize_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
-            self.minimize_button.clicked.connect(self._window.showMinimized)
-            self.minimize_button.setToolTip("Minimize window")
-            self.maximize_button = QPushButton("▢")
-            self.maximize_button.setObjectName("windowControlButton")
-            self.maximize_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
-            self.maximize_button.clicked.connect(self._toggle_maximize)
-            self.maximize_button.setToolTip("Maximize or restore window")
-            self.close_button = QPushButton("✕")
-            self.close_button.setObjectName("closeButton")
-            self.close_button.setFixedSize(_scaled_int(28, self._scale), _scaled_int(28, self._scale))
-            self.close_button.setText("✕")
-            self.close_button.clicked.connect(self._on_close)
-            self.close_button.setToolTip("Close application")
-
-        if controls is not None:
-            layout.addLayout(controls)
+        layout.addLayout(controls)
         layout.addLayout(brand)
         layout.addWidget(spacer)
-        if not IS_MAC:
-            layout.addWidget(version_badge)
-            layout.addWidget(self.status_badge)
-        if not IS_MAC:
-            layout.addWidget(self.minimize_button)
-            layout.addWidget(self.maximize_button)
+        layout.addWidget(version_badge)
+        layout.addWidget(self.status_badge)
         layout.addWidget(self.logout_button)
-        if not IS_MAC:
-            layout.addWidget(self.close_button)
 
     def set_state(self, username: str, logged_in: bool) -> None:
         self.status_badge.setText("READY" if logged_in else "LOCKED")
@@ -1172,8 +1163,7 @@ class TitleBar(QWidget):
 
     def sync_window_state(self) -> None:
         self._is_maximized = self._window.isMaximized()
-        if not IS_MAC:
-            self.maximize_button.setText("❐" if self._is_maximized else "▢")
+        self.maximize_button.setToolTip("Restore window" if self._is_maximized else "Maximize window")
 
     def _toggle_maximize(self) -> None:
         if self._window.isMaximized():
@@ -5041,13 +5031,80 @@ class DashboardPage(QWidget):
         self.state.window_count = max(1, value)
 
     def _browser_binary(self) -> Path | None:
-        candidates = [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            Path("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
-        ]
-        for candidate in candidates:
+        env_binary = os.getenv("EZYM_MAILER_BROWSER_BINARY", "").strip()
+        if env_binary:
+            candidate = Path(env_binary).expanduser()
             if candidate.exists():
                 return candidate
+
+        bundle_roots = [
+            _runtime_root() / BUILTIN_BROWSER_DIR_NAME,
+            Path.cwd() / BUILTIN_BROWSER_DIR_NAME,
+            Path.home() / BUILTIN_BROWSER_DIR_NAME,
+        ]
+        if IS_MAC:
+            bundle_roots.extend([
+                Path("/Applications/Google Chrome.app/Contents/MacOS"),
+                Path("/Applications/Google Chrome Canary.app/Contents/MacOS"),
+            ])
+            candidates = [
+                "Google Chrome",
+                "Google Chrome Canary",
+                "Chromium",
+            ]
+        elif IS_WINDOWS:
+            windows_roots: list[Path] = []
+            local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+            program_files = os.environ.get("PROGRAMFILES", "").strip()
+            program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "").strip()
+            if local_appdata:
+                local_root = Path(local_appdata)
+                windows_roots.extend([
+                    local_root / "Google" / "Chrome" / "Application",
+                    local_root / "Microsoft" / "Edge" / "Application",
+                ])
+            if program_files:
+                program_root = Path(program_files)
+                windows_roots.extend([
+                    program_root / "Google" / "Chrome" / "Application",
+                    program_root / "Microsoft" / "Edge" / "Application",
+                ])
+            if program_files_x86:
+                program_root_x86 = Path(program_files_x86)
+                windows_roots.extend([
+                    program_root_x86 / "Google" / "Chrome" / "Application",
+                    program_root_x86 / "Microsoft" / "Edge" / "Application",
+                ])
+            bundle_roots.extend(windows_roots)
+            candidates = [
+                "chrome.exe",
+                "msedge.exe",
+                "chromium.exe",
+            ]
+        else:
+            bundle_roots.extend([
+                Path("/usr/bin"),
+                Path("/usr/local/bin"),
+            ])
+            candidates = [
+                "google-chrome",
+                "chromium",
+                "chromium-browser",
+                "microsoft-edge",
+            ]
+
+        for root in bundle_roots:
+            candidate = _find_executable(root, candidates)
+            if candidate is not None:
+                return candidate
+
+        if IS_WINDOWS:
+            fallback_candidates = [
+                Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+            ]
+            return _find_first_existing(fallback_candidates)
+
         return None
 
     def _browser_launch_rect(self, index: int, total: int) -> tuple[int, int, int, int]:
