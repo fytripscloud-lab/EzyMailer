@@ -6,6 +6,7 @@ import json
 import os
 import re
 import platform
+import random
 import time
 import secrets
 import subprocess
@@ -14,6 +15,7 @@ import ssl
 import sqlite3
 import socket
 import string
+import threading
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -1029,6 +1031,144 @@ class AIValidationWorker(QObject):
         if not unique_models:
             raise ValueError("No models were returned by the provider.")
         return unique_models
+
+
+class CampaignSendWorker(QObject):
+    log = Signal(str)
+    progress = Signal(str, str, int, int)
+    finished = Signal(str, str, bool, int, int, str)
+
+    def __init__(
+        self,
+        session: BrowserSessionHandle,
+        tasks: list[dict[str, str]],
+        pause_event: threading.Event,
+        cancel_event: threading.Event,
+        send_callback: Callable[..., None],
+        *,
+        window_label: str,
+        delay_mode: str,
+        delay_from: float,
+        delay_to: float,
+        retry_count: int,
+        retry_enabled: bool,
+        convert_enabled: bool,
+        attachment_formats: list[str],
+        file_name_mode: str,
+        window_send_mode: str,
+    ):
+        super().__init__()
+        self.session = session
+        self.tasks = tasks
+        self.pause_event = pause_event
+        self.cancel_event = cancel_event
+        self.send_callback = send_callback
+        self.window_label = window_label
+        self.delay_mode = delay_mode
+        self.delay_from = max(0.0, float(delay_from))
+        self.delay_to = max(self.delay_from, float(delay_to))
+        self.retry_count = max(0, int(retry_count))
+        self.retry_enabled = bool(retry_enabled)
+        self.convert_enabled = bool(convert_enabled)
+        self.attachment_formats = list(attachment_formats)
+        self.file_name_mode = file_name_mode
+        self.window_send_mode = window_send_mode
+
+    def _timestamp(self) -> str:
+        return QDateTime.currentDateTime().toString("hh:mm:ss")
+
+    def _wait_for_resume(self) -> bool:
+        while not self.cancel_event.is_set():
+            if self.pause_event.is_set():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _sleep_with_controls(self, seconds: float) -> bool:
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if self.cancel_event.is_set():
+                return False
+            if not self._wait_for_resume():
+                return False
+            time.sleep(0.1)
+        return not self.cancel_event.is_set()
+
+    def _delay_seconds(self) -> float:
+        if self.delay_mode == "Fixed":
+            return self.delay_from
+        if self.delay_mode == "Human-like pattern":
+            base = random.uniform(self.delay_from, self.delay_to)
+            return max(self.delay_from, min(self.delay_to, base * random.uniform(0.75, 1.15)))
+        return random.uniform(self.delay_from, self.delay_to)
+
+    def run(self) -> None:
+        completed = 0
+        total = len(self.tasks)
+        error_message = ""
+        for task in self.tasks:
+            if self.cancel_event.is_set():
+                break
+            if not self._wait_for_resume():
+                break
+
+            recipient = task["recipient"]
+            subject = task["subject"]
+            body_text = task["body_text"]
+            attachment_html = task["attachment_html"]
+            attachment_formats = self.attachment_formats or [task["attachment_format"]]
+            file_name_value = task["file_name_value"]
+            attempts = self.retry_count + 1 if self.retry_enabled else 1
+            last_error: Exception | None = None
+            sent_ok = False
+
+            for attempt in range(1, attempts + 1):
+                if self.cancel_event.is_set() or not self._wait_for_resume():
+                    break
+                try:
+                    self.send_callback(
+                        self.session,
+                        recipient,
+                        subject,
+                        body_text,
+                        attachment_html,
+                        attachment_formats,
+                        self.file_name_mode,
+                        file_name_value,
+                        self.convert_enabled,
+                        True,
+                        False,
+                    )
+                    sent_ok = True
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < attempts and not self.cancel_event.is_set():
+                        if not self._sleep_with_controls(self._delay_seconds()):
+                            break
+
+            completed += 1
+            if sent_ok:
+                self.log.emit(f"[{self._timestamp()}] {self.window_label} sent {recipient}")
+            elif last_error is not None:
+                error_message = str(last_error)
+                self.log.emit(f"[{self._timestamp()}] {self.window_label} failed {recipient}: {error_message}")
+            else:
+                self.log.emit(f"[{self._timestamp()}] {self.window_label} cancelled {recipient}")
+            self.progress.emit(self.session.session_id, self.window_label, completed, total)
+
+            if completed < total and not self.cancel_event.is_set():
+                if not self._sleep_with_controls(self._delay_seconds()):
+                    break
+
+        self.finished.emit(
+            self.session.session_id,
+            self.window_label,
+            self.cancel_event.is_set(),
+            completed,
+            total,
+            error_message,
+        )
 
 
 class AnimatedLogoBadge(QWidget):
@@ -2815,6 +2955,10 @@ class DashboardPage(QWidget):
         self.campaign_progress_text = QLabel("0 / 0 sent")
         self.start_campaign_button = QPushButton("Start Campaign")
         self.sidebar_start_campaign_button = QPushButton("Start Campaign")
+        self.campaign_pause_button = QPushButton("Pause Campaign")
+        self.campaign_cancel_button = QPushButton("Cancel Campaign")
+        self.campaign_pause_button.setVisible(False)
+        self.campaign_cancel_button.setVisible(False)
         self.campaign_reset_all_button = QPushButton("Reset All")
         self.launch_preset_label = QLabel("Default")
         self.custom1_input = QLineEdit()
@@ -2853,6 +2997,20 @@ class DashboardPage(QWidget):
         self.delay_to = QDoubleSpinBox()
         self.retry_count = QSpinBox()
         self.retry_enable_checkbox = QCheckBox("Enable")
+        self._campaign_threads: list[QThread] = []
+        self._campaign_workers: dict[str, CampaignSendWorker] = {}
+        self._campaign_worker_queue: list[dict[str, object]] = []
+        self._campaign_worker_order: list[str] = []
+        self._campaign_worker_progress: dict[str, int] = {}
+        self._campaign_worker_totals: dict[str, int] = {}
+        self._campaign_send_log_entries: list[str] = []
+        self._campaign_pause_event = threading.Event()
+        self._campaign_cancel_event = threading.Event()
+        self._campaign_active = False
+        self._campaign_paused = False
+        self._campaign_total = 0
+        self._campaign_completed = 0
+        self._campaign_send_mode = "Parallel"
         self.ai_provider_combo = QComboBox()
         self.ai_api_key_input = QLineEdit()
         self.ai_connect_button = QPushButton("Connect")
@@ -3064,7 +3222,7 @@ class DashboardPage(QWidget):
         activity_layout.addWidget(self.activity_log_view)
 
         self.sidebar_start_campaign_button.setObjectName("blastButton")
-        self.sidebar_start_campaign_button.clicked.connect(lambda: self._start_blast())
+        self.sidebar_start_campaign_button.clicked.connect(lambda: self._handle_campaign_primary_action())
         self.sidebar_start_campaign_button.setToolTip("Start the main send workflow")
 
         layout.addWidget(launch_card)
@@ -3807,7 +3965,8 @@ class DashboardPage(QWidget):
 
         controls_layout.addWidget(QLabel("Campaign Progress:"))
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
+        if not self._campaign_active:
+            self.progress_bar.setValue(0)
         controls_layout.addWidget(self.progress_bar)
         self.campaign_progress_text.setObjectName("sectionHint")
         controls_layout.addWidget(self.campaign_progress_text)
@@ -3815,9 +3974,21 @@ class DashboardPage(QWidget):
 
         self.start_campaign_button.setObjectName("blastButton")
         self.start_campaign_button.setMinimumHeight(_scaled_int(54, self._scale))
-        self.start_campaign_button.clicked.connect(lambda: self._start_blast())
+        self.start_campaign_button.clicked.connect(lambda: self._handle_campaign_primary_action())
         self.start_campaign_button.setToolTip("Start the email sending workflow")
         layout.addWidget(self.start_campaign_button)
+
+        campaign_action_row = QHBoxLayout()
+        self.campaign_pause_button.setObjectName("warningButton")
+        self.campaign_pause_button.clicked.connect(lambda: self._handle_campaign_pause_resume())
+        self.campaign_pause_button.setToolTip("Pause or resume the active campaign")
+        self.campaign_cancel_button.setObjectName("dangerButton")
+        self.campaign_cancel_button.clicked.connect(lambda: self._handle_campaign_cancel())
+        self.campaign_cancel_button.setToolTip("Cancel the active campaign")
+        campaign_action_row.addWidget(self.campaign_pause_button)
+        campaign_action_row.addWidget(self.campaign_cancel_button)
+        campaign_action_row.addStretch()
+        layout.addLayout(campaign_action_row)
 
         log_card, log_layout = self._card("SEND LOG")
         self.send_log_view.setReadOnly(True)
@@ -4397,6 +4568,17 @@ class DashboardPage(QWidget):
             for definition in self._tag_definitions
         }
 
+    def _resolved_tag_values(self, recipient: str = "", subject: str = "", tag_values: dict[str, str] | None = None) -> dict[str, str]:
+        replacements = {
+            "$custom1": self.custom1_input.text().strip(),
+            "$custom2": self.custom2_input.text().strip(),
+            "$subject": subject.strip(),
+        }
+        replacements.update(tag_values or self._dynamic_tag_values())
+        replacements.update(self._recipient_tag_values(recipient))
+        replacements.update(self._customer_variable_values(recipient))
+        return replacements
+
     def _generate_random_tag_value(self, token: str, default_value: str) -> str:
         token = token.strip()
         if token.startswith("$random"):
@@ -4624,16 +4806,15 @@ class DashboardPage(QWidget):
                 normalized[f"${key_text}"] = value_text
         return normalized
 
-    def _apply_tags_to_text(self, text: str, recipient: str = "", subject: str = "") -> str:
+    def _apply_tags_to_text(
+        self,
+        text: str,
+        recipient: str = "",
+        subject: str = "",
+        tag_values: dict[str, str] | None = None,
+    ) -> str:
         result = text or ""
-        replacements = {
-            "$custom1": self.custom1_input.text().strip(),
-            "$custom2": self.custom2_input.text().strip(),
-            "$subject": subject.strip(),
-        }
-        replacements.update(self._dynamic_tag_values())
-        replacements.update(self._recipient_tag_values(recipient))
-        replacements.update(self._customer_variable_values(recipient))
+        replacements = self._resolved_tag_values(recipient, subject, tag_values)
 
         brace_lookup = {
             key.lstrip("$").lower(): value
@@ -4913,10 +5094,12 @@ class DashboardPage(QWidget):
         format_value: str,
         file_name_mode: str = "auto",
         file_name_value: str = "",
+        resolve_tags: bool = True,
     ) -> str:
         default_base = self._attachment_default_name_base(recipient, subject)
         if str(file_name_mode or "").strip().lower() == "custom":
-            custom = self._sanitize_filename(self._apply_tags_to_text(file_name_value or "", recipient, subject))
+            raw_value = self._apply_tags_to_text(file_name_value or "", recipient, subject) if resolve_tags else (file_name_value or "")
+            custom = self._sanitize_filename(raw_value)
             if custom:
                 return custom
         return default_base
@@ -5129,68 +5312,19 @@ class DashboardPage(QWidget):
             Path.cwd() / BUILTIN_BROWSER_DIR_NAME,
             Path.home() / BUILTIN_BROWSER_DIR_NAME,
         ]
-        if IS_MAC:
-            bundle_roots.extend([
-                Path("/Applications/Google Chrome.app/Contents/MacOS"),
-                Path("/Applications/Google Chrome Canary.app/Contents/MacOS"),
-            ])
-            candidates = [
-                "Google Chrome",
-                "Google Chrome Canary",
-                "Chromium",
-            ]
-        elif IS_WINDOWS:
-            windows_roots: list[Path] = []
-            local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-            program_files = os.environ.get("PROGRAMFILES", "").strip()
-            program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "").strip()
-            if local_appdata:
-                local_root = Path(local_appdata)
-                windows_roots.extend([
-                    local_root / "Google" / "Chrome" / "Application",
-                    local_root / "Microsoft" / "Edge" / "Application",
-                ])
-            if program_files:
-                program_root = Path(program_files)
-                windows_roots.extend([
-                    program_root / "Google" / "Chrome" / "Application",
-                    program_root / "Microsoft" / "Edge" / "Application",
-                ])
-            if program_files_x86:
-                program_root_x86 = Path(program_files_x86)
-                windows_roots.extend([
-                    program_root_x86 / "Google" / "Chrome" / "Application",
-                    program_root_x86 / "Microsoft" / "Edge" / "Application",
-                ])
-            bundle_roots.extend(windows_roots)
-            candidates = [
-                "chrome.exe",
-                "msedge.exe",
-                "chromium.exe",
-            ]
-        else:
-            bundle_roots.extend([
-                Path("/usr/bin"),
-                Path("/usr/local/bin"),
-            ])
-            candidates = [
-                "google-chrome",
-                "chromium",
-                "chromium-browser",
-                "microsoft-edge",
-            ]
+        candidates = [
+            "chrome",
+            "chrome.exe",
+            "chromium",
+            "chromium.exe",
+            "chromium-browser",
+            "chromium-browser.exe",
+        ]
 
         for root in bundle_roots:
             candidate = _find_executable(root, candidates)
             if candidate is not None:
                 return candidate
-
-        if IS_WINDOWS:
-            fallback_candidates = [
-                Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe",
-                Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "Application" / "msedge.exe",
-            ]
-            return _find_first_existing(fallback_candidates)
 
         return None
 
@@ -5262,7 +5396,7 @@ class DashboardPage(QWidget):
     def _launch_browser_process(self, index: int) -> BrowserSessionHandle:
         binary = self._browser_binary()
         if binary is None:
-            raise RuntimeError("Google Chrome was not found in /Applications.")
+            raise RuntimeError("No bundled Chromium runtime was found for this app.")
 
         incognito = self.state.browser_mode == "Incognito"
         session_id = f"chrome-{QDateTime.currentMSecsSinceEpoch()}-{index}"
@@ -5502,16 +5636,7 @@ class DashboardPage(QWidget):
         return missing
 
     def _refresh_campaign_action_state(self) -> None:
-        can_start = self.state.logged_in and not self._campaign_missing_fields()
-        self.start_campaign_button.setEnabled(can_start)
-        self.sidebar_start_campaign_button.setEnabled(can_start)
-        if self._pending_campaign_payload:
-            total = len(self._pending_campaign_payload.get("recipients") or [])
-            sent = 0 if self.progress_bar.value() <= 0 else int(round((self.progress_bar.value() / 100) * total))
-            remaining = max(total - sent, 0)
-            self.campaign_progress_text.setText(f"{sent} / {total} sent • {remaining} remaining")
-        else:
-            self.campaign_progress_text.setText("0 / 0 sent")
+        self._update_campaign_action_state()
 
     def _reset_campaign_form_state(self, confirm: bool = True) -> None:
         if confirm:
@@ -5527,9 +5652,14 @@ class DashboardPage(QWidget):
 
         self._workspace_loading = True
         try:
+            if self._campaign_active:
+                self._handle_campaign_cancel()
             self._pending_campaign_payload = None
             self.progress_bar.setValue(0)
             self.campaign_progress_text.setText("0 / 0 sent")
+            self._campaign_send_log_entries.clear()
+            self._campaign_total = 0
+            self._campaign_completed = 0
             self._delete_campaign_workspace_state()
             self._clear_pending_emails()
             self.subject_drafts_list.blockSignals(True)
@@ -5602,6 +5732,314 @@ class DashboardPage(QWidget):
         self._cleanup_browser_profile_dir(session.profile_dir)
         self._log_action(f"Closed browser window {session.title}")
         self.notify(f"Closed {session.title}")
+
+    def _append_campaign_send_log(self, message: str) -> None:
+        self._campaign_send_log_entries.append(message)
+        self._refresh_activity()
+
+    def _update_campaign_action_state(self) -> None:
+        can_start = self.state.logged_in and not self._campaign_active and not self._campaign_missing_fields()
+        primary_label = "Start Campaign"
+        if self._campaign_active:
+            primary_label = "Resume Campaign" if self._campaign_paused else "Pause Campaign"
+        for button in (self.start_campaign_button, self.sidebar_start_campaign_button):
+            button.setText(primary_label)
+            button.setEnabled(can_start if not self._campaign_active else True)
+        self.campaign_pause_button.setVisible(self._campaign_active)
+        self.campaign_pause_button.setEnabled(self._campaign_active)
+        self.campaign_pause_button.setText("Resume Campaign" if self._campaign_paused else "Pause Campaign")
+        self.campaign_cancel_button.setVisible(self._campaign_active)
+        self.campaign_cancel_button.setEnabled(self._campaign_active)
+        if self._campaign_total:
+            remaining = max(self._campaign_total - self._campaign_completed, 0)
+            self.campaign_progress_text.setText(f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining")
+        else:
+            self.campaign_progress_text.setText("0 / 0 sent")
+
+    def _chunk_campaign_recipients(self, recipients: list[str], window_count: int, sender_limit: int) -> list[list[str]]:
+        if not recipients or window_count <= 0:
+            return []
+        total = len(recipients)
+        if total > window_count * sender_limit:
+            raise RuntimeError(
+                f"{total} recipient(s) exceed the current window capacity of {window_count * sender_limit}. "
+                f"Increase browser windows or lower the recipient count."
+            )
+        chunks: list[list[str]] = []
+        index = 0
+        base, remainder = divmod(total, window_count)
+        for window_index in range(window_count):
+            size = base + (1 if window_index < remainder else 0)
+            if size <= 0:
+                continue
+            next_index = min(total, index + min(size, sender_limit))
+            chunks.append(recipients[index:next_index])
+            index = next_index
+        if index < total:
+            chunks[-1].extend(recipients[index:])
+        return chunks
+
+    def _build_campaign_jobs(
+        self,
+        sessions: list[BrowserSessionHandle],
+        recipients: list[str],
+        subject_template: str,
+        body_template: str,
+        attachment_html: str,
+        attachment_formats: list[str],
+        file_name_mode: str,
+        file_name_value: str,
+    ) -> list[dict[str, object]]:
+        chunks = self._chunk_campaign_recipients(
+            recipients,
+            len(sessions),
+            max(1, int(getattr(self.state, "sender_limit", 300))),
+        )
+        jobs: list[dict[str, object]] = []
+        for index, (session, chunk) in enumerate(zip(sessions, chunks), start=1):
+            tasks: list[dict[str, str]] = []
+            window_label = f"Window {index}"
+            for recipient in chunk:
+                tag_values = self._dynamic_tag_values()
+                subject = self._apply_tags_to_text(subject_template, recipient, tag_values=tag_values)
+                body_text = self._apply_tags_to_text(body_template, recipient, subject, tag_values=tag_values)
+                attachment_text = self._apply_tags_to_text(attachment_html, recipient, subject, tag_values=tag_values)
+                file_name_text = self._apply_tags_to_text(file_name_value, recipient, subject, tag_values=tag_values)
+                tasks.append(
+                    {
+                        "recipient": recipient,
+                        "subject": subject,
+                        "body_text": body_text,
+                        "attachment_html": attachment_text,
+                        "attachment_format": attachment_formats[0] if attachment_formats else self.attach_format_value,
+                        "file_name_value": file_name_text,
+                    }
+                )
+            jobs.append(
+                {
+                    "session": session,
+                    "window_label": window_label,
+                    "tasks": tasks,
+                }
+            )
+        return jobs
+
+    def _queue_campaign_job(self, job: dict[str, object]) -> None:
+        thread = QThread(self)
+        worker = CampaignSendWorker(
+            job["session"],
+            job["tasks"],
+            self._campaign_pause_event,
+            self._campaign_cancel_event,
+            self._send_compose_with_playwright,
+            window_label=str(job["window_label"]),
+            delay_mode=getattr(self.state, "delay_type", "Random range"),
+            delay_from=float(getattr(self.state, "delay_from", 0.5)),
+            delay_to=float(getattr(self.state, "delay_to", 1.0)),
+            retry_count=int(getattr(self.state, "retry_count", 3)),
+            retry_enabled=bool(getattr(self.state, "retry_enabled", True)),
+            convert_enabled=bool(self.attach_convert_checkbox.isChecked()),
+            attachment_formats=self._normalize_attachment_format_values(
+                self._pending_campaign_payload.get("attachment_formats")
+                or self._pending_campaign_payload.get("attachment_format")
+                or self.attach_format_value
+            ),
+            file_name_mode=str(self._pending_campaign_payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto"),
+            window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._append_campaign_send_log)
+        worker.progress.connect(self._on_campaign_worker_progress)
+        worker.finished.connect(self._on_campaign_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self._campaign_threads.append(thread)
+        self._campaign_workers[str(job["session"].session_id)] = worker
+        thread.start()
+
+    def _start_next_campaign_worker(self) -> None:
+        if self._campaign_cancel_event.is_set() or self._campaign_paused:
+            return
+        if not self._campaign_worker_queue:
+            return
+        job = self._campaign_worker_queue.pop(0)
+        self._queue_campaign_job(job)
+
+    def _on_campaign_worker_progress(self, session_id: str, window_label: str, completed: int, total: int) -> None:
+        self._campaign_worker_progress[session_id] = completed
+        self._campaign_worker_totals[session_id] = total
+        self._campaign_completed = sum(self._campaign_worker_progress.values())
+        remaining = max(self._campaign_total - self._campaign_completed, 0)
+        self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
+        self.campaign_progress_text.setText(f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining")
+
+    def _finish_campaign_runtime(self, message: str | None = None, *, cancelled: bool = False) -> None:
+        self._campaign_active = False
+        self._campaign_paused = False
+        self._campaign_cancel_event.clear()
+        self._campaign_pause_event.clear()
+        self._campaign_threads.clear()
+        self._campaign_workers.clear()
+        self._campaign_worker_queue.clear()
+        self._campaign_worker_progress.clear()
+        self._campaign_worker_totals.clear()
+        if cancelled:
+            self.notify("Campaign cancelled")
+            self._log_action("Campaign cancelled")
+        elif message:
+            self.notify(message)
+        self._pending_campaign_payload = None
+        self._update_campaign_action_state()
+
+    def _on_campaign_worker_finished(
+        self,
+        session_id: str,
+        window_label: str,
+        cancelled: bool,
+        completed: int,
+        total: int,
+        error_message: str,
+    ) -> None:
+        self._campaign_workers.pop(session_id, None)
+        self._campaign_worker_progress[session_id] = completed
+        self._campaign_worker_totals[session_id] = total
+        self._campaign_completed = sum(self._campaign_worker_progress.values())
+        self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
+        if error_message:
+            self._log_action(f"{window_label} finished with an error: {error_message}")
+        if self._campaign_cancel_event.is_set() or cancelled:
+            if not self._campaign_workers:
+                self._finish_campaign_runtime(cancelled=True)
+            return
+        if self.state.window_send_mode == "Sequential" and self._campaign_worker_queue and not self._campaign_paused:
+            self._start_next_campaign_worker()
+        elif not self._campaign_workers and not self._campaign_worker_queue:
+            self._append_campaign_send_log(f"[{QDateTime.currentDateTime().toString('hh:mm:ss')}] Campaign complete")
+            self._finish_campaign_runtime(message=f"Sent {self._campaign_completed} email(s)")
+
+    def _handle_campaign_primary_action(self) -> None:
+        if self._campaign_active:
+            self._handle_campaign_pause_resume()
+            return
+        self._start_blast()
+
+    def _handle_campaign_pause_resume(self) -> None:
+        if not self._campaign_active:
+            return
+        if self._campaign_paused:
+            self._campaign_paused = False
+            self._campaign_pause_event.set()
+            self._update_campaign_action_state()
+            self._log_action("Campaign resumed")
+            if self.state.window_send_mode == "Sequential" and not self._campaign_workers and self._campaign_worker_queue:
+                self._start_next_campaign_worker()
+            return
+        self._campaign_paused = True
+        self._campaign_pause_event.clear()
+        self._update_campaign_action_state()
+        self._log_action("Campaign paused")
+
+    def _handle_campaign_cancel(self) -> None:
+        if not self._campaign_active:
+            return
+        self._campaign_cancel_event.set()
+        self._campaign_pause_event.set()
+        self._campaign_worker_queue.clear()
+        self._update_campaign_action_state()
+        self._log_action("Campaign cancel requested")
+
+    def _begin_campaign_send(self, payload: dict[str, object]) -> None:
+        if self._campaign_active:
+            self.notify("Campaign is already running")
+            return
+
+        recipients_raw = payload.get("recipients") or []
+        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
+        if not recipients:
+            self.notify("Add customer emails before starting the campaign")
+            self._log_action("Campaign blocked: no recipients available")
+            return
+
+        subject_template = str(payload.get("subject") or "").strip()
+        body_template = self._campaign_body_text(str(payload.get("body_text") or ""), str(payload.get("body_html") or ""))
+        if not body_template:
+            self.notify("Add body content before starting the campaign")
+            self._log_action("Campaign blocked: no body content available")
+            return
+
+        attachment_html = str(payload.get("attachment_html") or "").strip()
+        attachment_formats = self._normalize_attachment_format_values(
+            payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document"
+        )
+        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
+        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
+
+        if not self._browser_sessions:
+            self.notify("Open browser windows first")
+            self._log_action("Campaign blocked: no browser windows available")
+            return
+
+        ordered_recipients = list(recipients)
+        if self.state.email_send_order == "Random shuffle":
+            random.shuffle(ordered_recipients)
+
+        sessions = [session for session in self._browser_sessions if session.debug_port is not None]
+        if not sessions:
+            self.notify("Browser windows are not ready yet")
+            self._log_action("Campaign blocked: browser sessions missing debug ports")
+            return
+
+        total = len(ordered_recipients)
+        window_count = min(len(sessions), total)
+        per_sender_limit = max(1, int(getattr(self.state, "sender_limit", 300)))
+        if total > window_count * per_sender_limit:
+            QMessageBox.warning(
+                self,
+                "Campaign capacity exceeded",
+                f"The campaign needs {total} sends, but {window_count} window(s) at {per_sender_limit} per sender can only handle {window_count * per_sender_limit}.",
+            )
+            self._log_action("Campaign blocked: sender capacity exceeded")
+            self.notify("Increase browser windows or lower the recipient count")
+            return
+
+        self._pending_campaign_payload = payload
+        self._campaign_send_log_entries.clear()
+        self._campaign_pause_event.set()
+        self._campaign_cancel_event.clear()
+        self._campaign_active = True
+        self._campaign_paused = False
+        self._campaign_total = total
+        self._campaign_completed = 0
+        self._campaign_worker_queue = []
+        self._campaign_worker_progress.clear()
+        self._campaign_worker_totals.clear()
+        self.progress_bar.setValue(0)
+        self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
+        self._update_campaign_action_state()
+
+        jobs = self._build_campaign_jobs(
+            sessions[:window_count],
+            ordered_recipients,
+            subject_template,
+            body_template,
+            attachment_html,
+            attachment_formats,
+            file_name_mode,
+            file_name_value,
+        )
+        self._campaign_worker_queue = list(jobs)
+        self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
+        self.notify("Sending campaign")
+
+        if self.state.window_send_mode == "Sequential":
+            self._start_next_campaign_worker()
+        else:
+            queue = list(self._campaign_worker_queue)
+            self._campaign_worker_queue.clear()
+            for job in queue:
+                self._queue_campaign_job(job)
 
     def _start_blast(self) -> None:
         if not self.state.logged_in:
@@ -5676,7 +6114,7 @@ class DashboardPage(QWidget):
         with sync_playwright() as playwright:
             binary = self._browser_binary()
             if binary is None:
-                raise RuntimeError("Google Chrome was not found in /Applications.")
+                raise RuntimeError("No bundled Chromium runtime was found for this app.")
             browser = playwright.chromium.launch(
                 headless=True,
                 executable_path=str(binary),
@@ -5846,14 +6284,23 @@ class DashboardPage(QWidget):
         format_value: str | list[str],
         file_name_mode: str,
         file_name_value: str,
+        convert_enabled: bool,
+        already_resolved: bool = False,
     ) -> list[Path]:
         temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
-        resolved_attachment_html = self._apply_tags_to_text(attachment_html, recipient, subject)
-        base_name = self._attachment_output_name_base(recipient, subject, str(format_value), file_name_mode, file_name_value)
+        resolved_attachment_html = attachment_html if already_resolved else self._apply_tags_to_text(attachment_html, recipient, subject)
+        base_name = self._attachment_output_name_base(
+            recipient,
+            subject,
+            str(format_value),
+            file_name_mode,
+            file_name_value,
+            resolve_tags=not already_resolved,
+        )
         jpg_path = temp_dir / f"{base_name}.jpg"
         self._render_html_to_jpg(resolved_attachment_html, jpg_path)
 
-        if not self.attach_convert_checkbox.isChecked():
+        if not convert_enabled:
             html_path = temp_dir / f"{base_name}.html"
             html_path.write_text(resolved_attachment_html or "<html><body></body></html>", encoding="utf-8")
             try:
@@ -5903,6 +6350,9 @@ class DashboardPage(QWidget):
         attachment_format: str | list[str],
         file_name_mode: str,
         file_name_value: str,
+        convert_enabled: bool,
+        already_resolved: bool = False,
+        log_steps: bool = True,
     ) -> None:
         attachment_paths = self._compose_attachment_paths(
             recipient,
@@ -5911,10 +6361,20 @@ class DashboardPage(QWidget):
             attachment_format,
             file_name_mode,
             file_name_value,
+            convert_enabled,
+            already_resolved=already_resolved,
         )
         try:
-            self._log_action(f"Preparing attachment file for {recipient}")
-            self._send_compose_with_playwright_attachment(session, recipient, subject, body_text, attachment_paths)
+            if log_steps:
+                self._log_action(f"Preparing attachment file for {recipient}")
+            self._send_compose_with_playwright_attachment(
+                session,
+                recipient,
+                subject,
+                body_text,
+                attachment_paths,
+                log_steps=log_steps,
+            )
         finally:
             try:
                 if attachment_paths:
@@ -5929,6 +6389,8 @@ class DashboardPage(QWidget):
         subject: str,
         body_text: str,
         attachment_paths: list[Path],
+        *,
+        log_steps: bool = True,
     ) -> None:
         try:
             with sync_playwright() as playwright:
@@ -5954,7 +6416,8 @@ class DashboardPage(QWidget):
                 page.set_default_navigation_timeout(15000)
                 self._gmail_page_from_session(page)
                 page.bring_to_front()
-                self._log_action("Gmail page ready")
+                if log_steps:
+                    self._log_action("Gmail page ready")
 
                 compose_clicked = False
                 try:
@@ -5969,7 +6432,8 @@ class DashboardPage(QWidget):
                         pass
                 if not compose_clicked:
                     raise RuntimeError("Unable to open Gmail compose window.")
-                self._log_action("Gmail compose opened")
+                if log_steps:
+                    self._log_action("Gmail compose opened")
 
                 recipient_box = page.locator(
                     'input[aria-label^="To"], input[aria-label*="To recipients"], input[name="to"]'
@@ -5977,32 +6441,37 @@ class DashboardPage(QWidget):
                 recipient_box.wait_for(state="visible", timeout=10000)
                 recipient_box.fill(recipient)
                 recipient_box.press("Enter")
-                self._log_action("Recipient entered")
+                if log_steps:
+                    self._log_action("Recipient entered")
 
                 subject_box = page.locator('input[name="subjectbox"], input[placeholder*="Subject"]').first
                 subject_box.wait_for(state="visible", timeout=10000)
                 subject_box.fill(subject)
-                self._log_action("Subject entered")
+                if log_steps:
+                    self._log_action("Subject entered")
 
                 body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
                 body_box.wait_for(state="visible", timeout=10000)
                 body_box.click()
                 body_box.fill(body_text)
-                self._log_action("Body entered")
+                if log_steps:
+                    self._log_action("Body entered")
 
                 attach_candidates = page.locator('input[type="file"]')
                 if attach_candidates.count() == 0:
                     attach_button = page.get_by_role("button", name=re.compile(r"Attach files", re.IGNORECASE))
                     attach_button.first.click(timeout=8000)
                     attach_candidates = page.locator('input[type="file"]')
-                self._log_action("Attachment picker ready")
+                if log_steps:
+                    self._log_action("Attachment picker ready")
                 files_to_attach = [str(path) for path in attachment_paths if path.exists()]
                 if not files_to_attach:
                     raise RuntimeError("No attachment files were generated.")
                 attach_candidates.last.set_input_files(files_to_attach)
-                self._log_action(
-                    "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
-                )
+                if log_steps:
+                    self._log_action(
+                        "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
+                    )
 
                 page.wait_for_timeout(1000)
                 send_button = page.locator('div[role="button"][aria-label^="Send"]')
@@ -6012,7 +6481,8 @@ class DashboardPage(QWidget):
                     send_button = page.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
                 send_button.first.click(timeout=10000)
                 page.wait_for_timeout(1500)
-                self._log_action(f"Gmail send completed for {recipient}")
+                if log_steps:
+                    self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(f"Gmail automation timed out: {exc}") from exc
 
@@ -6036,72 +6506,11 @@ class DashboardPage(QWidget):
             attachment_format,
             file_name_mode,
             file_name_value,
+            convert_enabled=True,
         )
 
     def _execute_campaign_send(self, payload: dict[str, object]) -> None:
-        recipients_raw = payload.get("recipients") or []
-        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
-        if not recipients:
-            self.notify("Add customer emails before starting the campaign")
-            self._log_action("Campaign blocked: no recipients available")
-            return
-
-        subject_template = str(payload.get("subject") or "").strip()
-        body_template = self._campaign_body_text(
-            str(payload.get("body_text") or ""),
-            str(payload.get("body_html") or ""),
-        )
-        if not body_template:
-            self.notify("Add body content before starting the campaign")
-            self._log_action("Campaign blocked: no body content available")
-            return
-
-        attachment_html = str(payload.get("attachment_html") or "").strip()
-        attachment_formats = self._normalize_attachment_format_values(payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document")
-        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
-        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
-
-        if not self._browser_sessions:
-            self.notify("Open browser windows first")
-            self._log_action("Campaign blocked: no browser windows available")
-            return
-
-        try:
-            total = len(recipients)
-            window_count = len(self._browser_sessions)
-            self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
-            self.notify("Sending campaign")
-            self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
-            for index, recipient in enumerate(recipients, start=1):
-                window_index = ((index - 1) % window_count) + 1
-                session = self._browser_sessions[window_index - 1]
-                if session.debug_port is None:
-                    raise RuntimeError("Browser session is missing a Playwright connection port.")
-                subject = self._apply_tags_to_text(subject_template, recipient)
-                body_text = self._apply_tags_to_text(body_template, recipient)
-                self._log_action(f"Sending campaign email {index}/{total} to {recipient}")
-                self._send_compose_with_playwright(
-                    session,
-                    recipient,
-                    subject,
-                    body_text,
-                    attachment_html,
-                    attachment_formats,
-                    file_name_mode,
-                    file_name_value,
-                )
-                self.progress_bar.setValue(int((index / total) * 100))
-                remaining = max(total - index, 0)
-                self.campaign_progress_text.setText(f"{index} / {total} sent • {remaining} remaining")
-                self._log_action(f"Sent campaign email {index}/{total} to {recipient}")
-
-            self._log_action(f"Campaign send completed: {total} recipient(s)")
-            self.notify(f"Sent {total} email(s)")
-        except Exception as exc:
-            self._log_action(f"Campaign send failed: {exc}")
-            self.notify("Campaign send failed")
-        finally:
-            self._pending_campaign_payload = None
+        self._begin_campaign_send(payload)
 
     def _show_launch_loader(self, title: str, subtitle: str) -> None:
         self.window().show_launch_loader(title, subtitle)
@@ -7546,12 +7955,14 @@ class DashboardPage(QWidget):
     def _refresh_activity(self) -> None:
         if not self.state.activity_log:
             self.activity_log_view.setPlainText("[--:--:--] No activity yet.")
-            self.send_log_view.setPlainText("[--:--:--] No send events yet.")
-            return
+        else:
+            lines = "\n".join(self.state.activity_log[-30:][::-1])
+            self.activity_log_view.setPlainText(lines)
 
-        lines = "\n".join(self.state.activity_log[-30:][::-1])
-        self.activity_log_view.setPlainText(lines)
-        self.send_log_view.setPlainText(lines)
+        if not self._campaign_send_log_entries:
+            self.send_log_view.setPlainText("[--:--:--] No send events yet.")
+        else:
+            self.send_log_view.setPlainText("\n".join(self._campaign_send_log_entries[-80:]))
 
     def _refresh_controls(self) -> None:
         self.incognito_button.setChecked(self.state.browser_mode == "Incognito")
@@ -7747,7 +8158,7 @@ class MainWindow(QMainWindow):
             self.launch_loader.close()
 
     def _start_windows_browser_bootstrap(self) -> None:
-        if self._browser_bootstrap_running or not IS_WINDOWS:
+        if self._browser_bootstrap_running:
             return
         if self._browser_binary() is not None:
             return
@@ -7788,13 +8199,13 @@ class MainWindow(QMainWindow):
             return
 
         warning_message = message or "Unable to auto-configure the browser runtime."
-        print(f"Windows browser bootstrap failed: {warning_message}")
+        print(f"Browser runtime bootstrap failed: {warning_message}")
         self.show_toast("Browser runtime setup needs attention", "warning")
         QMessageBox.warning(
             self,
             "Browser runtime setup",
             "The app could not auto-configure the browser runtime on this device.\n\n"
-            "The login screen is still available, but campaign browser automation may require a local Chrome/Chromium installation.",
+            "The login screen is still available, but campaign browser automation may require the bundled Chromium runtime to finish downloading.",
         )
 
     def changeEvent(self, event) -> None:
@@ -8384,6 +8795,7 @@ class MainWindow(QMainWindow):
             self.dashboard_page._log_action("User signed out")
         self.hide_launch_loader()
         try:
+            self.dashboard_page._handle_campaign_cancel()
             self.dashboard_page._persist_sending_settings_state()
         except Exception:
             pass
@@ -8400,6 +8812,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         try:
             if hasattr(self, "dashboard_page"):
+                self.dashboard_page._handle_campaign_cancel()
                 self.dashboard_page._persist_subject_body_state()
                 self.dashboard_page._persist_attachment_state()
                 self.dashboard_page._persist_sending_settings_state()
