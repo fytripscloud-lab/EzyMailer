@@ -923,7 +923,7 @@ class AppState:
     ai_api_key: str = ""
     ai_model: str = ""
     ai_connected: bool = False
-    sender_limit: int = 500
+    sender_limit: int = 300
     delay_from: float = 0.5
     delay_to: float = 1.0
     retry_count: int = 3
@@ -2225,6 +2225,7 @@ class FileFormatDialog(QDialog):
         self.custom_name: QRadioButton | None = None
         self.custom_name_input: QLineEdit | None = None
         self.file_extension_label: QLabel | None = None
+        self._selected_formats_cache: list[str] = []
         self._build_ui()
         self._apply_initial_selection()
         self._wire_exclusive_selection()
@@ -2293,8 +2294,8 @@ class FileFormatDialog(QDialog):
         custom_row.setContentsMargins(0, 0, 0, 0)
         custom_row.setSpacing(_scaled_int(8, self._scale))
         self.custom_name_input = QLineEdit()
-        self.custom_name_input.setPlaceholderText("Enter file name or tags, e.g. report-{{first_name}}")
-        self.custom_name_input.setToolTip("Tags like $custom1, $name, and {{first_name}} are allowed")
+        self.custom_name_input.setPlaceholderText("Enter file name or tags, e.g. report-$subject-$name")
+        self.custom_name_input.setToolTip("Tags like $custom1, $subject, $name, and {{first_name}} are allowed")
         self.file_extension_label = QLabel(self._format_extension())
         custom_row.addWidget(self.custom_name)
         custom_row.addWidget(self.custom_name_input, 1)
@@ -2352,17 +2353,33 @@ class FileFormatDialog(QDialog):
         self._sync_file_name_controls()
 
     def selected_format(self) -> str:
-        if self._random_checkbox is not None and self._random_checkbox.isChecked():
+        formats = self.selected_formats()
+        if not formats and self._random_checkbox is not None and self._random_checkbox.isChecked():
             return "Random format"
+        if not formats:
+            return self._selected_format
+        if len(formats) == 1:
+            return formats[0]
+        return ", ".join(formats)
+
+    def selected_formats(self) -> list[str]:
+        if self._random_checkbox is not None and self._random_checkbox.isChecked():
+            return ["Random format"]
         selected = [button.text() for button in self._buttons if button.isChecked()]
         if selected:
-            if len(selected) == 1:
-                return selected[0]
-            return ", ".join(selected)
-        return self._selected_format
+            self._selected_formats_cache = list(selected)
+            return selected
+        if self._selected_formats_cache:
+            return list(self._selected_formats_cache)
+        current = (self._selected_format or "").strip()
+        if not current:
+            return []
+        return [part.strip() for part in current.split(",") if part.strip()]
 
     def _format_extension(self) -> str:
-        selected = [button.text() for button in self._buttons if button.isChecked()]
+        selected = self.selected_formats()
+        if not selected or selected == ["Random format"]:
+            return ".out"
         if len(selected) != 1:
             return ".out"
         mapping = {
@@ -2380,7 +2397,16 @@ class FileFormatDialog(QDialog):
         if self.custom_name_input is not None:
             self.custom_name_input.setEnabled(not auto_checked)
         if self.file_extension_label is not None:
-            self.file_extension_label.setText(self._format_extension())
+            selected = self.selected_formats()
+            if not selected:
+                label = ".out"
+            elif selected == ["Random format"]:
+                label = "Random"
+            elif len(selected) == 1:
+                label = self._format_extension()
+            else:
+                label = "Multiple"
+            self.file_extension_label.setText(label)
 
     def _apply_initial_file_name_selection(self) -> None:
         if self.auto_name is None or self.custom_name is None:
@@ -3318,7 +3344,7 @@ class DashboardPage(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
         self.sender_limit.setRange(1, 5000)
-        self.sender_limit.setValue(500)
+        self.sender_limit.setValue(300)
         self.sender_limit.setObjectName("windowSpin")
         self.sender_limit.setToolTip("Set the maximum emails per sender")
         self.delay_from.setDecimals(1)
@@ -3560,7 +3586,7 @@ class DashboardPage(QWidget):
             finally:
                 widget.blockSignals(False)
 
-        sender_limit = _as_int(payload.get("sender_limit"), 500)
+        sender_limit = _as_int(payload.get("sender_limit"), 300)
         delay_from = _as_float(payload.get("delay_from"), 0.5)
         delay_to = _as_float(payload.get("delay_to"), 1.0)
         retry_count = _as_int(payload.get("retry_count"), 3)
@@ -4598,11 +4624,12 @@ class DashboardPage(QWidget):
                 normalized[f"${key_text}"] = value_text
         return normalized
 
-    def _apply_tags_to_text(self, text: str, recipient: str = "") -> str:
+    def _apply_tags_to_text(self, text: str, recipient: str = "", subject: str = "") -> str:
         result = text or ""
         replacements = {
             "$custom1": self.custom1_input.text().strip(),
             "$custom2": self.custom2_input.text().strip(),
+            "$subject": subject.strip(),
         }
         replacements.update(self._dynamic_tag_values())
         replacements.update(self._recipient_tag_values(recipient))
@@ -4781,13 +4808,16 @@ class DashboardPage(QWidget):
             file_name_value=getattr(self, "attach_file_name_value", ""),
         )
         if dialog.exec() == QDialog.Accepted:
-            selected = self._normalize_attachment_format_value(dialog.selected_format())
-            self.attach_format_value = selected
+            selected_formats = self._normalize_attachment_format_values(dialog.selected_formats())
+            if dialog._random_checkbox is not None and dialog._random_checkbox.isChecked():
+                self.attach_format_value = "Random format"
+            else:
+                self.attach_format_value = ", ".join(selected_formats) if selected_formats else "PDF document"
             self.attach_file_name_mode = "custom" if dialog.uses_custom_file_name() else "auto"
             self.attach_file_name_value = dialog.custom_name_input.text().strip() if dialog.uses_custom_file_name() and dialog.custom_name_input is not None else ""
-            self.attach_format_label.setText(self._attachment_format_summary(selected))
-            self._log_action(f"Selected attachment format: {selected}")
-            self.notify(f"Format set to {selected}")
+            self.attach_format_label.setText(self._attachment_format_summary(self.attach_format_value))
+            self._log_action(f"Selected attachment format: {self.attach_format_value}")
+            self.notify(f"Format set to {self.attach_format_value}")
 
     def _sync_attachment_convert_controls(self, checked: bool) -> None:
         row_widget = getattr(self, "attach_format_row_widget", None)
@@ -4799,7 +4829,7 @@ class DashboardPage(QWidget):
         self.attach_choose_format_button.setEnabled(checked)
         self.attach_format_label.setEnabled(checked)
 
-    def _attachment_format_summary(self, selected: str) -> str:
+    def _attachment_format_summary(self, selected: str | list[str]) -> str:
         summary_map = {
             "PDF document": "PDF",
             "Excel spreadsheet (XLSX)": "XLSX",
@@ -4808,23 +4838,50 @@ class DashboardPage(QWidget):
             "PowerPoint slideshow (PPSX)": "PPSX",
             "Word document (DOCX)": "DOCX",
         }
-        selected = (selected or "").strip()
-        if not selected:
+        if isinstance(selected, list):
+            parts = [str(item).strip() for item in selected if str(item).strip()]
+        else:
+            selected = (selected or "").strip()
+            if not selected:
+                return "PDF"
+            if selected == "Random format":
+                return "Random"
+            parts = [part.strip() for part in selected.split(",") if part.strip()]
+        if not parts:
             return "PDF"
-        if selected == "Random format":
-            return "Random"
-        parts = [part.strip() for part in selected.split(",") if part.strip()]
+        if len(parts) == 1:
+            return summary_map.get(parts[0], parts[0])
         short_parts = [summary_map.get(part, part) for part in parts]
-        return ", ".join(short_parts)
+        return f"Multiple: {', '.join(short_parts)}"
+
+    def _normalize_attachment_format_values(self, selected: str | list[str] | tuple[str, ...]) -> list[str]:
+        if isinstance(selected, (list, tuple)):
+            parts = [str(item).strip() for item in selected if str(item).strip()]
+        else:
+            selected = (selected or "").strip()
+            if not selected:
+                return ["PDF document"]
+            if selected == "Random format":
+                return ["Random format"]
+            parts = [part.strip() for part in selected.split(",") if part.strip()]
+        mapping = {
+            "PDF document": "PDF document",
+            "Excel spreadsheet (XLSX)": "Excel spreadsheet (XLSX)",
+            "Excel template (XLTX)": "Excel template (XLTX)",
+            "PowerPoint presentation (PPTX)": "PowerPoint presentation (PPTX)",
+            "PowerPoint slideshow (PPSX)": "PowerPoint slideshow (PPSX)",
+            "Word document (DOCX)": "Word document (DOCX)",
+        }
+        normalized = [mapping.get(part, part) for part in parts if mapping.get(part, part)]
+        return normalized or ["PDF document"]
 
     def _normalize_attachment_format_value(self, selected: str) -> str:
-        selected = (selected or "").strip()
-        if not selected or selected == "Random format":
+        normalized = self._normalize_attachment_format_values(selected)
+        if not normalized:
             return "PDF document"
-        parts = [part.strip() for part in selected.split(",") if part.strip()]
-        if not parts:
-            return "PDF document"
-        return parts[0]
+        if normalized == ["Random format"]:
+            return "Random format"
+        return normalized[0]
 
     def _attachment_format_extension(self, format_value: str) -> str:
         format_value = self._normalize_attachment_format_value(format_value)
@@ -4839,12 +4896,15 @@ class DashboardPage(QWidget):
         return mapping.get(format_value, ".out")
 
     def _attachment_default_name_base(self, recipient: str, subject: str) -> str:
-        bits = [subject.strip() or "attachment"]
-        recipient_name = recipient.split("@", 1)[0].strip() if recipient else ""
-        if recipient_name:
-            bits.append(recipient_name)
-        bits.append(time.strftime("%Y%m%d-%H%M%S"))
-        return self._sanitize_filename("-".join(bits)) or "attachment"
+        alphabet = string.ascii_uppercase + string.digits
+        target_length = secrets.randbelow(9) + 8
+        segments = min(max(secrets.randbelow(3) + 2, 2), max(target_length // 2, 2))
+        lengths = [2] * segments
+        remaining = target_length - (2 * segments)
+        for _ in range(remaining):
+            lengths[secrets.randbelow(segments)] += 1
+        parts = ["".join(secrets.choice(alphabet) for _ in range(length)) for length in lengths]
+        return "-".join(parts)
 
     def _attachment_output_name_base(
         self,
@@ -4856,7 +4916,7 @@ class DashboardPage(QWidget):
     ) -> str:
         default_base = self._attachment_default_name_base(recipient, subject)
         if str(file_name_mode or "").strip().lower() == "custom":
-            custom = self._sanitize_filename(self._apply_tags_to_text(file_name_value or "", recipient))
+            custom = self._sanitize_filename(self._apply_tags_to_text(file_name_value or "", recipient, subject))
             if custom:
                 return custom
         return default_base
@@ -5422,6 +5482,7 @@ class DashboardPage(QWidget):
             "body_html": body_html,
             "attachment_html": attachment_html,
             "attachment_format": self.attach_format_value,
+            "attachment_formats": self._normalize_attachment_format_values(self.attach_format_value),
             "attachment_file_name_mode": self.attach_file_name_mode,
             "attachment_file_name_value": self.attach_file_name_value,
         }
@@ -5777,19 +5838,19 @@ class DashboardPage(QWidget):
 
         raise RuntimeError(f"Unsupported attachment format: {format_value or 'unknown'}")
 
-    def _compose_attachment_path(
+    def _compose_attachment_paths(
         self,
         recipient: str,
         subject: str,
         attachment_html: str,
-        format_value: str,
+        format_value: str | list[str],
         file_name_mode: str,
         file_name_value: str,
-    ) -> Path:
+    ) -> list[Path]:
         temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
-        base_name = self._attachment_output_name_base(recipient, subject, format_value, file_name_mode, file_name_value)
+        resolved_attachment_html = self._apply_tags_to_text(attachment_html, recipient, subject)
+        base_name = self._attachment_output_name_base(recipient, subject, str(format_value), file_name_mode, file_name_value)
         jpg_path = temp_dir / f"{base_name}.jpg"
-        resolved_attachment_html = self._apply_tags_to_text(attachment_html, recipient)
         self._render_html_to_jpg(resolved_attachment_html, jpg_path)
 
         if not self.attach_convert_checkbox.isChecked():
@@ -5799,12 +5860,28 @@ class DashboardPage(QWidget):
                 jpg_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            return html_path
+            return [html_path]
 
-        extension = self._attachment_format_extension(format_value)
-        final_path = temp_dir / f"{base_name}{extension}"
-        self._export_jpg_to_format(jpg_path, format_value, final_path)
-        return final_path
+        raw_formats = [str(item).strip() for item in format_value] if isinstance(format_value, list) else [str(format_value or "").strip()]
+        if any(item == "Random format" for item in raw_formats):
+            format_values = [secrets.choice([
+                "PDF document",
+                "Excel spreadsheet (XLSX)",
+                "Excel template (XLTX)",
+                "PowerPoint presentation (PPTX)",
+                "PowerPoint slideshow (PPSX)",
+                "Word document (DOCX)",
+            ])]
+        else:
+            format_values = self._normalize_attachment_format_values(format_value)
+
+        final_paths: list[Path] = []
+        for selected_format in format_values:
+            extension = self._attachment_format_extension(selected_format)
+            final_path = temp_dir / f"{base_name}{extension}"
+            self._export_jpg_to_format(jpg_path, selected_format, final_path)
+            final_paths.append(final_path)
+        return final_paths
 
     def _sanitize_filename(self, value: str) -> str:
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip("-_.")
@@ -5823,11 +5900,11 @@ class DashboardPage(QWidget):
         subject: str,
         body_text: str,
         attachment_html: str,
-        attachment_format: str,
+        attachment_format: str | list[str],
         file_name_mode: str,
         file_name_value: str,
     ) -> None:
-        attachment_path = self._compose_attachment_path(
+        attachment_paths = self._compose_attachment_paths(
             recipient,
             subject,
             attachment_html,
@@ -5837,10 +5914,11 @@ class DashboardPage(QWidget):
         )
         try:
             self._log_action(f"Preparing attachment file for {recipient}")
-            self._send_compose_with_playwright_attachment(session, recipient, subject, body_text, attachment_path)
+            self._send_compose_with_playwright_attachment(session, recipient, subject, body_text, attachment_paths)
         finally:
             try:
-                shutil.rmtree(attachment_path.parent, ignore_errors=True)
+                if attachment_paths:
+                    shutil.rmtree(attachment_paths[0].parent, ignore_errors=True)
             except Exception:
                 pass
 
@@ -5850,7 +5928,7 @@ class DashboardPage(QWidget):
         recipient: str,
         subject: str,
         body_text: str,
-        attachment_path: Path,
+        attachment_paths: list[Path],
     ) -> None:
         try:
             with sync_playwright() as playwright:
@@ -5918,8 +5996,13 @@ class DashboardPage(QWidget):
                     attach_button.first.click(timeout=8000)
                     attach_candidates = page.locator('input[type="file"]')
                 self._log_action("Attachment picker ready")
-                attach_candidates.last.set_input_files(str(attachment_path))
-                self._log_action(f"Attachment selected: {attachment_path.name}")
+                files_to_attach = [str(path) for path in attachment_paths if path.exists()]
+                if not files_to_attach:
+                    raise RuntimeError("No attachment files were generated.")
+                attach_candidates.last.set_input_files(files_to_attach)
+                self._log_action(
+                    "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
+                )
 
                 page.wait_for_timeout(1000)
                 send_button = page.locator('div[role="button"][aria-label^="Send"]')
@@ -5940,7 +6023,7 @@ class DashboardPage(QWidget):
         subject: str,
         body_text: str,
         attachment_html: str,
-        attachment_format: str,
+        attachment_format: str | list[str],
         file_name_mode: str,
         file_name_value: str,
     ) -> None:
@@ -5974,7 +6057,7 @@ class DashboardPage(QWidget):
             return
 
         attachment_html = str(payload.get("attachment_html") or "").strip()
-        attachment_format = self._normalize_attachment_format_value(str(payload.get("attachment_format") or self.attach_format_value or "PDF document"))
+        attachment_formats = self._normalize_attachment_format_values(payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document")
         file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
         file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
 
@@ -6003,7 +6086,7 @@ class DashboardPage(QWidget):
                     subject,
                     body_text,
                     attachment_html,
-                    attachment_format,
+                    attachment_formats,
                     file_name_mode,
                     file_name_value,
                 )
@@ -7476,7 +7559,7 @@ class DashboardPage(QWidget):
         self.normal_message_button.setChecked(self.state.body_mode == "Normal Message")
         self.html_message_button.setChecked(self.state.body_mode == "HTML Message")
         self.sender_limit.blockSignals(True)
-        self.sender_limit.setValue(int(getattr(self.state, "sender_limit", 500)))
+        self.sender_limit.setValue(int(getattr(self.state, "sender_limit", 300)))
         self.sender_limit.blockSignals(False)
         self.delay_from.blockSignals(True)
         self.delay_from.setValue(float(getattr(self.state, "delay_from", 0.5)))
