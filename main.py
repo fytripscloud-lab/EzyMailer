@@ -57,7 +57,7 @@ from PySide6.QtCore import (
     QPoint,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence, QGuiApplication, QClipboard
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -1172,7 +1172,7 @@ class TitleBar(QWidget):
 
         brand = QHBoxLayout()
         brand.setSpacing(_scaled_int(6, self._scale))
-        title = QLabel("EzyMailer")
+        title = QLabel("EazyMailer")
         title.setObjectName("brandTitle")
         title.setStyleSheet("font-weight: 800;")
         brand.addWidget(title)
@@ -2563,9 +2563,9 @@ class LoginPage(QWidget):
 
         title_block = QVBoxLayout()
         title_block.setSpacing(0)
-        brand = QLabel("EzyMailer")
+        brand = QLabel("EazyMailer")
         brand.setObjectName("loginAppName")
-        kicker = QLabel("Desktop email automation workspace")
+        kicker = QLabel("AI Automation Workspace")
         kicker.setObjectName("loginKicker")
         title_block.addWidget(brand)
         title_block.addWidget(kicker)
@@ -2578,7 +2578,7 @@ class LoginPage(QWidget):
         intro.setObjectName("loginTitle")
         intro.setAlignment(Qt.AlignCenter)
 
-        subtitle = QLabel("Admin and user access.")
+        subtitle = QLabel("Secure sign in.")
         subtitle.setObjectName("loginSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
@@ -2788,6 +2788,7 @@ class DashboardPage(QWidget):
         self.active_windows_value = QLabel("0")
         self.campaign_progress_text = QLabel("0 / 0 sent")
         self.start_campaign_button = QPushButton("Start Campaign")
+        self.sidebar_start_campaign_button = QPushButton("Start Campaign")
         self.campaign_reset_all_button = QPushButton("Reset All")
         self.launch_preset_label = QLabel("Default")
         self.custom1_input = QLineEdit()
@@ -3036,16 +3037,15 @@ class DashboardPage(QWidget):
         self.activity_log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         activity_layout.addWidget(self.activity_log_view)
 
-        blast_button = QPushButton("Start Campaign")
-        blast_button.setObjectName("blastButton")
-        blast_button.clicked.connect(lambda: self._start_blast())
-        blast_button.setToolTip("Start the main send workflow")
+        self.sidebar_start_campaign_button.setObjectName("blastButton")
+        self.sidebar_start_campaign_button.clicked.connect(lambda: self._start_blast())
+        self.sidebar_start_campaign_button.setToolTip("Start the main send workflow")
 
         layout.addWidget(launch_card)
         layout.addWidget(mode_card)
         layout.addWidget(sessions_card, 2)
         layout.addWidget(activity_card, 2)
-        layout.addWidget(blast_button)
+        layout.addWidget(self.sidebar_start_campaign_button)
 
         return sidebar
 
@@ -3093,6 +3093,7 @@ class DashboardPage(QWidget):
         self.pending_emails_editor.setToolTip("Paste recipient email addresses, one per line")
         self.pending_emails_editor.installEventFilter(self)
         self.pending_emails_editor.textChanged.connect(self._schedule_pending_emails_save)
+        self.pending_emails_editor.textChanged.connect(self._refresh_pending_email_summary)
         page_layout.addWidget(self.pending_emails_editor, 1)
 
         filter_card, filter_layout = self._card(
@@ -3129,7 +3130,7 @@ class DashboardPage(QWidget):
         filter_layout.addLayout(actions_row)
 
         counts_row = QHBoxLayout()
-        for label_text in ("Total", "Valid", "Invalid", "Duplicates"):
+        for label_text in ("Total", "Valid", "Filter Count", "Duplicates"):
             value = QLabel("0")
             value.setObjectName("countValue")
             self.data_summary_labels[label_text.lower()] = value
@@ -3757,7 +3758,7 @@ class DashboardPage(QWidget):
         layout = QVBoxLayout(page)
         layout.setSpacing(_scaled_int(10, self._scale))
 
-        header = self._section_title("EMAIL BLASTING CONTROLS", "Send emails from all open Gmail windows.")
+        header = self._section_title("CAMPAIGN SENDING CONTROL", "Send emails from all open Gmail windows.")
         layout.addWidget(header)
 
         controls_card, controls_layout = self._card("Active Gmail Windows")
@@ -4206,7 +4207,10 @@ class DashboardPage(QWidget):
         layout = QVBoxLayout(page)
         layout.setSpacing(_scaled_int(10, self._scale))
 
-        header = self._section_title("DYNAMIC TAGS", "Use these tags in Subject or Body. They generate random values when sending.")
+        header = self._section_title(
+            "DYNAMIC TAGS",
+            "Use these tags in Subject, Body, attachment HTML, and custom file names. They generate random values when sending.",
+        )
         layout.addWidget(header)
 
         grid_card, grid_layout = self._card("", None)
@@ -4264,62 +4268,8 @@ class DashboardPage(QWidget):
         manual_layout.addWidget(self._line_with_copy(self.custom1_input))
         manual_layout.addWidget(self._line_with_copy(self.custom2_input))
         layout.addWidget(manual_card)
-
-        variables_card, variables_layout = self._card(
-            "CUSTOMER VARIABLES",
-            "Store per-customer values that can be used in Subject, Body, Attachment Content, and File Name.",
-        )
-        variables_form = QFormLayout()
-        variables_form.setLabelAlignment(Qt.AlignLeft)
-        self.customer_email_input.setPlaceholderText("customer@email.com")
-        self.customer_variable_key_input.setPlaceholderText("first_name")
-        self.customer_variable_value_input.setPlaceholderText("John")
-        self.customer_email_input.setToolTip("Email key used to look up variables for a customer")
-        self.customer_variable_key_input.setToolTip("Variable name such as first_name or company")
-        self.customer_variable_value_input.setToolTip("Variable value used when replacing tags")
-        variables_form.addRow("Email", self.customer_email_input)
-        variables_form.addRow("Variable", self.customer_variable_key_input)
-        variables_form.addRow("Value", self.customer_variable_value_input)
-        variables_layout.addLayout(variables_form)
-
-        variables_actions = QHBoxLayout()
-        self.customer_variables_save_button.setObjectName("primaryButton")
-        self.customer_variables_delete_button.setObjectName("dangerButton")
-        self.customer_variables_refresh_button.setObjectName("secondaryButton")
-        self.customer_variables_clear_button.setObjectName("secondaryButton")
-        self.customer_variables_save_button.setToolTip("Save or update the selected customer variable")
-        self.customer_variables_delete_button.setToolTip("Delete the selected customer variable")
-        self.customer_variables_refresh_button.setToolTip("Reload variables from local storage and API")
-        self.customer_variables_clear_button.setToolTip("Clear the editor fields")
-        self.customer_variables_save_button.clicked.connect(self._persist_customer_variable_record)
-        self.customer_variables_delete_button.clicked.connect(self._delete_selected_customer_variable_record)
-        self.customer_variables_refresh_button.clicked.connect(self._load_customer_variables_state)
-        self.customer_variables_clear_button.clicked.connect(self._clear_customer_variable_form)
-        variables_actions.addWidget(self.customer_variables_save_button)
-        variables_actions.addWidget(self.customer_variables_delete_button)
-        variables_actions.addWidget(self.customer_variables_refresh_button)
-        variables_actions.addWidget(self.customer_variables_clear_button)
-        variables_actions.addStretch()
-        variables_layout.addLayout(variables_actions)
-
-        self.customer_variables_table.setObjectName("subjectTable")
-        self.customer_variables_table.setColumnCount(3)
-        self.customer_variables_table.setHorizontalHeaderLabels(["Email", "Variable", "Value"])
-        self.customer_variables_table.verticalHeader().setVisible(False)
-        self.customer_variables_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.customer_variables_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.customer_variables_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.customer_variables_table.horizontalHeader().setStretchLastSection(True)
-        self.customer_variables_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.customer_variables_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.customer_variables_table.itemSelectionChanged.connect(self._populate_customer_variable_form_from_selection)
-        self.customer_variables_table.setMinimumHeight(_scaled_int(240, self._scale))
-        variables_layout.addWidget(self.customer_variables_table, 1)
-        layout.addWidget(variables_card, 1)
-        layout.addStretch()
-
         self._load_tags_state()
-        self._load_customer_variables_state()
+        layout.addStretch()
         return self._tab_scroll(page)
 
     def _default_tag_definitions(self) -> list[dict[str, str]]:
@@ -4381,20 +4331,45 @@ class DashboardPage(QWidget):
         line_edit.setObjectName("searchInput")
         copy_button = QPushButton("Copy")
         copy_button.setObjectName("secondaryButton")
-        copy_button.clicked.connect(lambda: self._log_action("Copied custom tag value"))
+        token = line_edit.placeholderText().split("=", 1)[0].strip() or line_edit.text().strip()
+        copy_button.clicked.connect(lambda _checked=False, token=token: self._copy_to_clipboard(token, "custom tag"))
         line_edit.setToolTip("Edit the manual custom tag value")
-        copy_button.setToolTip("Copy the manual custom tag value")
+        copy_button.setToolTip("Copy the manual custom tag token")
         row_layout.addWidget(line_edit, 1)
         row_layout.addWidget(copy_button)
         return row
+
+    def _copy_to_clipboard(self, text: str, label: str = "text") -> None:
+        token = str(text or "").strip()
+        if not token:
+            return
+        clipboard = QGuiApplication.clipboard()
+        try:
+            clipboard.clear(mode=QClipboard.Clipboard)
+        except Exception:
+            pass
+        clipboard.setText(token, mode=QClipboard.Clipboard)
+        try:
+            clipboard.setText(token)
+        except Exception:
+            pass
+        QApplication.processEvents()
+        self._log_action(f"Copied {label}: {token}")
+        self.notify(f"Copied {token}")
 
     def _tag_sample_values(self) -> dict[str, str]:
         values = dict(self.state.tag_samples or {})
         for definition in self._tag_definitions:
             token = definition["token"]
             if token not in values:
-                values[token] = definition["default_value"]
+                values[token] = self._generate_random_tag_value(token, definition["default_value"])
         return values
+
+    def _dynamic_tag_values(self) -> dict[str, str]:
+        return {
+            definition["token"]: self._generate_random_tag_value(definition["token"], definition["default_value"])
+            for definition in self._tag_definitions
+        }
 
     def _generate_random_tag_value(self, token: str, default_value: str) -> str:
         token = token.strip()
@@ -4433,7 +4408,7 @@ class DashboardPage(QWidget):
             return "".join(secrets.choice(string.digits) for _ in range(4))
         if token.startswith("$ym"):
             today = QDateTime.currentDateTime().date()
-            return f"{today.year()}{today.month():02d}"
+            return f"{today.year()}{secrets.randbelow(12) + 1:02d}"
         if token.startswith("$id"):
             return f"{''.join(secrets.choice(string.digits) for _ in range(2))}-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(2))}"
         if token == "$phone":
@@ -4545,12 +4520,12 @@ class DashboardPage(QWidget):
         payload = {
             "custom1": "",
             "custom2": "",
-            "samples": {definition["token"]: definition["default_value"] for definition in self._tag_definitions},
+            "samples": self._dynamic_tag_values(),
         }
         self._apply_tag_state(payload)
         self._persist_tags_state()
-        self._log_action("Reset tags to default")
-        self.notify("Tags reset to default")
+        self._log_action("Randomized tag values")
+        self.notify("Tags randomized")
 
     def _recipient_tag_values(self, recipient: str) -> dict[str, str]:
         recipient = (recipient or "").strip()
@@ -4629,7 +4604,7 @@ class DashboardPage(QWidget):
             "$custom1": self.custom1_input.text().strip(),
             "$custom2": self.custom2_input.text().strip(),
         }
-        replacements.update(self._tag_sample_values())
+        replacements.update(self._dynamic_tag_values())
         replacements.update(self._recipient_tag_values(recipient))
         replacements.update(self._customer_variable_values(recipient))
 
@@ -4996,19 +4971,13 @@ class DashboardPage(QWidget):
         row = QHBoxLayout()
         token_value = QLabel(value or token)
         token_value.setObjectName("sectionSubtitle")
-        remove_button = QPushButton("X")
-        remove_button.setObjectName("dangerButton")
-        remove_button.setFixedWidth(_scaled_int(36, self._scale))
         copy_button = QPushButton("Copy")
         copy_button.setObjectName("secondaryButton")
-        copy_button.clicked.connect(lambda: self._log_action(f"Copied tag {token}"))
-        remove_button.clicked.connect(lambda: self._log_action(f"Removed tag {token}"))
+        copy_button.clicked.connect(lambda _checked=False, token=token: self._copy_to_clipboard(token, "tag"))
         token_value.setToolTip(f"Token value for {token}")
-        remove_button.setToolTip(f"Remove {token} from the grid")
         copy_button.setToolTip(f"Copy {token} to clipboard")
         row.addWidget(token_value)
         row.addStretch()
-        row.addWidget(remove_button)
         row.addWidget(copy_button)
         layout.addLayout(row)
 
@@ -5435,7 +5404,7 @@ class DashboardPage(QWidget):
         self.notify("Workspace reset to defaults")
 
     def _current_campaign_payload(self) -> dict[str, object]:
-        recipients = self.state.pending_recipients if self.state.pending_emails_validated else []
+        recipients = self._extract_email_candidates(self.pending_emails_editor.toPlainText())
         subject = self.subject_input.text().strip()
         current_body = self._current_body_widget()
         body_text = ""
@@ -5461,7 +5430,7 @@ class DashboardPage(QWidget):
         payload = payload or self._current_campaign_payload()
         missing: list[str] = []
         recipients = payload.get("recipients") or []
-        if not self.state.pending_emails_validated or not isinstance(recipients, list) or not recipients:
+        if not isinstance(recipients, list) or not recipients:
             missing.append("customer emails")
         if not str(payload.get("subject") or "").strip():
             missing.append("subject")
@@ -5474,6 +5443,7 @@ class DashboardPage(QWidget):
     def _refresh_campaign_action_state(self) -> None:
         can_start = self.state.logged_in and not self._campaign_missing_fields()
         self.start_campaign_button.setEnabled(can_start)
+        self.sidebar_start_campaign_button.setEnabled(can_start)
         if self._pending_campaign_payload:
             total = len(self._pending_campaign_payload.get("recipients") or [])
             sent = 0 if self.progress_bar.value() <= 0 else int(round((self.progress_bar.value() / 100) * total))
@@ -5951,8 +5921,12 @@ class DashboardPage(QWidget):
                 attach_candidates.last.set_input_files(str(attachment_path))
                 self._log_action(f"Attachment selected: {attachment_path.name}")
 
-                page.wait_for_timeout(1500)
-                send_button = page.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
+                page.wait_for_timeout(1000)
+                send_button = page.locator('div[role="button"][aria-label^="Send"]')
+                if send_button.count() == 0:
+                    send_button = page.locator('div[role="button"][data-tooltip^="Send"]')
+                if send_button.count() == 0:
+                    send_button = page.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
                 send_button.first.click(timeout=10000)
                 page.wait_for_timeout(1500)
                 self._log_action(f"Gmail send completed for {recipient}")
@@ -6009,7 +5983,6 @@ class DashboardPage(QWidget):
             self._log_action("Campaign blocked: no browser windows available")
             return
 
-        self._show_launch_loader("Sending campaign", "Opening Gmail compose and sending messages.")
         try:
             total = len(recipients)
             window_count = len(self._browser_sessions)
@@ -6046,7 +6019,6 @@ class DashboardPage(QWidget):
             self.notify("Campaign send failed")
         finally:
             self._pending_campaign_payload = None
-            self._hide_launch_loader()
 
     def _show_launch_loader(self, title: str, subtitle: str) -> None:
         self.window().show_launch_loader(title, subtitle)
@@ -7161,7 +7133,27 @@ class DashboardPage(QWidget):
             return
         self.state.pending_emails_validated = False
         self._refresh_campaign_action_state()
+        self._refresh_pending_email_summary()
         self._pending_emails_save_timer.start()
+
+    def _refresh_pending_email_summary(self) -> None:
+        if self._workspace_loading:
+            return
+
+        source_text = self.pending_emails_editor.toPlainText()
+        candidates = self._extract_email_candidates(source_text)
+        total_count = len(candidates)
+        self.data_summary_labels["total"].setText(str(total_count))
+
+        if self.state.pending_emails_validated:
+            accepted_count = len(self.state.pending_recipients)
+            self.data_summary_labels["valid"].setText(str(accepted_count))
+            self.data_summary_labels["filter_count"].setText(str(accepted_count))
+            self.data_summary_labels["duplicates"].setText("0")
+        else:
+            self.data_summary_labels["valid"].setText("0")
+            self.data_summary_labels["filter_count"].setText("0")
+            self.data_summary_labels["duplicates"].setText("0")
 
     def _persist_pending_emails_state(self) -> None:
         if self._workspace_loading:
@@ -7208,11 +7200,7 @@ class DashboardPage(QWidget):
 
         self.state.pending_recipients = emails[:]
         self.state.pending_emails_validated = bool(payload.get("validated"))
-        if emails:
-            self.data_summary_labels["total"].setText(str(len(emails)))
-            self.data_summary_labels["valid"].setText(str(len(emails)))
-            self.data_summary_labels["invalid"].setText("0")
-            self.data_summary_labels["duplicates"].setText("0")
+        self._refresh_pending_email_summary()
         self._refresh_campaign_action_state()
 
     def _sync_subject_body_widgets(self) -> None:
@@ -7302,10 +7290,7 @@ class DashboardPage(QWidget):
         self.state.pending_recipients = []
         self.state.pending_emails_validated = False
         _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
-        self.data_summary_labels["total"].setText("0")
-        self.data_summary_labels["valid"].setText("0")
-        self.data_summary_labels["invalid"].setText("0")
-        self.data_summary_labels["duplicates"].setText("0")
+        self._refresh_pending_email_summary()
         self._log_action("Cleared pending email list")
 
     def _show_email_loader(self, subtitle: str) -> None:
@@ -7444,14 +7429,14 @@ class DashboardPage(QWidget):
                 self.pending_emails_editor.blockSignals(False)
             self.data_summary_labels["total"].setText(str(len(candidates)))
             self.data_summary_labels["valid"].setText(str(len(accepted)))
-            self.data_summary_labels["invalid"].setText(str(len(rejected)))
+            self.data_summary_labels["filter_count"].setText(str(len(accepted)))
             self.data_summary_labels["duplicates"].setText(str(duplicates))
             self._persist_pending_emails_state()
 
             mode_label = "gmail.com only" if gmail_only else "mixed domains"
             self._log_action(
                 f"Validated {len(candidates)} email candidate(s) in {mode_label}: "
-                f"{len(accepted)} valid, {len(rejected)} invalid, {duplicates} duplicates"
+                f"{len(accepted)} valid, {len(rejected)} filtered out, {duplicates} duplicates"
             )
             self.notify(f"{len(accepted)} valid email(s) ready")
         finally:
@@ -8299,10 +8284,14 @@ class MainWindow(QMainWindow):
         self.state.auth_token = auth_token
         self._last_login_username = username
         self.title_bar.set_state(self.state.username, self.state.logged_in)
-        if should_reset_workspace:
-            self.dashboard_page._reset_campaign_form_state(confirm=False)
-        self.dashboard_page.load_user_workspace()
         self.show_dashboard()
+        try:
+            if should_reset_workspace:
+                self.dashboard_page._reset_campaign_form_state(confirm=False)
+            self.dashboard_page.load_user_workspace()
+        except Exception as exc:
+            self.dashboard_page._log_action(f"Workspace load failed after login: {exc}")
+            self.show_toast("Signed in, but workspace reload had an issue", "warning")
         self.dashboard_page._log_action("User authenticated")
         self.show_toast("Signed in successfully", "success")
 
