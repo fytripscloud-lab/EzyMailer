@@ -57,6 +57,7 @@ from PySide6.QtCore import (
     Qt,
     QEvent,
     QPoint,
+    QSize,
     Signal,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence, QGuiApplication, QClipboard
@@ -81,6 +82,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QStyle,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -233,13 +235,15 @@ def _compute_layout_scale(screen) -> float:
 
 def _compute_text_scale(screen) -> float:
     if screen is None:
-        return 1.28
+        return 1.16 if IS_WINDOWS else 1.28
 
     geometry = screen.availableGeometry()
     width_boost = max(0.0, (geometry.width() - 1280.0) / 2200.0)
     height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
-    scale = 1.28 + min(0.12, (width_boost + height_boost) * 0.8)
-    return max(1.28, min(1.40, scale))
+    base = 1.16 if IS_WINDOWS else 1.28
+    ceiling = 1.28 if IS_WINDOWS else 1.40
+    scale = base + min(0.12, (width_boost + height_boost) * 0.8)
+    return max(base, min(ceiling, scale))
 
 
 def _device_fingerprint() -> str:
@@ -3081,6 +3085,7 @@ class DashboardPage(QWidget):
         root.addLayout(body, 1)
 
         self.refresh()
+        self._apply_navigation_icons()
 
     def _card(self, title: str, subtitle: str | None = None) -> tuple[QFrame, QVBoxLayout]:
         card = QFrame()
@@ -3162,6 +3167,9 @@ class DashboardPage(QWidget):
         reset_button.setObjectName("dangerButton")
         reset_button.clicked.connect(lambda: self._handle_reset())
         reset_button.setToolTip("Reset browser sessions and launch settings")
+        self._apply_button_icon(launch_button, QStyle.SP_MediaPlay)
+        self._apply_button_icon(pause_button, QStyle.SP_MediaPause)
+        self._apply_button_icon(reset_button, QStyle.SP_BrowserReload)
 
         launch_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
         launch_row.addWidget(launch_button)
@@ -3182,6 +3190,9 @@ class DashboardPage(QWidget):
         default_button.setToolTip("Restore the default launch preset")
         tile_button.setToolTip("Apply a layout-style launch preset")
         clear_button.setToolTip("Clear the preset selection")
+        self._apply_button_icon(default_button, QStyle.SP_DialogApplyButton)
+        self._apply_button_icon(tile_button, QStyle.SP_FileDialogDetailedView)
+        self._apply_button_icon(clear_button, QStyle.SP_BrowserReload)
         quick_row.addWidget(default_button)
         quick_row.addWidget(tile_button)
         quick_row.addWidget(clear_button)
@@ -3204,6 +3215,8 @@ class DashboardPage(QWidget):
         self.normal_button.clicked.connect(lambda: self._set_browser_mode("Normal"))
         self.incognito_button.setToolTip("Open browser windows in private browsing mode")
         self.normal_button.setToolTip("Open browser windows in normal mode")
+        self._apply_button_icon(self.incognito_button, QStyle.SP_DialogYesButton)
+        self._apply_button_icon(self.normal_button, QStyle.SP_DialogNoButton)
         mode_row = QHBoxLayout()
         mode_row.addWidget(self.incognito_button)
         mode_row.addWidget(self.normal_button)
@@ -3224,6 +3237,7 @@ class DashboardPage(QWidget):
         self.sidebar_start_campaign_button.setObjectName("blastButton")
         self.sidebar_start_campaign_button.clicked.connect(lambda: self._handle_campaign_primary_action())
         self.sidebar_start_campaign_button.setToolTip("Start the main send workflow")
+        self._apply_button_icon(self.sidebar_start_campaign_button, QStyle.SP_MediaPlay)
 
         layout.addWidget(launch_card)
         layout.addWidget(mode_card)
@@ -3353,6 +3367,7 @@ class DashboardPage(QWidget):
         self.subject_toggle_button.setToolTip("Open the subject manager modal")
         self.subject_toggle_button.setVisible(False)
         self.subject_toggle_button.clicked.connect(self._open_subject_manager)
+        self._apply_button_icon(self.subject_toggle_button, QStyle.SP_TitleBarMenuButton)
         subject_row.addWidget(subject_label)
         subject_row.addWidget(self.subject_input, 1)
         subject_row.addWidget(self.subject_toggle_button)
@@ -3362,10 +3377,12 @@ class DashboardPage(QWidget):
         self.subject_new_button.setObjectName("secondaryButton")
         self.subject_new_button.clicked.connect(self._new_subject_draft)
         self.subject_new_button.setToolTip("Start a new subject")
+        self._apply_button_icon(self.subject_new_button, QStyle.SP_FileDialogNewFolder)
         subject_toolbar.addWidget(self.subject_new_button)
         self.subject_import_button.setObjectName("secondaryButton")
         self.subject_import_button.clicked.connect(self._load_subject_from_file)
         self.subject_import_button.setToolTip("Import subject rows from a CSV file")
+        self._apply_button_icon(self.subject_import_button, QStyle.SP_DialogOpenButton)
         subject_toolbar.addWidget(self.subject_import_button)
         subject_toolbar.addStretch()
         subject_box.addLayout(subject_toolbar)
@@ -3382,12 +3399,15 @@ class DashboardPage(QWidget):
         self.body_add_button.setFixedWidth(_scaled_int(34, self._scale))
         self.body_add_button.setToolTip("Add a new body")
         self.body_add_button.clicked.connect(self._new_body_draft_tab)
+        self._apply_button_icon(self.body_add_button, QStyle.SP_FileDialogNewFolder)
         self.body_upload_button.setObjectName("secondaryButton")
         self.body_upload_button.clicked.connect(self._upload_body_files)
         self.body_upload_button.setToolTip("Upload CSV text bodies or HTML body files")
+        self._apply_button_icon(self.body_upload_button, QStyle.SP_DialogOpenButton)
         self.body_refresh_button.setObjectName("secondaryButton")
         self.body_refresh_button.clicked.connect(self.load_user_workspace)
         self.body_refresh_button.setToolTip("Reset the body workspace to a single active body tab")
+        self._apply_button_icon(self.body_refresh_button, QStyle.SP_BrowserReload)
         body_header.addWidget(self.body_add_button)
         body_header.addWidget(self.body_upload_button)
         body_header.addWidget(self.body_refresh_button)
@@ -3428,12 +3448,15 @@ class DashboardPage(QWidget):
         self.attach_add_button.setFixedWidth(_scaled_int(34, self._scale))
         self.attach_add_button.setToolTip("Add a new HTML attachment tab")
         self.attach_add_button.clicked.connect(self._new_attachment_draft_tab)
+        self._apply_button_icon(self.attach_add_button, QStyle.SP_FileDialogNewFolder)
         self.attach_upload_button.setObjectName("secondaryButton")
         self.attach_upload_button.clicked.connect(self._upload_attachment_files)
         self.attach_upload_button.setToolTip("Upload HTML files and create tabs")
+        self._apply_button_icon(self.attach_upload_button, QStyle.SP_DialogOpenButton)
         self.attach_reset_button.setObjectName("secondaryButton")
         self.attach_reset_button.clicked.connect(self._reset_attachment_tabs)
         self.attach_reset_button.setToolTip("Reset attachments to a single blank tab")
+        self._apply_button_icon(self.attach_reset_button, QStyle.SP_BrowserReload)
         content_header.addWidget(self.attach_add_button)
         content_header.addWidget(self.attach_upload_button)
         content_header.addWidget(self.attach_reset_button)
@@ -3469,6 +3492,7 @@ class DashboardPage(QWidget):
         self.attach_choose_format_button.setObjectName("secondaryButton")
         self.attach_choose_format_button.clicked.connect(self._choose_attachment_file_format)
         self.attach_choose_format_button.setToolTip("Open a modal to choose one or more export file formats")
+        self._apply_button_icon(self.attach_choose_format_button, QStyle.SP_DialogApplyButton)
         format_row = QHBoxLayout()
         format_row.setContentsMargins(0, 0, 0, 0)
         format_row.setSpacing(_scaled_int(8, self._scale))
@@ -3627,6 +3651,7 @@ class DashboardPage(QWidget):
         save_button.setObjectName("primaryButton")
         save_button.clicked.connect(lambda: self._save_sending_settings())
         save_button.setToolTip("Save the current sending settings")
+        self._apply_button_icon(save_button, QStyle.SP_DialogSaveButton)
         layout.addWidget(save_button, alignment=Qt.AlignLeft)
         layout.addStretch()
 
@@ -3956,10 +3981,12 @@ class DashboardPage(QWidget):
         refresh_button.setObjectName("secondaryButton")
         refresh_button.clicked.connect(lambda: self._log_action("Refreshed active Gmail windows"))
         refresh_button.setToolTip("Refresh the active Gmail window count")
+        self._apply_button_icon(refresh_button, QStyle.SP_BrowserReload)
         windows_row.addWidget(refresh_button)
         self.campaign_reset_all_button.setObjectName("secondaryButton")
         self.campaign_reset_all_button.clicked.connect(self._reset_campaign_form_state)
         self.campaign_reset_all_button.setToolTip("Clear recipient data, subject/body, and attachment content")
+        self._apply_button_icon(self.campaign_reset_all_button, QStyle.SP_BrowserReload)
         windows_row.addWidget(self.campaign_reset_all_button)
         controls_layout.addLayout(windows_row)
 
@@ -3976,15 +4003,18 @@ class DashboardPage(QWidget):
         self.start_campaign_button.setMinimumHeight(_scaled_int(54, self._scale))
         self.start_campaign_button.clicked.connect(lambda: self._handle_campaign_primary_action())
         self.start_campaign_button.setToolTip("Start the email sending workflow")
+        self._apply_button_icon(self.start_campaign_button, QStyle.SP_MediaPlay)
         layout.addWidget(self.start_campaign_button)
 
         campaign_action_row = QHBoxLayout()
         self.campaign_pause_button.setObjectName("warningButton")
         self.campaign_pause_button.clicked.connect(lambda: self._handle_campaign_pause_resume())
         self.campaign_pause_button.setToolTip("Pause or resume the active campaign")
+        self._apply_button_icon(self.campaign_pause_button, QStyle.SP_MediaPause)
         self.campaign_cancel_button.setObjectName("dangerButton")
         self.campaign_cancel_button.clicked.connect(lambda: self._handle_campaign_cancel())
         self.campaign_cancel_button.setToolTip("Cancel the active campaign")
+        self._apply_button_icon(self.campaign_cancel_button, QStyle.SP_DialogCancelButton)
         campaign_action_row.addWidget(self.campaign_pause_button)
         campaign_action_row.addWidget(self.campaign_cancel_button)
         campaign_action_row.addStretch()
@@ -4013,6 +4043,7 @@ class DashboardPage(QWidget):
         users_header = QHBoxLayout()
         self.admin_refresh_users_button.setObjectName("secondaryButton")
         self.admin_refresh_users_button.clicked.connect(self._admin_refresh_users)
+        self._apply_button_icon(self.admin_refresh_users_button, QStyle.SP_BrowserReload)
         users_header.addWidget(self.admin_refresh_users_button)
         users_header.addStretch()
         users_layout.addLayout(users_header)
@@ -4053,16 +4084,22 @@ class DashboardPage(QWidget):
         actions_row = QHBoxLayout()
         self.admin_create_user_button.setObjectName("primaryButton")
         self.admin_create_user_button.clicked.connect(self._admin_create_user)
+        self._apply_button_icon(self.admin_create_user_button, QStyle.SP_FileDialogNewFolder)
         self.admin_save_user_button.setObjectName("secondaryButton")
         self.admin_save_user_button.clicked.connect(self._admin_save_user)
+        self._apply_button_icon(self.admin_save_user_button, QStyle.SP_DialogSaveButton)
         self.admin_activate_user_button.setObjectName("secondaryButton")
         self.admin_activate_user_button.clicked.connect(lambda: self._admin_toggle_active(True))
+        self._apply_button_icon(self.admin_activate_user_button, QStyle.SP_MediaPlay)
         self.admin_deactivate_user_button.setObjectName("secondaryButton")
         self.admin_deactivate_user_button.clicked.connect(lambda: self._admin_toggle_active(False))
+        self._apply_button_icon(self.admin_deactivate_user_button, QStyle.SP_MediaPause)
         self.admin_reset_password_button.setObjectName("secondaryButton")
         self.admin_reset_password_button.clicked.connect(self._admin_reset_password)
+        self._apply_button_icon(self.admin_reset_password_button, QStyle.SP_BrowserReload)
         self.admin_reset_device_button.setObjectName("secondaryButton")
         self.admin_reset_device_button.clicked.connect(self._admin_reset_device)
+        self._apply_button_icon(self.admin_reset_device_button, QStyle.SP_BrowserReload)
         for button in (
             self.admin_create_user_button,
             self.admin_save_user_button,
@@ -4080,6 +4117,7 @@ class DashboardPage(QWidget):
         activity_header = QHBoxLayout()
         self.admin_refresh_activity_button.setObjectName("secondaryButton")
         self.admin_refresh_activity_button.clicked.connect(self._admin_refresh_activity)
+        self._apply_button_icon(self.admin_refresh_activity_button, QStyle.SP_BrowserReload)
         activity_header.addWidget(self.admin_refresh_activity_button)
         activity_header.addStretch()
         activity_layout.addLayout(activity_header)
@@ -4098,6 +4136,7 @@ class DashboardPage(QWidget):
         login_header = QHBoxLayout()
         self.admin_refresh_login_button.setObjectName("secondaryButton")
         self.admin_refresh_login_button.clicked.connect(self._admin_refresh_login_history)
+        self._apply_button_icon(self.admin_refresh_login_button, QStyle.SP_BrowserReload)
         login_header.addWidget(self.admin_refresh_login_button)
         login_header.addStretch()
         login_layout.addLayout(login_header)
@@ -4118,6 +4157,7 @@ class DashboardPage(QWidget):
         self.admin_tabs.addTab(users_card, "Users")
         self.admin_tabs.addTab(activity_card, "Activity")
         self.admin_tabs.addTab(login_card, "Login History")
+        self._apply_navigation_icons()
         layout.addWidget(self.admin_tabs, 1)
         return self._tab_scroll(page)
 
@@ -4448,6 +4488,9 @@ class DashboardPage(QWidget):
         regenerate_button.clicked.connect(lambda: self._regenerate_tags())
         ai_button.clicked.connect(lambda: self._log_action("Generated tags with AI"))
         reset_button.clicked.connect(lambda: self._reset_tags_to_default())
+        self._apply_button_icon(regenerate_button, QStyle.SP_BrowserReload)
+        self._apply_button_icon(ai_button, QStyle.SP_ComputerIcon)
+        self._apply_button_icon(reset_button, QStyle.SP_DialogResetButton)
         actions_row.addWidget(regenerate_button)
         actions_row.addWidget(ai_button)
         actions_row.addWidget(reset_button)
@@ -4501,6 +4544,45 @@ class DashboardPage(QWidget):
         button.setCheckable(True)
         button.setChecked(checked)
         button.setCursor(Qt.PointingHandCursor)
+
+    def _standard_icon(self, pixmap: QStyle.StandardPixmap):
+        return self.style().standardIcon(pixmap)
+
+    def _apply_button_icon(self, button: QPushButton, pixmap: QStyle.StandardPixmap) -> None:
+        button.setIcon(self._standard_icon(pixmap))
+        button.setIconSize(QSize(_scaled_int(14, self._scale), _scaled_int(14, self._scale)))
+
+    def _apply_tab_icon(self, tab_widget: QTabWidget, index: int, pixmap: QStyle.StandardPixmap) -> None:
+        tab_widget.setTabIcon(index, self._standard_icon(pixmap))
+
+    def _apply_navigation_icons(self) -> None:
+        if hasattr(self, "tabs"):
+            self.tabs.setIconSize(QSize(_scaled_int(16, self._scale), _scaled_int(16, self._scale)))
+            self._apply_tab_icon(self.tabs, 0, QStyle.SP_DirIcon)
+            self._apply_tab_icon(self.tabs, 1, QStyle.SP_FileIcon)
+            self._apply_tab_icon(self.tabs, 2, QStyle.SP_FileDialogContentsView)
+            self._apply_tab_icon(self.tabs, 3, QStyle.SP_FileDialogDetailedView)
+            self._apply_tab_icon(self.tabs, 4, QStyle.SP_DialogApplyButton)
+            self._apply_tab_icon(self.tabs, 5, QStyle.SP_MediaPlay)
+        if hasattr(self, "body_tabs"):
+            self.body_tabs.setIconSize(QSize(_scaled_int(14, self._scale), _scaled_int(14, self._scale)))
+        if hasattr(self, "attach_tabs"):
+            self.attach_tabs.setIconSize(QSize(_scaled_int(14, self._scale), _scaled_int(14, self._scale)))
+        if hasattr(self, "admin_tabs"):
+            self.admin_tabs.setIconSize(QSize(_scaled_int(16, self._scale), _scaled_int(16, self._scale)))
+            self._apply_tab_icon(self.admin_tabs, 0, QStyle.SP_DirHomeIcon)
+            self._apply_tab_icon(self.admin_tabs, 1, QStyle.SP_FileDialogListView)
+            self._apply_tab_icon(self.admin_tabs, 2, QStyle.SP_MessageBoxInformation)
+        for button, icon in (
+            (getattr(self, "sidebar_start_campaign_button", None), QStyle.SP_MediaPlay),
+            (getattr(self, "start_campaign_button", None), QStyle.SP_MediaPlay),
+            (getattr(self, "campaign_pause_button", None), QStyle.SP_MediaPause),
+            (getattr(self, "campaign_cancel_button", None), QStyle.SP_DialogCancelButton),
+            (getattr(self, "campaign_reset_all_button", None), QStyle.SP_BrowserReload),
+            (getattr(self, "launch_preset_label", None), None),
+        ):
+            if isinstance(button, QPushButton) and icon is not None:
+                self._apply_button_icon(button, icon)
 
     def _labeled_value_row(self, label_text: str, widget: QWidget) -> QWidget:
         row = QFrame()
@@ -6826,6 +6908,7 @@ class DashboardPage(QWidget):
         tab_number = self.body_tabs.count() + 1
         tab_label = f"Body {tab_number} [{'HTML' if widget.mode_text() == 'HTML Message' else 'Text'}]"
         index = self.body_tabs.addTab(widget, tab_label)
+        self.body_tabs.setTabIcon(index, self._standard_icon(QStyle.SP_FileIcon))
         self._refresh_body_tab_labels()
         self._update_body_tab_controls()
         if select:
@@ -6932,6 +7015,7 @@ class DashboardPage(QWidget):
         widget = self._create_attachment_draft_tab(record)
         tab_number = self.attach_tabs.count() + 1
         index = self.attach_tabs.addTab(widget, f"Content {tab_number} [HTML]")
+        self.attach_tabs.setTabIcon(index, self._standard_icon(QStyle.SP_FileDialogContentsView))
         self._refresh_attachment_tab_labels()
         self._update_attachment_tab_controls()
         if select:
@@ -8230,7 +8314,7 @@ class MainWindow(QMainWindow):
         self.move(x, y)
 
     def _apply_styles(self) -> None:
-        self.setFont(QFont("Segoe UI", _scaled_int(10, self._text_scale)))
+        self.setFont(QFont("Segoe UI", _scaled_int(9 if IS_WINDOWS else 10, self._text_scale)))
         style = """
             QMainWindow {
                 background: #1e1e1e;
@@ -8238,7 +8322,7 @@ class MainWindow(QMainWindow):
             QWidget {
                 color: #d4d4d4;
                 font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
-                font-size: 8pt;
+                font-size: 7.2pt;
             }
             QWidget#tabPage {
                 background: #1e1e1e;
