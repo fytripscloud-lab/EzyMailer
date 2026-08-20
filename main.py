@@ -3065,6 +3065,7 @@ class DashboardPage(QWidget):
         self._floating_windows: list[QDialog] = []
         self._browser_sessions: list[BrowserSessionHandle] = []
         self._subject_list_visible = False
+        self._pending_launch_target: int | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -3328,10 +3329,15 @@ class DashboardPage(QWidget):
         filter_layout.addLayout(actions_row)
 
         counts_row = QHBoxLayout()
-        for label_text in ("Total", "Valid", "Filter Count", "Duplicates"):
+        for key, label_text in (
+            ("total", "Total"),
+            ("valid", "Valid"),
+            ("filter_count", "Filter Count"),
+            ("duplicates", "Duplicates"),
+        ):
             value = QLabel("0")
             value.setObjectName("countValue")
-            self.data_summary_labels[label_text.lower()] = value
+            self.data_summary_labels[key] = value
             card = QFrame()
             card.setObjectName("miniStat")
             card_layout = QVBoxLayout(card)
@@ -5391,12 +5397,16 @@ class DashboardPage(QWidget):
         bundle_roots = [
             _browser_cache_dir(),
             _runtime_root() / BUILTIN_BROWSER_DIR_NAME,
+            _runtime_root().parent / "Resources" / BUILTIN_BROWSER_DIR_NAME,
             Path.cwd() / BUILTIN_BROWSER_DIR_NAME,
             Path.home() / BUILTIN_BROWSER_DIR_NAME,
         ]
         candidates = [
             "chrome",
             "chrome.exe",
+            "Google Chrome for Testing",
+            "Chromium",
+            "Chromium.exe",
             "chromium",
             "chromium.exe",
             "chromium-browser",
@@ -5616,7 +5626,29 @@ class DashboardPage(QWidget):
             return
         target = max(1, self.window_spin.value())
         self._terminate_browser_sessions()
+        if self._browser_binary() is None:
+            self._pending_launch_target = target
+            self._log_action("Browser runtime missing; downloading Chromium before launch")
+            self.notify("Preparing browser runtime")
+            try:
+                self.window()._start_windows_browser_bootstrap()
+            except Exception:
+                pass
+            return
         self._log_action(f"Preparing {target} browser window(s)")
+        self.notify(f"Launching {target} browser window(s)")
+        self._show_launch_loader(
+            "Launching browser windows",
+            "Applying browser mode and launch preset.",
+        )
+        QTimer.singleShot(900, lambda t=target: self._complete_launch(t))
+
+    def _resume_pending_launch(self) -> None:
+        target = self._pending_launch_target
+        if target is None:
+            return
+        self._pending_launch_target = None
+        self._log_action(f"Browser runtime ready; launching {target} browser window(s)")
         self.notify(f"Launching {target} browser window(s)")
         self._show_launch_loader(
             "Launching browser windows",
@@ -8280,6 +8312,11 @@ class MainWindow(QMainWindow):
         browser_binary = self._browser_binary()
         if success and browser_binary is not None:
             self.show_toast("Browser runtime ready", "success")
+            if hasattr(self, "dashboard_page"):
+                try:
+                    self.dashboard_page._resume_pending_launch()
+                except Exception:
+                    pass
             return
 
         warning_message = message or "Unable to auto-configure the browser runtime."

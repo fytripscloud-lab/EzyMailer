@@ -8,4 +8,5 @@ venv/
 .DS_Store
 packaging/.DS_Store
 packaging/macos-dmg/
+packaging/playwright-browsers/
 server_credentials/
