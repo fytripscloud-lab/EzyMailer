@@ -18,6 +18,8 @@ import string
 import threading
 import uuid
 import certifi
+import xml.etree.ElementTree
+import xml.parsers.expat
 from datetime import datetime
 from io import BytesIO
 import urllib.error
