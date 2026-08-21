@@ -7030,10 +7030,7 @@ class DashboardPage(QWidget):
                 if log_steps:
                     self._log_action("Gmail compose opened")
 
-                recipient_box = page.locator(
-                    'input[aria-label^="To"], input[aria-label*="To recipients"], input[name="to"]'
-                ).first
-                recipient_box.wait_for(state="visible", timeout=10000)
+                recipient_box = self._gmail_recipient_input(page)
                 if sending_type == "Typing (Like human)":
                     recipient_box.press_sequentially(recipient, delay=random.uniform(0.015, 0.045))
                 else:
@@ -7089,6 +7086,55 @@ class DashboardPage(QWidget):
                     self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(f"Gmail automation timed out: {exc}") from exc
+
+    def _gmail_recipient_input(self, page):
+        """Focus Gmail's active compose recipient editor before filling it.
+
+        Gmail keeps its recipient input hidden until the compose recipient area
+        receives focus. The hidden input can still match the old selector, so
+        visibility must be established by clicking the active compose region.
+        """
+        recipient_selectors = (
+            'input[aria-label="To recipients"]',
+            'input[aria-label^="To"]',
+            '[role="combobox"][aria-label*="To"]',
+            'input[name="to"]',
+        )
+        focus_selectors = (
+            '[role="dialog"] [aria-label="To recipients"]',
+            '[role="dialog"] [aria-label^="To"]',
+            '[role="dialog"] [role="combobox"]',
+            '[role="dialog"] div[aria-label="To"]',
+            '[role="dialog"] .agP',
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            for selector in recipient_selectors:
+                locator = page.locator(selector)
+                try:
+                    count = locator.count()
+                except Exception:
+                    continue
+                for index in range(count):
+                    candidate = locator.nth(index)
+                    try:
+                        if candidate.is_visible():
+                            candidate.click()
+                            return candidate
+                    except Exception:
+                        continue
+
+            for selector in focus_selectors:
+                locator = page.locator(selector).last
+                try:
+                    if locator.is_visible():
+                        locator.click(timeout=1000)
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(250)
+
+        raise RuntimeError("Gmail compose recipient field did not become available.")
 
     def _maybe_send_with_playwright(
         self,
