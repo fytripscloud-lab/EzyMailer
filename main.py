@@ -160,12 +160,31 @@ def _external_dependency_asset() -> str:
     raise RuntimeError(f"No external dependency archive is available for {platform.system()} {platform.machine()}")
 
 
+def _restore_runtime_permissions(root: Path) -> None:
+    """Restore executable bits lost when the dependency ZIP is extracted."""
+    if not root.exists():
+        return
+    executable_paths = [
+        root / "playwright" / "driver" / "node",
+        root / "playwright" / "driver" / "node.exe",
+        root / "playwright" / "driver.sh",
+    ]
+    for path in executable_paths:
+        if not path.is_file() or IS_WINDOWS:
+            continue
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+        except OSError:
+            pass
+
+
 def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] | None = None) -> Path:
     """Download and extract the versioned GitHub dependency pack once."""
     target = _external_dependency_dir()
     marker = target / ".ready"
     target.mkdir(parents=True, exist_ok=True)
     if marker.exists():
+        _restore_runtime_permissions(target)
         if str(target) not in sys.path:
             sys.path.insert(0, str(target))
         return target
@@ -230,6 +249,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
         progress("Finalizing app dependencies", "Completing the local runtime setup", 99, 100)
     shutil.rmtree(target, ignore_errors=True)
     extraction_dir.rename(target)
+    _restore_runtime_permissions(target)
     archive_path.unlink(missing_ok=True)
     packaged_browser = target / BUILTIN_BROWSER_DIR_NAME
     browser_cache = _browser_cache_dir()
