@@ -53,7 +53,7 @@ pyinstaller \
   --clean \
   --windowed \
   --name "$APP_NAME" \
-  --icon "$ROOT_DIR/packaging/macos-dmg/EzyMailer.app/Contents/Resources/icon-windowed.icns" \
+  --icon "$ROOT_DIR/packaging/assets/EazyMailer.icns" \
   --collect-all PIL \
   --collect-all greenlet \
   --collect-all lxml \
