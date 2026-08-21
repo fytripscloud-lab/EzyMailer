@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Release tag used by the desktop bootstrapper
         required: true
-        default: dependencies-v3
+        default: dependencies-v4
   push:
     tags:
       - dependencies-v*

@@ -131,7 +131,7 @@ ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
 DEFAULT_BROWSER_DOWNLOAD_HOST = "https://cdn.playwright.dev"
-DEPENDENCY_RELEASE_TAG = "dependencies-v3"
+DEPENDENCY_RELEASE_TAG = "dependencies-v4"
 DEPENDENCY_RELEASE_BASE = (
     "https://github.com/fytripscloud-lab/EzyMailer/releases/download/"
     f"{DEPENDENCY_RELEASE_TAG}"
@@ -180,6 +180,28 @@ def _restore_runtime_permissions(root: Path) -> None:
             pass
 
 
+_external_dll_directory_handles: list[object] = []
+_external_dll_directories: set[str] = set()
+
+
+def _configure_external_dll_search(root: Path) -> None:
+    """Make extracted native dependency DLLs discoverable on Windows."""
+    if not IS_WINDOWS:
+        return
+    for directory in (root, root / "PIL"):
+        if not directory.is_dir():
+            continue
+        try:
+            directory_text = str(directory.resolve())
+            if directory_text in _external_dll_directories:
+                continue
+            handle = os.add_dll_directory(directory_text)
+            _external_dll_directory_handles.append(handle)
+            _external_dll_directories.add(directory_text)
+        except (AttributeError, OSError):
+            pass
+
+
 def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] | None = None) -> Path:
     """Download and extract the versioned GitHub dependency pack once."""
     target = _external_dependency_dir()
@@ -187,6 +209,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
     target.mkdir(parents=True, exist_ok=True)
     if marker.exists():
         _restore_runtime_permissions(target)
+        _configure_external_dll_search(target)
         if str(target) not in sys.path:
             sys.path.insert(0, str(target))
         return target
@@ -252,6 +275,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
     shutil.rmtree(target, ignore_errors=True)
     extraction_dir.rename(target)
     _restore_runtime_permissions(target)
+    _configure_external_dll_search(target)
     archive_path.unlink(missing_ok=True)
     packaged_browser = target / BUILTIN_BROWSER_DIR_NAME
     browser_cache = _browser_cache_dir()
