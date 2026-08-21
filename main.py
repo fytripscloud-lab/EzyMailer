@@ -5863,7 +5863,7 @@ class DashboardPage(QWidget):
         x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
-        args.append("https://www.google.com/")
+        args.append("https://workspace.google.com/intl/en-US/gmail/#inbox")
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -6886,8 +6886,6 @@ class DashboardPage(QWidget):
 
     def _gmail_page_from_session(self, page, timeout_ms: int = 30000):
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-        if "mail.google.com" not in (page.url or ""):
-            page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=timeout_ms)
         return page
 
     def _send_compose_with_playwright(
@@ -6973,9 +6971,8 @@ class DashboardPage(QWidget):
                 if log_steps:
                     self._log_action("Gmail page ready")
 
-                # Reset any stale draft/compose state, then open one fresh
-                # Gmail compose window for this recipient only.
-                page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=15000)
+                # Use the already authenticated Gmail page. Do not redirect
+                # during login or between recipients.
                 page.wait_for_timeout(400)
                 compose_button = page.locator(
                     'div.z0 div[role="button"][gh="cm"], '
