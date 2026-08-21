@@ -13,5 +13,5 @@ pip install pyinstaller
 pyinstaller --noconfirm --clean --onefile --windowed --name EazyMailer --exclude-module playwright --exclude-module PIL --exclude-module docx --exclude-module openpyxl --exclude-module reportlab --exclude-module pptx --exclude-module lxml main.py
 
 echo.
-echo Build complete. Check dist for EzyMailer.exe.
+echo Build complete. Check dist for EazyMailer.exe.
 pause

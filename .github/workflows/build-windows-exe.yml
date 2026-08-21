@@ -30,6 +30,6 @@ jobs:
         with:
           name: EzyMailer-Windows-EXE
           path: |
-            dist\EzyMailer.exe
+            dist\EazyMailer.exe
             dist\playwright-browsers\**
           if-no-files-found: error

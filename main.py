@@ -353,6 +353,21 @@ def _installed_browser_binary() -> Path | None:
     return _find_first_existing(candidates)
 
 
+def _browser_product_name(binary: Path) -> str:
+    """Return the user-facing browser name for a selected executable."""
+    normalized = str(binary).lower().replace("\\", "/")
+    if "microsoft edge" in normalized or normalized.endswith("/msedge.exe") or "microsoft-edge" in normalized:
+        return "Microsoft Edge"
+    if "google chrome" in normalized or normalized.endswith("/chrome.exe") or "google-chrome" in normalized:
+        return "Google Chrome"
+    return "Chromium"
+
+
+def _browser_private_flag(browser_name: str) -> str:
+    """Use the private-window switch supported by the selected browser."""
+    return "--inprivate" if browser_name == "Microsoft Edge" else "--incognito"
+
+
 class BrowserBootstrapWorker(QObject):
     progress = Signal(str, str, int, int)
     finished = Signal(bool, str)
@@ -382,15 +397,15 @@ class BrowserBootstrapWorker(QObject):
             )
             self._browser_cache_dir.mkdir(parents=True, exist_ok=True)
             ensure_external_dependencies(self._report)
-            existing_browser = _cached_browser_binary(self._browser_cache_dir)
             installed_browser = _installed_browser_binary()
-            selected_browser = existing_browser or installed_browser
+            existing_browser = _cached_browser_binary(self._browser_cache_dir)
+            selected_browser = installed_browser or existing_browser
             if selected_browser is not None:
                 browser_name = "installed browser" if installed_browser and not existing_browser else "browser runtime"
                 if existing_browser is not None:
                     self._report(
                     "Browser ready",
-                    "Using the previously prepared browser runtime.",
+                    f"Using {_browser_product_name(selected_browser)} for browser sessions.",
                     100,
                     100,
                 )
@@ -504,13 +519,15 @@ def _compute_layout_scale(screen) -> float:
 
 def _compute_text_scale(screen) -> float:
     if screen is None:
-        return 1.16 if IS_WINDOWS else 1.28
+        return 0.92 if IS_WINDOWS else 1.28
 
     geometry = screen.availableGeometry()
     width_boost = max(0.0, (geometry.width() - 1280.0) / 2200.0)
     height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
-    base = 1.16 if IS_WINDOWS else 1.28
-    ceiling = 1.28 if IS_WINDOWS else 1.40
+    # Windows builds use a denser UI so the full workspace fits comfortably
+    # on standard laptop displays. Keep the macOS visual scale unchanged.
+    base = 0.92 if IS_WINDOWS else 1.28
+    ceiling = 1.00 if IS_WINDOWS else 1.40
     scale = base + min(0.12, (width_boost + height_boost) * 0.8)
     return max(base, min(ceiling, scale))
 
@@ -1214,6 +1231,7 @@ class BrowserSessionHandle:
     session_id: str
     title: str
     mode: str
+    browser_name: str = "Google Chrome"
     process: subprocess.Popen[str] | None = None
     status: str = "Starting"
     profile_dir: Path | None = None
@@ -5689,7 +5707,7 @@ class DashboardPage(QWidget):
             candidate = Path(env_binary).expanduser()
             if candidate.exists():
                 return candidate
-        return _cached_browser_binary(_browser_cache_dir()) or _installed_browser_binary()
+        return _installed_browser_binary() or _cached_browser_binary(_browser_cache_dir())
 
     def _browser_launch_rect(self, index: int, total: int) -> tuple[int, int, int, int]:
         screen = self.window().screen() or QApplication.primaryScreen()
@@ -5762,8 +5780,10 @@ class DashboardPage(QWidget):
             raise RuntimeError("No supported Edge, Chrome, or Chromium browser was found for this app.")
 
         incognito = self.state.browser_mode == "Incognito"
-        session_id = f"chrome-{QDateTime.currentMSecsSinceEpoch()}-{index}"
-        title = f"Chrome Window {index}"
+        browser_name = _browser_product_name(binary)
+        browser_slug = browser_name.lower().replace(" ", "-")
+        session_id = f"{browser_slug}-{QDateTime.currentMSecsSinceEpoch()}-{index}"
+        title = f"{browser_name} Window {index}"
         profile_dir = self._create_browser_profile_dir(index)
         debug_port = self._reserve_debug_port()
         args = [str(binary), "--new-window", f"--user-data-dir={profile_dir}"]
@@ -5780,7 +5800,7 @@ class DashboardPage(QWidget):
             ]
         )
         if incognito:
-            args.append("--incognito")
+            args.append(_browser_private_flag(browser_name))
         x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
@@ -5795,6 +5815,7 @@ class DashboardPage(QWidget):
             session_id=session_id,
             title=title,
             mode="Incognito" if incognito else "Normal",
+            browser_name=browser_name,
             process=process,
             status="Running",
             profile_dir=profile_dir,
@@ -5822,7 +5843,7 @@ class DashboardPage(QWidget):
                         self.state.username,
                         session.session_id,
                         session.title,
-                        "Google Chrome",
+                        session.browser_name,
                         self.state.browser_mode,
                         "Closed",
                         None,
@@ -5866,7 +5887,7 @@ class DashboardPage(QWidget):
                     self.state.username,
                     session.session_id,
                     session.title,
-                    "Google Chrome",
+                    session.browser_name,
                     session.mode,
                     "Closed",
                     None,
@@ -5943,7 +5964,7 @@ class DashboardPage(QWidget):
                     self.state.username,
                     session.session_id,
                     session.title,
-                    "Google Chrome",
+                    session.browser_name,
                     session.mode,
                     session.status,
                     session.process.pid if session.process is not None else None,
@@ -6103,7 +6124,7 @@ class DashboardPage(QWidget):
                 self.state.username,
                 session.session_id,
                 session.title,
-                "Google Chrome",
+                session.browser_name,
                 session.mode,
                 "Closed",
                 None,
@@ -7576,7 +7597,7 @@ class DashboardPage(QWidget):
         except Exception as exc:
             self._terminate_browser_sessions()
             self._log_action(f"Browser launch failed: {exc}")
-            self.notify("Unable to launch Google Chrome")
+            self.notify("Unable to launch browser")
             return
 
         self._browser_sessions = launched
@@ -7589,7 +7610,7 @@ class DashboardPage(QWidget):
                     self.state.username,
                     session.session_id,
                     session.title,
-                    "Google Chrome",
+                    session.browser_name,
                     session.mode,
                     session.status,
                     session.process.pid if session.process is not None else None,
