@@ -129,7 +129,7 @@ ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
 DEFAULT_BROWSER_DOWNLOAD_HOST = "https://cdn.playwright.dev"
-DEPENDENCY_RELEASE_TAG = "dependencies-v2"
+DEPENDENCY_RELEASE_TAG = "dependencies-v3"
 DEPENDENCY_RELEASE_BASE = (
     "https://github.com/fytripscloud-lab/EzyMailer/releases/download/"
     f"{DEPENDENCY_RELEASE_TAG}"
@@ -302,6 +302,45 @@ def _cached_browser_binary(root: Path) -> Path | None:
     return None
 
 
+def _installed_browser_binary() -> Path | None:
+    """Prefer an installed Edge or Chrome before downloading Chromium."""
+    candidates: list[Path] = []
+    if IS_MAC:
+        for app_root in (Path("/Applications"), Path.home() / "Applications"):
+            candidates.extend(
+                [
+                    app_root / "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                    app_root / "Google Chrome.app/Contents/MacOS/Google Chrome",
+                    app_root / "Chromium.app/Contents/MacOS/Chromium",
+                ]
+            )
+    elif IS_WINDOWS:
+        local_app_data = Path(os.getenv("LOCALAPPDATA", ""))
+        program_files = Path(os.getenv("ProgramFiles", "C:/Program Files"))
+        program_files_x86 = Path(os.getenv("ProgramFiles(x86)", "C:/Program Files (x86)"))
+        candidates.extend(
+            [
+                program_files / "Microsoft/Edge/Application/msedge.exe",
+                program_files_x86 / "Microsoft/Edge/Application/msedge.exe",
+                local_app_data / "Microsoft/Edge/Application/msedge.exe",
+                program_files / "Google/Chrome/Application/chrome.exe",
+                program_files_x86 / "Google/Chrome/Application/chrome.exe",
+                local_app_data / "Google/Chrome/Application/chrome.exe",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                Path("/usr/bin/microsoft-edge"),
+                Path("/usr/bin/microsoft-edge-stable"),
+                Path("/usr/bin/google-chrome"),
+                Path("/usr/bin/google-chrome-stable"),
+                Path("/usr/bin/chromium"),
+            ]
+        )
+    return _find_first_existing(candidates)
+
+
 class BrowserBootstrapWorker(QObject):
     progress = Signal(str, str, int, int)
     finished = Signal(bool, str)
@@ -332,13 +371,24 @@ class BrowserBootstrapWorker(QObject):
             self._browser_cache_dir.mkdir(parents=True, exist_ok=True)
             ensure_external_dependencies(self._report)
             existing_browser = _cached_browser_binary(self._browser_cache_dir)
-            if existing_browser is not None:
-                self._report(
-                    "Dependencies already ready",
-                    "Using the previously downloaded Chromium runtime.",
+            installed_browser = _installed_browser_binary()
+            selected_browser = existing_browser or installed_browser
+            if selected_browser is not None:
+                browser_name = "installed browser" if installed_browser and not existing_browser else "browser runtime"
+                if existing_browser is not None:
+                    self._report(
+                    "Browser ready",
+                    "Using the previously prepared browser runtime.",
                     100,
                     100,
                 )
+                else:
+                    self._report(
+                        "Browser ready",
+                        f"Using the detected {browser_name}.",
+                        100,
+                        100,
+                    )
                 self._finish(True, "Browser runtime already configured.")
                 return
 
@@ -5627,7 +5677,7 @@ class DashboardPage(QWidget):
             candidate = Path(env_binary).expanduser()
             if candidate.exists():
                 return candidate
-        return _cached_browser_binary(_browser_cache_dir())
+        return _cached_browser_binary(_browser_cache_dir()) or _installed_browser_binary()
 
     def _browser_launch_rect(self, index: int, total: int) -> tuple[int, int, int, int]:
         screen = self.window().screen() or QApplication.primaryScreen()
@@ -5697,7 +5747,7 @@ class DashboardPage(QWidget):
     def _launch_browser_process(self, index: int) -> BrowserSessionHandle:
         binary = self._browser_binary()
         if binary is None:
-            raise RuntimeError("No bundled Chromium runtime was found for this app.")
+            raise RuntimeError("No supported Edge, Chrome, or Chromium browser was found for this app.")
 
         incognito = self.state.browser_mode == "Incognito"
         session_id = f"chrome-{QDateTime.currentMSecsSinceEpoch()}-{index}"
@@ -5838,7 +5888,7 @@ class DashboardPage(QWidget):
         self._terminate_browser_sessions()
         if self._browser_binary() is None:
             self._pending_launch_target = target
-            self._log_action("Browser runtime missing; downloading Chromium before launch")
+            self._log_action("No installed browser found; downloading Chromium before launch")
             self.notify("Preparing browser runtime")
             try:
                 self.window()._start_windows_browser_bootstrap()
