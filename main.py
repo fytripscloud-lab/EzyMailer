@@ -6977,11 +6977,16 @@ class DashboardPage(QWidget):
                 # Gmail compose window for this recipient only.
                 page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(400)
-                page.goto(
-                    "https://mail.google.com/mail/u/0/#inbox?compose=new",
-                    wait_until="domcontentloaded",
-                    timeout=15000,
-                )
+                compose_button = page.locator(
+                    'div.z0 div[role="button"][gh="cm"], '
+                    'div.z0 [role="button"][jslog*="20510"]'
+                ).first
+                try:
+                    compose_button.wait_for(state="visible", timeout=10000)
+                    compose_button.click()
+                except Exception:
+                    compose_button = page.get_by_role("button", name=re.compile(r"^Compose$", re.IGNORECASE)).first
+                    compose_button.click(timeout=10000)
                 if log_steps:
                     self._log_action("Gmail compose opened")
 
@@ -7000,8 +7005,7 @@ class DashboardPage(QWidget):
                 if log_steps:
                     self._log_action("Recipient entered")
 
-                subject_box = page.locator('input[name="subjectbox"], input[placeholder*="Subject"]').first
-                subject_box.wait_for(state="visible", timeout=10000)
+                subject_box = self._gmail_subject_input(page)
                 subject_box.fill(subject)
                 if log_steps:
                     self._log_action("Subject entered")
@@ -7030,17 +7034,67 @@ class DashboardPage(QWidget):
                     )
 
                 page.wait_for_timeout(1000)
-                send_button = page.locator('div[role="button"][aria-label^="Send"]')
-                if send_button.count() == 0:
-                    send_button = page.locator('div[role="button"][data-tooltip^="Send"]')
-                if send_button.count() == 0:
-                    send_button = page.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
-                send_button.first.click(timeout=10000)
+                send_button = self._gmail_visible_control(
+                    page,
+                    (
+                        'div.dC div[role="button"][aria-label^="Send"]',
+                        'div.dC div[role="button"][data-tooltip^="Send"]',
+                        'div.dC [role="button"]',
+                    ),
+                    timeout=10000,
+                )
+                send_button.click(timeout=10000)
                 page.wait_for_timeout(1500)
                 if log_steps:
                     self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(f"Gmail automation timed out: {exc}") from exc
+
+    def _gmail_visible_control(self, page, selectors: tuple[str, ...], *, timeout: int = 10000):
+        deadline = time.monotonic() + (timeout / 1000)
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector)
+                try:
+                    for index in range(locator.count()):
+                        candidate = locator.nth(index)
+                        if candidate.is_visible():
+                            return candidate
+                except Exception:
+                    continue
+            page.wait_for_timeout(200)
+        raise RuntimeError("Gmail compose control did not become visible.")
+
+    def _gmail_subject_input(self, page):
+        subject_selectors = (
+            'input[name="subjectbox"]',
+            'input[aria-label="Subject"]',
+            'input[placeholder="Subject"]',
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            for selector in subject_selectors:
+                locator = page.locator(selector)
+                try:
+                    for index in range(locator.count()):
+                        candidate = locator.nth(index)
+                        if candidate.is_visible():
+                            return candidate
+                except Exception:
+                    continue
+
+            # Gmail sometimes keeps the input hidden until its subject row is
+            # focused, even though the compose window is already open.
+            for selector in ('div.aoD.az6', 'div[role="dialog"] div.aoD'):
+                try:
+                    container = page.locator(selector).last
+                    if container.is_visible():
+                        container.click(timeout=1000)
+                        break
+                except Exception:
+                    continue
+            page.wait_for_timeout(250)
+        raise RuntimeError("Gmail compose subject field did not become available.")
 
     def _gmail_recipient_input(self, page):
         """Focus Gmail's active compose recipient editor before filling it.
