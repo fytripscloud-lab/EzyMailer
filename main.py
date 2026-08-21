@@ -6973,21 +6973,26 @@ class DashboardPage(QWidget):
                 if log_steps:
                     self._log_action("Gmail page ready")
 
-                compose_clicked = False
-                try:
-                    compose_button = page.get_by_role("button", name=re.compile(r"^Compose$", re.IGNORECASE))
-                    compose_button.first.click(timeout=8000)
-                    compose_clicked = True
-                except Exception:
-                    try:
-                        page.goto("https://mail.google.com/mail/u/0/#inbox?compose=new", wait_until="domcontentloaded", timeout=10000)
-                        compose_clicked = True
-                    except Exception:
-                        pass
-                if not compose_clicked:
-                    raise RuntimeError("Unable to open Gmail compose window.")
+                # Reset any stale draft/compose state, then open one fresh
+                # Gmail compose window for this recipient only.
+                page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(400)
+                page.goto(
+                    "https://mail.google.com/mail/u/0/#inbox?compose=new",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
                 if log_steps:
                     self._log_action("Gmail compose opened")
+
+                # Never carry Gmail's optional Confidential mode into campaign
+                # messages. Close the dialog if Gmail restores stale UI state.
+                try:
+                    confidential_title = page.get_by_text("Confidential mode", exact=True)
+                    if confidential_title.is_visible():
+                        page.get_by_role("button", name=re.compile(r"^Cancel$", re.IGNORECASE)).click(timeout=3000)
+                except Exception:
+                    pass
 
                 recipient_box = self._gmail_recipient_input(page)
                 recipient_box.fill(recipient)
