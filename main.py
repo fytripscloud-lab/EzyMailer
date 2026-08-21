@@ -546,10 +546,9 @@ def _compute_text_scale(screen) -> float:
     geometry = screen.availableGeometry()
     width_boost = max(0.0, (geometry.width() - 1280.0) / 2200.0)
     height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
-    # Windows builds use a denser UI so the full workspace fits comfortably
-    # on standard laptop displays. Keep the macOS visual scale unchanged.
-    base = 0.92 if IS_WINDOWS else 1.28
-    ceiling = 1.00 if IS_WINDOWS else 1.40
+    # Keep Windows compact, but readable on standard laptop displays.
+    base = 1.00 if IS_WINDOWS else 1.28
+    ceiling = 1.08 if IS_WINDOWS else 1.40
     scale = base + min(0.12, (width_boost + height_boost) * 0.8)
     return max(base, min(ceiling, scale))
 
@@ -5848,7 +5847,7 @@ class DashboardPage(QWidget):
         removed_sessions: list[BrowserSessionHandle] = []
         alive_sessions: list[BrowserSessionHandle] = []
         for session in self._browser_sessions:
-            if session.is_alive():
+            if self._browser_session_is_alive(session):
                 if session.status != "Paused":
                     session.status = "Running"
                 alive_sessions.append(session)
@@ -5884,6 +5883,31 @@ class DashboardPage(QWidget):
 
         if not self._browser_sessions:
             self._browser_watch_timer.stop()
+
+    def _browser_session_is_alive(self, session: BrowserSessionHandle) -> bool:
+        """Treat a browser as alive when its CDP endpoint is still serving.
+
+        On Windows, Edge may hand the window to another process and exit the
+        Popen handle. The debugging endpoint is the reliable signal because it
+        is also what campaign workers use to connect to the existing window.
+        """
+        if session.process is not None and session.process.poll() is None:
+            return True
+        if session.debug_port is None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", session.debug_port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+    def _usable_browser_sessions(self) -> list[BrowserSessionHandle]:
+        self._sync_browser_session_states()
+        return [
+            session
+            for session in self._browser_sessions
+            if session.debug_port is not None and self._browser_session_is_alive(session)
+        ]
 
     def _sync_session_state_from_handles(self) -> None:
         self.state.active_sessions = [
@@ -6407,7 +6431,8 @@ class DashboardPage(QWidget):
         file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
         file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
 
-        if not self._browser_sessions:
+        sessions = self._usable_browser_sessions()
+        if not sessions:
             self.notify("Open browser windows first")
             self._log_action("Campaign blocked: no browser windows available")
             return
@@ -6415,12 +6440,6 @@ class DashboardPage(QWidget):
         ordered_recipients = list(recipients)
         if self.state.email_send_order == "Random shuffle":
             random.shuffle(ordered_recipients)
-
-        sessions = [session for session in self._browser_sessions if session.debug_port is not None]
-        if not sessions:
-            self.notify("Browser windows are not ready yet")
-            self._log_action("Campaign blocked: browser sessions missing debug ports")
-            return
 
         total = len(ordered_recipients)
         window_count = min(len(sessions), total)
@@ -6503,7 +6522,7 @@ class DashboardPage(QWidget):
             return
 
         recipients = payload["recipients"]
-        if not self._browser_sessions:
+        if not self._usable_browser_sessions():
             self._log_action("Campaign requested: launching browser windows first")
             self._pending_campaign_payload = payload
             self._handle_launch()
