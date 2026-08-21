@@ -4042,7 +4042,6 @@ class DashboardPage(QWidget):
         self.delay_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.send_order_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.window_mode_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
-        self.bot_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.ai_provider_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.ai_api_key_input.textEdited.connect(lambda _value: self._on_ai_api_key_changed())
         self.ai_model_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
