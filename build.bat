@@ -14,4 +14,3 @@ pyinstaller --noconfirm --clean --onefile --windowed --name EazyMailer --exclude
 
 echo.
 echo Build complete. Check dist for EazyMailer.exe.
-pause
