@@ -1268,6 +1268,7 @@ class AppState:
     delay_type: str = "Random range"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
+    bot_sending_type: str = "Default"
     ai_available_models: list[str] = field(default_factory=list)
 
 
@@ -1281,6 +1282,8 @@ class BrowserSessionHandle:
     status: str = "Starting"
     profile_dir: Path | None = None
     debug_port: int | None = None
+    send_completed: int = 0
+    send_total: int = 0
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -1392,6 +1395,7 @@ class CampaignSendWorker(QObject):
         attachment_formats: list[str],
         file_name_mode: str,
         window_send_mode: str,
+        bot_sending_type: str,
     ):
         super().__init__()
         self.session = session
@@ -1409,6 +1413,7 @@ class CampaignSendWorker(QObject):
         self.attachment_formats = list(attachment_formats)
         self.file_name_mode = file_name_mode
         self.window_send_mode = window_send_mode
+        self.bot_sending_type = bot_sending_type
 
     def _timestamp(self) -> str:
         return QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -1474,6 +1479,7 @@ class CampaignSendWorker(QObject):
                         self.convert_enabled,
                         True,
                         False,
+                        self._effective_sending_type(),
                     )
                     sent_ok = True
                     break
@@ -1505,6 +1511,11 @@ class CampaignSendWorker(QObject):
             total,
             error_message,
         )
+
+    def _effective_sending_type(self) -> str:
+        if self.bot_sending_type == "Random":
+            return random.choice(("Default", "Typing (Like human)"))
+        return self.bot_sending_type
 
 
 class AnimatedLogoBadge(QWidget):
@@ -1660,6 +1671,11 @@ class TitleBar(QWidget):
         version_badge.setObjectName("versionBadge")
         self.status_badge = QLabel("LOCKED")
         self.status_badge.setObjectName("statusBadge")
+        self.theme_badge = QLabel("◐")
+        self.theme_badge.setObjectName("statusBadge")
+        self.theme_badge.setToolTip("System appearance")
+        self.user_id_label = QLabel("")
+        self.user_id_label.setObjectName("statusBadge")
         for badge in (version_badge, self.status_badge):
             badge.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
             badge.setMinimumWidth(_scaled_int(58 if IS_MAC else 64, self._scale))
@@ -1668,6 +1684,8 @@ class TitleBar(QWidget):
         self.status_badge.setToolTip("Current login status")
         version_badge.hide()
         self.status_badge.hide()
+        self.theme_badge.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
+        self.user_id_label.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
 
         self.logout_button = QPushButton("Logout")
         self.logout_button.setObjectName("secondaryButton")
@@ -1680,10 +1698,16 @@ class TitleBar(QWidget):
         layout.addWidget(spacer)
         layout.addWidget(version_badge)
         layout.addWidget(self.status_badge)
+        layout.addWidget(self.theme_badge)
+        layout.addWidget(self.user_id_label)
         layout.addWidget(self.logout_button)
 
     def set_state(self, username: str, logged_in: bool) -> None:
         self.status_badge.setText("READY" if logged_in else "LOCKED")
+        self.user_id_label.setText(username if logged_in else "")
+        self.theme_badge.setText("☾" if self._window._system_is_dark() else "☀")
+        self.theme_badge.setVisible(logged_in)
+        self.user_id_label.setVisible(logged_in)
         self.logout_button.setVisible(logged_in)
 
     def sync_window_state(self) -> None:
@@ -3080,7 +3104,7 @@ class LoginPage(QWidget):
 
         shell = QFrame()
         shell.setObjectName("loginShell")
-        shell.setMaximumWidth(_scaled_int(480, self._scale))
+        shell.setMaximumWidth(_scaled_int(540, self._scale))
         shell_layout = QVBoxLayout(shell)
         shell_layout.setContentsMargins(_scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale))
         shell_layout.setSpacing(_scaled_int(12, self._scale))
@@ -3386,6 +3410,9 @@ class DashboardPage(QWidget):
         self.send_rand_radio = QRadioButton("Random shuffle")
         self.window_parallel_radio = QRadioButton("Parallel (all windows at once)")
         self.window_sequential_radio = QRadioButton("Sequential (one window at a time)")
+        self.bot_default_radio = QRadioButton("Default")
+        self.bot_typing_radio = QRadioButton("Typing (Like human)")
+        self.bot_random_radio = QRadioButton("Random")
         self._available_ai_models: list[str] = []
         self.window_mode_group = QButtonGroup(self)
         self.delay_type_group = QButtonGroup(self)
@@ -3963,6 +3990,15 @@ class DashboardPage(QWidget):
         window_mode_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Window send mode", self._wrap_layout(window_mode_row)))
 
+        bot_type_row = QHBoxLayout()
+        self.bot_type_group = QButtonGroup(self)
+        self.bot_type_group.setExclusive(True)
+        for button in (self.bot_default_radio, self.bot_typing_radio, self.bot_random_radio):
+            self.bot_type_group.addButton(button)
+            bot_type_row.addWidget(button)
+        bot_type_row.addStretch()
+        send_layout.addWidget(self._labeled_value_row("Bot sending type", self._wrap_layout(bot_type_row)))
+
         layout.addWidget(send_card)
 
         ai_card, ai_layout = self._card("AI ASSISTANT", "Connect an AI provider to unlock model selection.")
@@ -4028,6 +4064,7 @@ class DashboardPage(QWidget):
         self.delay_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.send_order_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.window_mode_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
+        self.bot_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.ai_provider_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.ai_api_key_input.textEdited.connect(lambda _value: self._on_ai_api_key_changed())
         self.ai_model_combo.currentTextChanged.connect(lambda _value: self._schedule_sending_settings_save())
@@ -4085,6 +4122,12 @@ class DashboardPage(QWidget):
         if self.window_sequential_radio.isChecked():
             window_send_mode = "Sequential"
 
+        bot_sending_type = "Default"
+        if self.bot_typing_radio.isChecked():
+            bot_sending_type = "Typing (Like human)"
+        elif self.bot_random_radio.isChecked():
+            bot_sending_type = "Random"
+
         return {
             "sender_limit": int(self.sender_limit.value()),
             "delay_from": float(self.delay_from.value()),
@@ -4094,6 +4137,7 @@ class DashboardPage(QWidget):
             "delay_type": delay_type,
             "email_send_order": email_send_order,
             "window_send_mode": window_send_mode,
+            "bot_sending_type": bot_sending_type,
             "ai_provider": self.ai_provider_combo.currentText().strip() or "ChatGPT",
             "ai_api_key": self.ai_api_key_input.text(),
             "ai_model": self.ai_model_combo.currentText().strip(),
@@ -4142,6 +4186,7 @@ class DashboardPage(QWidget):
         delay_type = str(payload.get("delay_type") or "Random range")
         email_send_order = str(payload.get("email_send_order") or "Sequential")
         window_send_mode = str(payload.get("window_send_mode") or "Parallel")
+        bot_sending_type = str(payload.get("bot_sending_type") or "Default")
         ai_provider = str(payload.get("ai_provider") or "ChatGPT")
         ai_api_key = str(payload.get("ai_api_key") or "")
         ai_model = str(payload.get("ai_model") or "")
@@ -4167,6 +4212,12 @@ class DashboardPage(QWidget):
         _block(self.window_parallel_radio, lambda: self.window_parallel_radio.setChecked(window_send_mode != "Sequential"))
         _block(self.window_sequential_radio, lambda: self.window_sequential_radio.setChecked(window_send_mode == "Sequential"))
 
+        _block(self.bot_default_radio, lambda: self.bot_default_radio.setChecked(bot_sending_type == "Default"))
+        _block(self.bot_typing_radio, lambda: self.bot_typing_radio.setChecked(bot_sending_type == "Typing (Like human)"))
+        _block(self.bot_random_radio, lambda: self.bot_random_radio.setChecked(bot_sending_type == "Random"))
+        if not any((self.bot_default_radio.isChecked(), self.bot_typing_radio.isChecked(), self.bot_random_radio.isChecked())):
+            self.bot_default_radio.setChecked(True)
+
         _block(self.ai_provider_combo, lambda: self.ai_provider_combo.setCurrentText(ai_provider))
         _block(self.ai_api_key_input, lambda: self.ai_api_key_input.setText(ai_api_key))
 
@@ -4178,6 +4229,7 @@ class DashboardPage(QWidget):
         self.state.delay_type = delay_type
         self.state.email_send_order = email_send_order
         self.state.window_send_mode = window_send_mode
+        self.state.bot_sending_type = bot_sending_type if bot_sending_type in {"Default", "Typing (Like human)", "Random"} else "Default"
         self.state.ai_provider = ai_provider
         self.state.ai_api_key = ai_api_key
         self.state.ai_model = ai_model
@@ -4215,6 +4267,7 @@ class DashboardPage(QWidget):
         self.state.delay_type = str(payload["delay_type"])
         self.state.email_send_order = str(payload["email_send_order"])
         self.state.window_send_mode = str(payload["window_send_mode"])
+        self.state.bot_sending_type = str(payload["bot_sending_type"])
         self.state.ai_provider = str(payload["ai_provider"])
         self.state.ai_api_key = str(payload["ai_api_key"])
         self.state.ai_model = str(payload["ai_model"])
@@ -6077,6 +6130,13 @@ class DashboardPage(QWidget):
     def _current_campaign_payload(self) -> dict[str, object]:
         recipients = self._extract_email_candidates(self.pending_emails_editor.toPlainText())
         subject = self.subject_input.text().strip()
+        subjects = [
+            self._subject_item_subject(self.subject_drafts_list.item(index)).strip()
+            for index in range(self.subject_drafts_list.count())
+        ]
+        subjects = [item for item in subjects if item]
+        if subject and subject not in subjects:
+            subjects.insert(0, subject)
         current_body = self._current_body_widget()
         body_text = ""
         body_html = ""
@@ -6089,6 +6149,7 @@ class DashboardPage(QWidget):
         return {
             "recipients": recipients,
             "subject": subject,
+            "subjects": subjects,
             "body_text": body_text,
             "body_html": body_html,
             "attachment_html": attachment_html,
@@ -6186,6 +6247,18 @@ class DashboardPage(QWidget):
                     process.kill()
                 except Exception:
                     pass
+        elif process is not None and sys.platform.startswith("win"):
+            # Edge/Chrome can hand the window to a child process before the
+            # launcher exits; terminate that process tree as well.
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
         self._browser_sessions = [item for item in self._browser_sessions if item.session_id != session_id]
         self._sync_session_state_from_handles()
         self._refresh_sessions()
@@ -6260,7 +6333,7 @@ class DashboardPage(QWidget):
         self,
         sessions: list[BrowserSessionHandle],
         recipients: list[str],
-        subject_template: str,
+        subject_template: str | list[str],
         body_template: str,
         attachment_html: str,
         attachment_formats: list[str],
@@ -6278,7 +6351,8 @@ class DashboardPage(QWidget):
             window_label = f"Window {index}"
             for recipient in chunk:
                 tag_values = self._dynamic_tag_values()
-                subject = self._apply_tags_to_text(subject_template, recipient, tag_values=tag_values)
+                selected_subject = random.choice(subject_template) if isinstance(subject_template, list) and subject_template else str(subject_template)
+                subject = self._apply_tags_to_text(selected_subject, recipient, tag_values=tag_values)
                 body_text = self._apply_tags_to_text(body_template, recipient, subject, tag_values=tag_values)
                 attachment_text = self._apply_tags_to_text(attachment_html, recipient, subject, tag_values=tag_values)
                 file_name_text = self._apply_tags_to_text(file_name_value, recipient, subject, tag_values=tag_values)
@@ -6302,9 +6376,14 @@ class DashboardPage(QWidget):
         return jobs
 
     def _queue_campaign_job(self, job: dict[str, object]) -> None:
+        session = job["session"]
+        if isinstance(session, BrowserSessionHandle):
+            session.send_completed = 0
+            session.send_total = len(job["tasks"])
+            self._refresh_sessions()
         thread = QThread(self)
         worker = CampaignSendWorker(
-            job["session"],
+            session,
             job["tasks"],
             self._campaign_pause_event,
             self._campaign_cancel_event,
@@ -6323,6 +6402,7 @@ class DashboardPage(QWidget):
             ),
             file_name_mode=str(self._pending_campaign_payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto"),
             window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
+            bot_sending_type=getattr(self.state, "bot_sending_type", "Default"),
         )
         worker.moveToThread(thread)
         # Start the bootstrap worker directly on the QThread. This avoids the
@@ -6347,6 +6427,11 @@ class DashboardPage(QWidget):
         self._queue_campaign_job(job)
 
     def _on_campaign_worker_progress(self, session_id: str, window_label: str, completed: int, total: int) -> None:
+        session = next((item for item in self._browser_sessions if item.session_id == session_id), None)
+        if session is not None:
+            session.send_completed = completed
+            session.send_total = total
+            self._refresh_sessions()
         self._campaign_worker_progress[session_id] = completed
         self._campaign_worker_totals[session_id] = total
         self._campaign_completed = sum(self._campaign_worker_progress.values())
@@ -6384,6 +6469,11 @@ class DashboardPage(QWidget):
         self._campaign_workers.pop(session_id, None)
         self._campaign_worker_progress[session_id] = completed
         self._campaign_worker_totals[session_id] = total
+        session = next((item for item in self._browser_sessions if item.session_id == session_id), None)
+        if session is not None:
+            session.send_completed = completed
+            session.send_total = total
+            self._refresh_sessions()
         self._campaign_completed = sum(self._campaign_worker_progress.values())
         self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
         if error_message:
@@ -6441,7 +6531,14 @@ class DashboardPage(QWidget):
             self._log_action("Campaign blocked: no recipients available")
             return
 
-        subject_template = str(payload.get("subject") or "").strip()
+        subject_values = payload.get("subjects")
+        subject_template: str | list[str]
+        if isinstance(subject_values, list):
+            subject_template = [str(item).strip() for item in subject_values if str(item).strip()]
+        else:
+            subject_template = str(payload.get("subject") or "").strip()
+        if not subject_template:
+            subject_template = str(payload.get("subject") or "").strip()
         body_template = self._campaign_body_text(str(payload.get("body_text") or ""), str(payload.get("body_html") or ""))
         if not body_template:
             self.notify("Add body content before starting the campaign")
@@ -6846,6 +6943,7 @@ class DashboardPage(QWidget):
         convert_enabled: bool,
         already_resolved: bool = False,
         log_steps: bool = True,
+        sending_type: str = "Default",
     ) -> None:
         attachment_paths = self._compose_attachment_paths(
             recipient,
@@ -6936,21 +7034,30 @@ class DashboardPage(QWidget):
                     'input[aria-label^="To"], input[aria-label*="To recipients"], input[name="to"]'
                 ).first
                 recipient_box.wait_for(state="visible", timeout=10000)
-                recipient_box.fill(recipient)
+                if sending_type == "Typing (Like human)":
+                    recipient_box.press_sequentially(recipient, delay=random.uniform(0.015, 0.045))
+                else:
+                    recipient_box.fill(recipient)
                 recipient_box.press("Enter")
                 if log_steps:
                     self._log_action("Recipient entered")
 
                 subject_box = page.locator('input[name="subjectbox"], input[placeholder*="Subject"]').first
                 subject_box.wait_for(state="visible", timeout=10000)
-                subject_box.fill(subject)
+                if sending_type == "Typing (Like human)":
+                    subject_box.press_sequentially(subject, delay=random.uniform(0.015, 0.045))
+                else:
+                    subject_box.fill(subject)
                 if log_steps:
                     self._log_action("Subject entered")
 
                 body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
                 body_box.wait_for(state="visible", timeout=10000)
                 body_box.click()
-                body_box.fill(body_text)
+                if sending_type == "Typing (Like human)":
+                    body_box.press_sequentially(body_text, delay=random.uniform(0.008, 0.03))
+                else:
+                    body_box.fill(body_text)
                 if log_steps:
                     self._log_action("Body entered")
 
@@ -7517,6 +7624,11 @@ class DashboardPage(QWidget):
         if not file_paths:
             return
 
+        if self.attach_tabs.count() == 1:
+            placeholder = self._current_attachment_widget()
+            if placeholder is not None and not placeholder.html_editor.toPlainText().strip():
+                self.attach_tabs.removeTab(0)
+
         imported = 0
         self._show_subject_body_loader("Uploading attachment files.")
         self._workspace_loading = True
@@ -7858,6 +7970,15 @@ class DashboardPage(QWidget):
         )
         if not file_paths:
             return
+
+        if self.body_tabs.count() == 1:
+            placeholder = self._current_body_widget()
+            if placeholder is not None:
+                payload = placeholder.payload()
+                plain = str(payload.get("plain_text") or "").strip()
+                html_text = str(payload.get("html_text") or "").strip()
+                if plain in {"", "Hello {{first_name}},\n\nThis is a body message."} and not html_text:
+                    self.body_tabs.removeTab(0)
 
         imported = 0
         self._show_subject_body_loader("Uploading body files.")
@@ -8493,6 +8614,16 @@ class DashboardPage(QWidget):
         self.delay_fixed_radio.blockSignals(False)
         self.delay_random_radio.blockSignals(False)
         self.delay_human_radio.blockSignals(False)
+        bot_type = getattr(self.state, "bot_sending_type", "Default")
+        self.bot_default_radio.blockSignals(True)
+        self.bot_typing_radio.blockSignals(True)
+        self.bot_random_radio.blockSignals(True)
+        self.bot_default_radio.setChecked(bot_type == "Default")
+        self.bot_typing_radio.setChecked(bot_type == "Typing (Like human)")
+        self.bot_random_radio.setChecked(bot_type == "Random")
+        self.bot_default_radio.blockSignals(False)
+        self.bot_typing_radio.blockSignals(False)
+        self.bot_random_radio.blockSignals(False)
         self.send_seq_radio.blockSignals(True)
         self.send_rand_radio.blockSignals(True)
         self.send_seq_radio.setChecked(getattr(self.state, "email_send_order", "Sequential") != "Random shuffle")
@@ -8551,6 +8682,8 @@ class DashboardPage(QWidget):
         label.setObjectName("sessionTitleSmall")
         state = QLabel(f"{session.mode} - {session.status}")
         state.setObjectName("sessionState")
+        count = QLabel(f"({session.send_completed}/{session.send_total})")
+        count.setObjectName("sessionState")
         label.setMinimumWidth(_scaled_int(72, self._scale))
         state.setMinimumWidth(_scaled_int(80, self._scale))
         state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -8569,6 +8702,7 @@ class DashboardPage(QWidget):
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(_scaled_int(6, self._scale))
         bottom_row.addWidget(state)
+        bottom_row.addWidget(count)
         bottom_row.addStretch()
         bottom_row.addWidget(close_button)
 
@@ -8585,6 +8719,10 @@ class DashboardPage(QWidget):
 
 
 class MainWindow(QMainWindow):
+    def _system_is_dark(self) -> bool:
+        palette = QApplication.palette()
+        return palette.window().color().lightness() < 150
+
     def __init__(self):
         super().__init__()
         self.state = AppState()
@@ -8595,6 +8733,9 @@ class MainWindow(QMainWindow):
         self._browser_bootstrap_worker: BrowserBootstrapWorker | None = None
         self._browser_bootstrap_timer: QTimer | None = None
         self._browser_bootstrap_running = False
+        self._session_check_timer = QTimer(self)
+        self._session_check_timer.setInterval(30000)
+        self._session_check_timer.timeout.connect(self._check_active_login_session)
         self._scale = _compute_layout_scale(QApplication.primaryScreen())
         self._text_scale = _compute_text_scale(QApplication.primaryScreen())
         self._centered_once = False
@@ -9349,9 +9490,32 @@ class MainWindow(QMainWindow):
             self.show_toast("Signed in, but workspace reload had an issue", "warning")
         self.dashboard_page._log_action("User authenticated")
         self.show_toast("Signed in successfully", "success")
+        self._session_check_timer.start()
         QTimer.singleShot(150, self._start_windows_browser_bootstrap)
 
-    def handle_logout(self) -> None:
+    def _check_active_login_session(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            return
+        try:
+            api_get_settings(self.state.auth_token)
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                self._perform_logout(confirm=False, reason="This account was signed in on another device.")
+        except Exception:
+            pass
+
+    def _perform_logout(self, *, confirm: bool, reason: str = "") -> None:
+        if confirm and self.state.logged_in and self.state.username:
+            reply = QMessageBox.question(
+                self,
+                "Confirm Logout",
+                f"Log out user {self.state.username}?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self._session_check_timer.stop()
         self._last_login_username = self.state.username
         if self.state.logged_in and self.state.username:
             self.dashboard_page._log_action("User signed out")
@@ -9369,7 +9533,10 @@ class MainWindow(QMainWindow):
         self.login_page.password_input.clear()
         self.login_page.error_label.setText("")
         self.show_login()
-        self.show_toast("Logged out", "warning")
+        self.show_toast(reason or "Logged out", "warning")
+
+    def handle_logout(self) -> None:
+        self._perform_logout(confirm=True)
 
     def closeEvent(self, event) -> None:
         try:

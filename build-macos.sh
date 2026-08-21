@@ -53,8 +53,14 @@ pyinstaller \
   --clean \
   --windowed \
   --name "$APP_NAME" \
+  --icon "$ROOT_DIR/packaging/macos-dmg/EzyMailer.app/Contents/Resources/icon-windowed.icns" \
+  --collect-all PIL \
+  --collect-all greenlet \
+  --collect-all lxml \
+  --collect-all charset_normalizer \
+  --hidden-import PIL.Image \
+  --hidden-import greenlet._greenlet \
   --exclude-module playwright \
-  --exclude-module PIL \
   --exclude-module docx \
   --exclude-module openpyxl \
   --exclude-module reportlab \
