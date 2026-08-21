@@ -17,6 +17,7 @@ import socket
 import string
 import threading
 import uuid
+import certifi
 from datetime import datetime
 from io import BytesIO
 import urllib.error
@@ -100,20 +101,6 @@ from PySide6.QtWidgets import (
     QWidget,
     QHeaderView,
 )
-from PIL import Image
-from docx import Document
-from docx.shared import Inches
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as OpenPyxlImage
-from reportlab.lib.utils import ImageReader
-from reportlab.lib.units import inch as reportlab_inch
-from reportlab.pdfgen import canvas
-from pptx import Presentation
-from pptx.util import Inches as PptxInches
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
-
-
 APP_TITLE = "EzyMailer"
 DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin"
@@ -141,12 +128,112 @@ LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
+DEFAULT_BROWSER_DOWNLOAD_HOST = "https://cdn.playwright.dev"
+DEPENDENCY_RELEASE_TAG = "dependencies-v2"
+DEPENDENCY_RELEASE_BASE = (
+    "https://github.com/fytripscloud-lab/EzyMailer/releases/download/"
+    f"{DEPENDENCY_RELEASE_TAG}"
+)
 
 
 def _runtime_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _external_dependency_dir() -> Path:
+    if getattr(sys, "frozen", False) and IS_MAC:
+        root = _runtime_root().parents[2]
+    elif getattr(sys, "frozen", False):
+        root = _runtime_root()
+    else:
+        root = _runtime_root()
+    return root / ".ezymailer" / "dependencies" / DEPENDENCY_RELEASE_TAG
+
+
+def _external_dependency_asset() -> str:
+    if IS_MAC and platform.machine().lower() in {"arm64", "aarch64"}:
+        return "ezymailer-dependencies-macos-arm64.zip"
+    if IS_WINDOWS:
+        return "ezymailer-dependencies-windows-x64.zip"
+    raise RuntimeError(f"No external dependency archive is available for {platform.system()} {platform.machine()}")
+
+
+def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] | None = None) -> Path:
+    """Download and extract the versioned GitHub dependency pack once."""
+    target = _external_dependency_dir()
+    marker = target / ".ready"
+    target.mkdir(parents=True, exist_ok=True)
+    if marker.exists():
+        if str(target) not in sys.path:
+            sys.path.insert(0, str(target))
+        return target
+
+    asset_name = _external_dependency_asset()
+    archive_path = target.with_suffix(".zip.part")
+    url = f"{DEPENDENCY_RELEASE_BASE}/{asset_name}"
+    if progress:
+        progress("Downloading app dependencies", "Connecting to GitHub CDN • ETA calculating", 1, 100)
+    request = urllib.request.Request(url, headers={"User-Agent": "EazyMailer"})
+    try:
+        tls_context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=30, context=tls_context) as response, archive_path.open("wb") as output:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            started_at = time.monotonic()
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+                elapsed = max(time.monotonic() - started_at, 0.1)
+                speed = downloaded / elapsed
+                eta = (total - downloaded) / speed if total and speed > 0 else None
+                if eta is None:
+                    eta_text = "ETA calculating"
+                else:
+                    eta_text = f"ETA {int(eta // 60)}m {int(eta % 60):02d}s"
+                percent = int(downloaded * 85 / total) if total else 5
+                if progress:
+                    progress(
+                        "Downloading app dependencies",
+                        f"{downloaded / 1048576:.0f} MB downloaded • {eta_text}",
+                        max(1, min(85, percent)),
+                        100,
+                    )
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+
+    if progress:
+        progress("Extracting app dependencies", "Automatically extracting the downloaded runtime", 90, 100)
+    import zipfile
+
+    extraction_dir = target.with_name(target.name + ".extracting")
+    shutil.rmtree(extraction_dir, ignore_errors=True)
+    extraction_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(extraction_dir)
+    shutil.rmtree(target, ignore_errors=True)
+    extraction_dir.rename(target)
+    archive_path.unlink(missing_ok=True)
+    packaged_browser = target / BUILTIN_BROWSER_DIR_NAME
+    browser_cache = _browser_cache_dir()
+    if packaged_browser.exists():
+        if browser_cache.exists():
+            shutil.rmtree(packaged_browser, ignore_errors=True)
+        else:
+            browser_cache.parent.mkdir(parents=True, exist_ok=True)
+            packaged_browser.rename(browser_cache)
+    marker = target / ".ready"
+    marker.write_text(DEPENDENCY_RELEASE_TAG, encoding="utf-8")
+    if str(target) not in sys.path:
+        sys.path.insert(0, str(target))
+    if progress:
+        progress("Dependencies ready", "The downloaded runtime is ready to use", 100, 100)
+    return target
 
 
 def _find_first_existing(paths: list[Path]) -> Path | None:
@@ -163,10 +250,23 @@ def _find_executable(root: Path, names: list[str]) -> Path | None:
             return direct
     if not root.exists():
         return None
-    for name in names:
-        matches = list(root.rglob(name))
-        if matches:
-            return matches[0]
+
+    # Playwright's browser cache has a stable two-level layout. Avoid a full
+    # recursive scan here because a completed Chromium cache is hundreds of
+    # megabytes and can otherwise delay the post-login loader for minutes.
+    version_roots = [root] if root.name.startswith("chromium-") else list(root.glob("chromium-*"))
+    for version_root in version_roots:
+        platform_roots = list(version_root.glob("chrome-*"))
+        if not platform_roots:
+            platform_roots = list(version_root.glob("chromium-*"))
+        for platform_root in platform_roots:
+            mac_app = platform_root / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+            if mac_app.exists():
+                return mac_app
+            for name in names:
+                candidate = platform_root / name
+                if candidate.exists():
+                    return candidate
     return None
 
 
@@ -174,48 +274,155 @@ def _browser_cache_dir() -> Path:
     override = os.getenv("EZYM_MAILER_BROWSER_CACHE_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    return LOCAL_CACHE_DIR / BUILTIN_BROWSER_DIR_NAME
+
+    # Use one deterministic cache beside the portable build. Do not inspect
+    # legacy or system caches; this makes first-run behavior predictable.
+    if getattr(sys, "frozen", False):
+        if IS_MAC:
+            adjacent_root = _runtime_root().parents[2]
+        else:
+            adjacent_root = _runtime_root()
+        return adjacent_root / ".ezymailer" / BUILTIN_BROWSER_DIR_NAME
+    return _runtime_root() / ".ezymailer" / BUILTIN_BROWSER_DIR_NAME
+
+
+def _cached_browser_binary(root: Path) -> Path | None:
+    """Resolve only the expected Playwright Chromium layout."""
+    for version_root in sorted(root.glob("chromium-*")):
+        direct_paths = [
+            version_root / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing",
+            version_root / "chrome-win64" / "chrome.exe",
+            version_root / "chrome-win" / "chrome.exe",
+            version_root / "chrome-linux64" / "chrome",
+            version_root / "chrome-linux" / "chrome",
+        ]
+        for candidate in direct_paths:
+            if candidate.exists():
+                return candidate
+    return None
 
 
 class BrowserBootstrapWorker(QObject):
-    progress = Signal(str, str)
+    progress = Signal(str, str, int, int)
     finished = Signal(bool, str)
 
     def __init__(self, browser_cache_dir: Path, parent=None):
         super().__init__(parent)
         self._browser_cache_dir = browser_cache_dir
+        self.latest_progress: tuple[str, str, int, int] | None = None
+        self.result: tuple[bool, str] | None = None
+        self._state_lock = threading.Lock()
+
+    def _report(self, title: str, subtitle: str, value: int, total: int) -> None:
+        with self._state_lock:
+            self.latest_progress = (title, subtitle, value, total)
+
+    def _finish(self, success: bool, message: str) -> None:
+        with self._state_lock:
+            self.result = (success, message)
 
     def run(self) -> None:
         try:
-            self.progress.emit(
-                "Auto-configuring additional files",
+            self._report(
+                "The app is building",
                 "Checking the local browser cache.",
+                10,
+                100,
             )
             self._browser_cache_dir.mkdir(parents=True, exist_ok=True)
+            ensure_external_dependencies(self._report)
+            existing_browser = _cached_browser_binary(self._browser_cache_dir)
+            if existing_browser is not None:
+                self._report(
+                    "Dependencies already ready",
+                    "Using the previously downloaded Chromium runtime.",
+                    100,
+                    100,
+                )
+                self._finish(True, "Browser runtime already configured.")
+                return
+
+            # Move visibly into the download phase before Playwright resolves
+            # its driver, so a slow CDN/driver startup cannot look hung.
+            self._report(
+                "Downloading Chromium",
+                "Connecting to the Chromium CDN • ETA calculating",
+                15,
+                100,
+            )
             from playwright._impl._driver import compute_driver_executable, get_driver_env
 
             driver_executable, driver_cli = compute_driver_executable()
-            self.progress.emit(
-                "Auto-configuring additional files",
-                "Downloading browser runtime from the CDN.",
+            self._report(
+                "The app is building",
+                "Additional files are downloading from the CDN.",
+                2,
+                100,
             )
             env = os.environ.copy()
             env.update(get_driver_env())
             env["PLAYWRIGHT_BROWSERS_PATH"] = str(self._browser_cache_dir)
-            completed = subprocess.run(
+            # Keep the first-run browser download on the official Playwright
+            # Chromium CDN instead of relying on an installed system browser.
+            env["PLAYWRIGHT_DOWNLOAD_HOST"] = os.getenv(
+                "EZYM_MAILER_BROWSER_DOWNLOAD_HOST",
+                DEFAULT_BROWSER_DOWNLOAD_HOST,
+            )
+            process = subprocess.Popen(
                 [driver_executable, driver_cli, "install", "chromium"],
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            if completed.returncode != 0:
-                error_message = (completed.stderr or completed.stdout or "Playwright install failed.").strip()
-                raise RuntimeError(error_message)
-            self.finished.emit(True, "Browser runtime configured.")
+            started_at = time.monotonic()
+            expected_bytes = 360 * 1024 * 1024
+            while process.poll() is None:
+                downloaded_bytes = 0
+                try:
+                    for file_path in self._browser_cache_dir.rglob("*"):
+                        if file_path.is_file():
+                            downloaded_bytes += file_path.stat().st_size
+                except OSError:
+                    pass
+
+                elapsed = max(time.monotonic() - started_at, 0.1)
+                speed = downloaded_bytes / elapsed
+                remaining = max(expected_bytes - downloaded_bytes, 0)
+                eta = remaining / speed if speed > 0 else None
+                if eta is None:
+                    eta_text = "calculating ETA"
+                else:
+                    eta_text = f"ETA {int(eta // 60)}m {int(eta % 60):02d}s"
+                # Progress reflects the measured bytes, not a synthetic 20%
+                # offset. Keep a small visible value while the first chunk is
+                # being established.
+                progress = min(98, max(2, int((downloaded_bytes / expected_bytes) * 98)))
+                downloaded_mb = downloaded_bytes / (1024 * 1024)
+                self._report(
+                    "Downloading Chromium",
+                    f"{downloaded_mb:.0f} MB downloaded • {eta_text}",
+                    progress,
+                    100,
+                )
+                time.sleep(0.5)
+
+            if process.returncode != 0:
+                raise RuntimeError("Playwright could not download Chromium.")
+            self._report(
+                "The app is building",
+                "Automatically configuring the downloaded files.",
+                90,
+                100,
+            )
+            self._report(
+                "Browser ready",
+                "The workspace is ready to use.",
+                100,
+                100,
+            )
+            self._finish(True, "Browser runtime configured.")
         except Exception as exc:
-            self.finished.emit(False, str(exc))
+            self._finish(False, str(exc))
 
 
 def _scaled_int(value: float, scale: float, minimum: int = 1) -> int:
@@ -1572,10 +1779,16 @@ class LaunchLoaderDialog(QDialog):
         self.loader_status = QLabel("Preparing")
         self.loader_status.setObjectName("loaderStatus")
         self.loader_status.setAlignment(Qt.AlignCenter)
+        self.loader_progress = QProgressBar()
+        self.loader_progress.setObjectName("loaderProgress")
+        self.loader_progress.setRange(0, 0)
+        self.loader_progress.setValue(0)
+        self.loader_progress.setTextVisible(True)
 
         card_layout.addWidget(self.robot, alignment=Qt.AlignCenter)
         card_layout.addWidget(self.loader_title)
         card_layout.addWidget(self.loader_subtitle)
+        card_layout.addWidget(self.loader_progress)
         card_layout.addWidget(self.loader_status)
 
         root.addWidget(card, alignment=Qt.AlignCenter)
@@ -1588,6 +1801,27 @@ class LaunchLoaderDialog(QDialog):
         if status_prefix:
             self._status_prefix = status_prefix
             self.loader_status.setText(status_prefix)
+        self.loader_progress.setRange(0, 0)
+        self.loader_progress.setValue(0)
+
+    def set_busy(self, title: str | None = None, subtitle: str | None = None, status_prefix: str = "Preparing") -> None:
+        if title:
+            self.loader_title.setText(title)
+        if subtitle:
+            self.loader_subtitle.setText(subtitle)
+        self._status_prefix = status_prefix
+        self.loader_status.setText(status_prefix)
+        self.loader_progress.setRange(0, 0)
+        self.loader_progress.setValue(0)
+
+    def set_progress(self, value: int, total: int = 100, status_prefix: str | None = None) -> None:
+        total = max(total, 1)
+        value = max(0, min(value, total))
+        self.loader_progress.setRange(0, total)
+        self.loader_progress.setValue(value)
+        if status_prefix:
+            self._status_prefix = status_prefix
+        self.loader_status.setText(self._status_prefix)
 
     def set_status_prefix(self, prefix: str) -> None:
         self._status_prefix = prefix
@@ -5393,32 +5627,7 @@ class DashboardPage(QWidget):
             candidate = Path(env_binary).expanduser()
             if candidate.exists():
                 return candidate
-
-        bundle_roots = [
-            _browser_cache_dir(),
-            _runtime_root() / BUILTIN_BROWSER_DIR_NAME,
-            _runtime_root().parent / "Resources" / BUILTIN_BROWSER_DIR_NAME,
-            Path.cwd() / BUILTIN_BROWSER_DIR_NAME,
-            Path.home() / BUILTIN_BROWSER_DIR_NAME,
-        ]
-        candidates = [
-            "chrome",
-            "chrome.exe",
-            "Google Chrome for Testing",
-            "Chromium",
-            "Chromium.exe",
-            "chromium",
-            "chromium.exe",
-            "chromium-browser",
-            "chromium-browser.exe",
-        ]
-
-        for root in bundle_roots:
-            candidate = _find_executable(root, candidates)
-            if candidate is not None:
-                return candidate
-
-        return None
+        return _cached_browser_binary(_browser_cache_dir())
 
     def _browser_launch_rect(self, index: int, total: int) -> tuple[int, int, int, int]:
         screen = self.window().screen() or QApplication.primaryScreen()
@@ -5501,6 +5710,7 @@ class DashboardPage(QWidget):
             [
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-infobars",
                 "--disable-default-apps",
                 "--disable-features=ChromeWhatsNewUI",
                 f"--remote-debugging-port={debug_port}",
@@ -5962,7 +6172,9 @@ class DashboardPage(QWidget):
             window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
         )
         worker.moveToThread(thread)
-        thread.started.connect(worker.run)
+        # Start the bootstrap worker directly on the QThread. This avoids the
+        # queued-start race that can leave the modal loader indeterminate.
+        thread.started.connect(worker.run, Qt.DirectConnection)
         worker.log.connect(self._append_campaign_send_log)
         worker.progress.connect(self._on_campaign_worker_progress)
         worker.finished.connect(self._on_campaign_worker_finished)
@@ -6224,6 +6436,10 @@ class DashboardPage(QWidget):
         return f"http://127.0.0.1:{session.debug_port}"
 
     def _render_html_to_jpg(self, html_content: str, output_path: Path) -> None:
+        ensure_external_dependencies()
+        from PIL import Image
+        from playwright.sync_api import sync_playwright
+
         html_content = html_content.strip() or "<html><body></body></html>"
         with sync_playwright() as playwright:
             binary = self._browser_binary()
@@ -6290,6 +6506,9 @@ class DashboardPage(QWidget):
         return
 
     def _attachment_image_size(self, jpg_path: Path) -> tuple[int, int]:
+        ensure_external_dependencies()
+        from PIL import Image
+
         image = Image.open(jpg_path)
         try:
             width, height = image.size
@@ -6309,6 +6528,17 @@ class DashboardPage(QWidget):
         return page_width_in, page_height_in
 
     def _export_jpg_to_format(self, jpg_path: Path, format_value: str, output_path: Path) -> Path:
+        ensure_external_dependencies()
+        from docx import Document
+        from docx.shared import Inches
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as OpenPyxlImage
+        from reportlab.lib.units import inch as reportlab_inch
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfgen import canvas
+        from pptx import Presentation
+        from pptx.util import Inches as PptxInches
+
         format_value = (format_value or "").strip()
         if format_value == "PDF document":
             image_width, image_height = self._attachment_image_size(jpg_path)
@@ -6401,6 +6631,7 @@ class DashboardPage(QWidget):
         convert_enabled: bool,
         already_resolved: bool = False,
     ) -> list[Path]:
+        ensure_external_dependencies()
         temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
         resolved_attachment_html = attachment_html if already_resolved else self._apply_tags_to_text(attachment_html, recipient, subject)
         base_name = self._attachment_output_name_base(
@@ -6506,6 +6737,10 @@ class DashboardPage(QWidget):
         *,
         log_steps: bool = True,
     ) -> None:
+        ensure_external_dependencies()
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+
         try:
             with sync_playwright() as playwright:
                 browser = None
@@ -8210,6 +8445,7 @@ class MainWindow(QMainWindow):
         self._last_login_username = ""
         self._browser_bootstrap_thread: QThread | None = None
         self._browser_bootstrap_worker: BrowserBootstrapWorker | None = None
+        self._browser_bootstrap_timer: QTimer | None = None
         self._browser_bootstrap_running = False
         self._scale = _compute_layout_scale(QApplication.primaryScreen())
         self._text_scale = _compute_text_scale(QApplication.primaryScreen())
@@ -8264,61 +8500,116 @@ class MainWindow(QMainWindow):
         self.launch_loader.activateWindow()
 
     def show_bootstrap_loader(self, title: str, subtitle: str) -> None:
-        self.launch_loader.set_message(title, subtitle, status_prefix="Configuring")
+        # This is a visual progress overlay, not a modal dialog. Application
+        # modality can leave the parent disabled after the overlay closes.
+        self.launch_loader.setWindowModality(Qt.NonModal)
+        self.launch_loader.setModal(False)
+        self.launch_loader.set_busy(title, subtitle, status_prefix="Configuring")
         self.launch_loader.show()
         self.launch_loader.raise_()
         self.launch_loader.activateWindow()
 
     def hide_launch_loader(self) -> None:
-        if self.launch_loader.isVisible():
-            self.launch_loader.close()
+        self.launch_loader.setWindowModality(Qt.NonModal)
+        self.launch_loader.setModal(False)
+        self.launch_loader.releaseKeyboard()
+        self.launch_loader.releaseMouse()
+        self.launch_loader.hide()
+        self.launch_loader.close()
+        self.setEnabled(True)
+        self.activateWindow()
 
     def _start_windows_browser_bootstrap(self) -> None:
         if self._browser_bootstrap_running:
-            return
-        if self._browser_binary() is not None:
             return
 
         browser_cache_dir = _browser_cache_dir()
         self._browser_bootstrap_running = True
         self.show_bootstrap_loader(
-            "Auto-configuring additional files",
-            "Downloading browser runtime from the CDN for first launch.",
+            "Preparing browser and app dependencies",
+            "Checking the local runtime before the workspace opens.",
         )
+        self.launch_loader.set_message(
+            "Downloading Chromium",
+            "Starting the one-time Chromium CDN download • ETA calculating",
+            status_prefix="Downloading",
+        )
+        self.launch_loader.set_progress(2, 100, status_prefix="Downloading")
 
-        thread = QThread(self)
+        # Do not call _log_action here: it records to the remote activity API
+        # synchronously and can block the GUI before the downloader starts.
+        self.state.activity_log.append("Preparing browser dependencies after login")
+        self.dashboard_page._refresh_activity()
+
         worker = BrowserBootstrapWorker(browser_cache_dir)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._update_browser_bootstrap_message)
-        worker.finished.connect(self._finish_windows_browser_bootstrap)
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
+        thread = threading.Thread(
+            target=worker.run,
+            name="ezymailer-browser-bootstrap",
+            daemon=True,
+        )
         self._browser_bootstrap_thread = thread
         self._browser_bootstrap_worker = worker
+        self._browser_bootstrap_timer = QTimer(self)
+        self._browser_bootstrap_timer.setInterval(250)
+        self._browser_bootstrap_timer.timeout.connect(self._poll_browser_bootstrap)
+        self._browser_bootstrap_timer.start()
         thread.start()
 
-    def _update_browser_bootstrap_message(self, title: str, subtitle: str) -> None:
+    def _poll_browser_bootstrap(self) -> None:
+        worker = self._browser_bootstrap_worker
+        if worker is None:
+            return
+        with worker._state_lock:
+            progress = worker.latest_progress
+            result = worker.result
+        if progress is not None:
+            self._update_browser_bootstrap_message(*progress)
+        if result is not None:
+            if self._browser_bootstrap_timer is not None:
+                self._browser_bootstrap_timer.stop()
+                self._browser_bootstrap_timer.deleteLater()
+                self._browser_bootstrap_timer = None
+            self._finish_windows_browser_bootstrap(*result)
+
+    def _update_browser_bootstrap_message(self, title: str, subtitle: str, value: int, total: int) -> None:
         if self.launch_loader.isVisible():
             self.launch_loader.set_message(title, subtitle, status_prefix="Configuring")
+            self.launch_loader.set_progress(value, total, status_prefix="Configuring")
+            if value >= total and title in {"Browser ready", "Dependencies already ready"}:
+                # Close synchronously from the GUI timer that received the
+                # ready state. A deferred callback can be overwritten by the
+                # loader's animation timer and leave the ready screen open.
+                self.hide_launch_loader()
 
     def _finish_windows_browser_bootstrap(self, success: bool, message: str) -> None:
+        if not self._browser_bootstrap_running and self._browser_bootstrap_worker is None:
+            return
         self._browser_bootstrap_running = False
         self._browser_bootstrap_worker = None
         self._browser_bootstrap_thread = None
-        self.hide_launch_loader()
 
         browser_binary = self._browser_binary()
         if success and browser_binary is not None:
+            if self.launch_loader.isVisible():
+                self.launch_loader.set_message(
+                    "Additional files configured",
+                    "The app finished preparing its browser runtime.",
+                    status_prefix="Done",
+                )
+                self.launch_loader.set_progress(100, 100, status_prefix="Done")
             self.show_toast("Browser runtime ready", "success")
             if hasattr(self, "dashboard_page"):
                 try:
-                    self.dashboard_page._resume_pending_launch()
+                    if getattr(self.dashboard_page, "_pending_launch_target", 0):
+                        QTimer.singleShot(450, self.dashboard_page._resume_pending_launch)
+                    QTimer.singleShot(100, self.hide_launch_loader)
                 except Exception:
-                    pass
+                    QTimer.singleShot(100, self.hide_launch_loader)
+            else:
+                QTimer.singleShot(100, self.hide_launch_loader)
             return
 
+        self.hide_launch_loader()
         warning_message = message or "Unable to auto-configure the browser runtime."
         print(f"Browser runtime bootstrap failed: {warning_message}")
         self.show_toast("Browser runtime setup needs attention", "warning")
@@ -8909,6 +9200,7 @@ class MainWindow(QMainWindow):
             self.show_toast("Signed in, but workspace reload had an issue", "warning")
         self.dashboard_page._log_action("User authenticated")
         self.show_toast("Signed in successfully", "success")
+        QTimer.singleShot(150, self._start_windows_browser_bootstrap)
 
     def handle_logout(self) -> None:
         self._last_login_username = self.state.username
@@ -8951,7 +9243,6 @@ def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    QTimer.singleShot(0, window._start_windows_browser_bootstrap)
     return app.exec()
 
 

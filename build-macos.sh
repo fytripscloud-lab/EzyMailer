@@ -7,15 +7,15 @@ APP_NAME="EzyMailer"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 STAGING_DIR="$ROOT_DIR/packaging/macos-dmg"
-PLAYWRIGHT_CACHE_DIR="$ROOT_DIR/packaging/playwright-browsers"
 DMG_NAME="$APP_NAME-macOS.dmg"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
 
 export EZYM_MAILER_API_BASE_URL="${EZYM_MAILER_API_BASE_URL:-http://15.206.161.73:8765}"
 export EZYM_MAILER_BOOTSTRAP_API="${EZYM_MAILER_BOOTSTRAP_API:-0}"
+export PYINSTALLER_CONFIG_DIR="$ROOT_DIR/.pyinstaller"
 
 cleanup_paths() {
-  export DIST_DIR ROOT_DIR STAGING_DIR PLAYWRIGHT_CACHE_DIR
+  export DIST_DIR ROOT_DIR STAGING_DIR
 python3 - <<'PY'
 import os
 from pathlib import Path
@@ -26,7 +26,6 @@ paths = [
     Path(os.environ["ROOT_DIR"]) / "build",
     Path(os.environ["DIST_DIR"]) / "EzyMailer.app",
     Path(os.environ["DIST_DIR"]) / "EzyMailer-macOS.dmg",
-    Path(os.environ["PLAYWRIGHT_CACHE_DIR"]),
     Path(os.environ["STAGING_DIR"]),
 ]
 for path in paths:
@@ -48,22 +47,20 @@ pip install -r "$ROOT_DIR/requirements.txt"
 pip install pyinstaller
 
 cleanup_paths
-PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_CACHE_DIR" python -m playwright install chromium
+mkdir -p "$PYINSTALLER_CONFIG_DIR"
 pyinstaller \
   --noconfirm \
   --clean \
   --windowed \
   --name "$APP_NAME" \
-  --hidden-import docx \
-  --hidden-import pptx \
-  --collect-submodules openpyxl \
-  --collect-submodules reportlab \
+  --exclude-module playwright \
+  --exclude-module PIL \
+  --exclude-module docx \
+  --exclude-module openpyxl \
+  --exclude-module reportlab \
+  --exclude-module pptx \
+  --exclude-module lxml \
   "$ROOT_DIR/main.py"
-
-APP_BROWSER_DIR="$APP_BUNDLE/Contents/Resources/playwright-browsers"
-rm -rf "$APP_BROWSER_DIR"
-mkdir -p "$APP_BUNDLE/Contents/Resources"
-cp -R "$PLAYWRIGHT_CACHE_DIR" "$APP_BROWSER_DIR"
 
 mkdir -p "$STAGING_DIR"
 cp -cR "$APP_BUNDLE" "$STAGING_DIR/"

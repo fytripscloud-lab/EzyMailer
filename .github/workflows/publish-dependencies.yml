@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Release tag used by the desktop bootstrapper
         required: true
-        default: dependencies-v1
+        default: dependencies-v2
   push:
     tags:
       - dependencies-v*
@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Package runtime dependencies
+      - name: Package runtime dependencies and Chromium
         shell: bash
         env:
           ASSET_NAME: ${{ matrix.asset }}
@@ -49,6 +49,10 @@ jobs:
             "openpyxl>=3.1.5" \
             "reportlab>=4.4.3" \
             "Pillow>=3.3.2"
+          mkdir -p runtime-dependencies/playwright-browsers
+          PYTHONPATH="$PWD/runtime-dependencies" \
+          PLAYWRIGHT_BROWSERS_PATH="$PWD/runtime-dependencies/playwright-browsers" \
+            python -m playwright install chromium
           python - <<'PY'
           import os
           from pathlib import Path

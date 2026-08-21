@@ -9,4 +9,6 @@ venv/
 packaging/.DS_Store
 packaging/macos-dmg/
 packaging/playwright-browsers/
+.pyinstaller/
+.ezymailer/
 server_credentials/
