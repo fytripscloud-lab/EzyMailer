@@ -1268,7 +1268,6 @@ class AppState:
     delay_type: str = "Random range"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
-    bot_sending_type: str = "Default"
     ai_available_models: list[str] = field(default_factory=list)
 
 
@@ -1395,7 +1394,6 @@ class CampaignSendWorker(QObject):
         attachment_formats: list[str],
         file_name_mode: str,
         window_send_mode: str,
-        bot_sending_type: str,
     ):
         super().__init__()
         self.session = session
@@ -1413,7 +1411,6 @@ class CampaignSendWorker(QObject):
         self.attachment_formats = list(attachment_formats)
         self.file_name_mode = file_name_mode
         self.window_send_mode = window_send_mode
-        self.bot_sending_type = bot_sending_type
 
     def _timestamp(self) -> str:
         return QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -1479,7 +1476,6 @@ class CampaignSendWorker(QObject):
                         self.convert_enabled,
                         True,
                         False,
-                        self._effective_sending_type(),
                     )
                     sent_ok = True
                     break
@@ -1511,12 +1507,6 @@ class CampaignSendWorker(QObject):
             total,
             error_message,
         )
-
-    def _effective_sending_type(self) -> str:
-        if self.bot_sending_type == "Random":
-            return random.choice(("Default", "Typing (Like human)"))
-        return self.bot_sending_type
-
 
 class AnimatedLogoBadge(QWidget):
     def __init__(self, parent=None, scale: float = 1.0):
@@ -3410,9 +3400,6 @@ class DashboardPage(QWidget):
         self.send_rand_radio = QRadioButton("Random shuffle")
         self.window_parallel_radio = QRadioButton("Parallel (all windows at once)")
         self.window_sequential_radio = QRadioButton("Sequential (one window at a time)")
-        self.bot_default_radio = QRadioButton("Default")
-        self.bot_typing_radio = QRadioButton("Typing (Like human)")
-        self.bot_random_radio = QRadioButton("Random")
         self._available_ai_models: list[str] = []
         self.window_mode_group = QButtonGroup(self)
         self.delay_type_group = QButtonGroup(self)
@@ -3990,15 +3977,6 @@ class DashboardPage(QWidget):
         window_mode_row.addStretch()
         send_layout.addWidget(self._labeled_value_row("Window send mode", self._wrap_layout(window_mode_row)))
 
-        bot_type_row = QHBoxLayout()
-        self.bot_type_group = QButtonGroup(self)
-        self.bot_type_group.setExclusive(True)
-        for button in (self.bot_default_radio, self.bot_typing_radio, self.bot_random_radio):
-            self.bot_type_group.addButton(button)
-            bot_type_row.addWidget(button)
-        bot_type_row.addStretch()
-        send_layout.addWidget(self._labeled_value_row("Bot sending type", self._wrap_layout(bot_type_row)))
-
         layout.addWidget(send_card)
 
         ai_card, ai_layout = self._card("AI ASSISTANT", "Connect an AI provider to unlock model selection.")
@@ -4122,12 +4100,6 @@ class DashboardPage(QWidget):
         if self.window_sequential_radio.isChecked():
             window_send_mode = "Sequential"
 
-        bot_sending_type = "Default"
-        if self.bot_typing_radio.isChecked():
-            bot_sending_type = "Typing (Like human)"
-        elif self.bot_random_radio.isChecked():
-            bot_sending_type = "Random"
-
         return {
             "sender_limit": int(self.sender_limit.value()),
             "delay_from": float(self.delay_from.value()),
@@ -4137,7 +4109,6 @@ class DashboardPage(QWidget):
             "delay_type": delay_type,
             "email_send_order": email_send_order,
             "window_send_mode": window_send_mode,
-            "bot_sending_type": bot_sending_type,
             "ai_provider": self.ai_provider_combo.currentText().strip() or "ChatGPT",
             "ai_api_key": self.ai_api_key_input.text(),
             "ai_model": self.ai_model_combo.currentText().strip(),
@@ -4186,7 +4157,6 @@ class DashboardPage(QWidget):
         delay_type = str(payload.get("delay_type") or "Random range")
         email_send_order = str(payload.get("email_send_order") or "Sequential")
         window_send_mode = str(payload.get("window_send_mode") or "Parallel")
-        bot_sending_type = str(payload.get("bot_sending_type") or "Default")
         ai_provider = str(payload.get("ai_provider") or "ChatGPT")
         ai_api_key = str(payload.get("ai_api_key") or "")
         ai_model = str(payload.get("ai_model") or "")
@@ -4212,12 +4182,6 @@ class DashboardPage(QWidget):
         _block(self.window_parallel_radio, lambda: self.window_parallel_radio.setChecked(window_send_mode != "Sequential"))
         _block(self.window_sequential_radio, lambda: self.window_sequential_radio.setChecked(window_send_mode == "Sequential"))
 
-        _block(self.bot_default_radio, lambda: self.bot_default_radio.setChecked(bot_sending_type == "Default"))
-        _block(self.bot_typing_radio, lambda: self.bot_typing_radio.setChecked(bot_sending_type == "Typing (Like human)"))
-        _block(self.bot_random_radio, lambda: self.bot_random_radio.setChecked(bot_sending_type == "Random"))
-        if not any((self.bot_default_radio.isChecked(), self.bot_typing_radio.isChecked(), self.bot_random_radio.isChecked())):
-            self.bot_default_radio.setChecked(True)
-
         _block(self.ai_provider_combo, lambda: self.ai_provider_combo.setCurrentText(ai_provider))
         _block(self.ai_api_key_input, lambda: self.ai_api_key_input.setText(ai_api_key))
 
@@ -4229,7 +4193,6 @@ class DashboardPage(QWidget):
         self.state.delay_type = delay_type
         self.state.email_send_order = email_send_order
         self.state.window_send_mode = window_send_mode
-        self.state.bot_sending_type = bot_sending_type if bot_sending_type in {"Default", "Typing (Like human)", "Random"} else "Default"
         self.state.ai_provider = ai_provider
         self.state.ai_api_key = ai_api_key
         self.state.ai_model = ai_model
@@ -4267,7 +4230,6 @@ class DashboardPage(QWidget):
         self.state.delay_type = str(payload["delay_type"])
         self.state.email_send_order = str(payload["email_send_order"])
         self.state.window_send_mode = str(payload["window_send_mode"])
-        self.state.bot_sending_type = str(payload["bot_sending_type"])
         self.state.ai_provider = str(payload["ai_provider"])
         self.state.ai_api_key = str(payload["ai_api_key"])
         self.state.ai_model = str(payload["ai_model"])
@@ -6402,7 +6364,6 @@ class DashboardPage(QWidget):
             ),
             file_name_mode=str(self._pending_campaign_payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto"),
             window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
-            bot_sending_type=getattr(self.state, "bot_sending_type", "Default"),
         )
         worker.moveToThread(thread)
         # Start the bootstrap worker directly on the QThread. This avoids the
@@ -6943,7 +6904,6 @@ class DashboardPage(QWidget):
         convert_enabled: bool,
         already_resolved: bool = False,
         log_steps: bool = True,
-        sending_type: str = "Default",
     ) -> None:
         attachment_paths = self._compose_attachment_paths(
             recipient,
@@ -7031,30 +6991,21 @@ class DashboardPage(QWidget):
                     self._log_action("Gmail compose opened")
 
                 recipient_box = self._gmail_recipient_input(page)
-                if sending_type == "Typing (Like human)":
-                    recipient_box.press_sequentially(recipient, delay=random.uniform(0.015, 0.045))
-                else:
-                    recipient_box.fill(recipient)
+                recipient_box.fill(recipient)
                 recipient_box.press("Enter")
                 if log_steps:
                     self._log_action("Recipient entered")
 
                 subject_box = page.locator('input[name="subjectbox"], input[placeholder*="Subject"]').first
                 subject_box.wait_for(state="visible", timeout=10000)
-                if sending_type == "Typing (Like human)":
-                    subject_box.press_sequentially(subject, delay=random.uniform(0.015, 0.045))
-                else:
-                    subject_box.fill(subject)
+                subject_box.fill(subject)
                 if log_steps:
                     self._log_action("Subject entered")
 
                 body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
                 body_box.wait_for(state="visible", timeout=10000)
                 body_box.click()
-                if sending_type == "Typing (Like human)":
-                    body_box.press_sequentially(body_text, delay=random.uniform(0.008, 0.03))
-                else:
-                    body_box.fill(body_text)
+                body_box.fill(body_text)
                 if log_steps:
                     self._log_action("Body entered")
 
@@ -8660,16 +8611,6 @@ class DashboardPage(QWidget):
         self.delay_fixed_radio.blockSignals(False)
         self.delay_random_radio.blockSignals(False)
         self.delay_human_radio.blockSignals(False)
-        bot_type = getattr(self.state, "bot_sending_type", "Default")
-        self.bot_default_radio.blockSignals(True)
-        self.bot_typing_radio.blockSignals(True)
-        self.bot_random_radio.blockSignals(True)
-        self.bot_default_radio.setChecked(bot_type == "Default")
-        self.bot_typing_radio.setChecked(bot_type == "Typing (Like human)")
-        self.bot_random_radio.setChecked(bot_type == "Random")
-        self.bot_default_radio.blockSignals(False)
-        self.bot_typing_radio.blockSignals(False)
-        self.bot_random_radio.blockSignals(False)
         self.send_seq_radio.blockSignals(True)
         self.send_rand_radio.blockSignals(True)
         self.send_seq_radio.setChecked(getattr(self.state, "email_send_order", "Sequential") != "Random shuffle")
