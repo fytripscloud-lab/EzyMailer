@@ -211,7 +211,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
         _restore_runtime_permissions(target)
         _configure_external_dll_search(target)
         if str(target) not in sys.path:
-            sys.path.insert(0, str(target))
+            sys.path.append(str(target))
         return target
 
     asset_name = _external_dependency_asset()
@@ -288,7 +288,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
     marker = target / ".ready"
     marker.write_text(DEPENDENCY_RELEASE_TAG, encoding="utf-8")
     if str(target) not in sys.path:
-        sys.path.insert(0, str(target))
+        sys.path.append(str(target))
     if progress:
         progress("Dependencies ready", "The downloaded runtime is ready to use", 100, 100)
     return target
@@ -571,8 +571,8 @@ def _compute_text_scale(screen) -> float:
     width_boost = max(0.0, (geometry.width() - 1280.0) / 2200.0)
     height_boost = max(0.0, (geometry.height() - 768.0) / 2600.0)
     # Keep Windows compact, but readable on standard laptop displays.
-    base = 1.00 if IS_WINDOWS else 1.28
-    ceiling = 1.08 if IS_WINDOWS else 1.40
+    base = 1.04 if IS_WINDOWS else 1.28
+    ceiling = 1.12 if IS_WINDOWS else 1.40
     scale = base + min(0.12, (width_boost + height_boost) * 0.8)
     return max(base, min(ceiling, scale))
 
