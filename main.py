@@ -215,7 +215,19 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
     shutil.rmtree(extraction_dir, ignore_errors=True)
     extraction_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(extraction_dir)
+        members = archive.infolist()
+        total_members = max(1, len(members))
+        for index, member in enumerate(members, start=1):
+            archive.extract(member, extraction_dir)
+            if progress and (index == 1 or index == total_members or index % 25 == 0):
+                progress(
+                    "Extracting app dependencies",
+                    f"Extracted {index:,} of {total_members:,} files",
+                    min(99, 90 + int(index * 9 / total_members)),
+                    100,
+                )
+    if progress:
+        progress("Finalizing app dependencies", "Completing the local runtime setup", 99, 100)
     shutil.rmtree(target, ignore_errors=True)
     extraction_dir.rename(target)
     archive_path.unlink(missing_ok=True)
@@ -8603,7 +8615,8 @@ class MainWindow(QMainWindow):
         self._browser_bootstrap_timer.setInterval(250)
         self._browser_bootstrap_timer.timeout.connect(self._poll_browser_bootstrap)
         self._browser_bootstrap_timer.start()
-        thread.start()
+        # Give the loader one event-loop tick to paint before network I/O.
+        QTimer.singleShot(500, thread.start)
 
     def _poll_browser_bootstrap(self) -> None:
         worker = self._browser_bootstrap_worker
