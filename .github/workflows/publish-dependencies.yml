@@ -39,50 +39,28 @@ jobs:
           ASSET_NAME: ${{ matrix.asset }}
         run: |
           set -euo pipefail
-          python -m venv .runtime-venv
-          source .runtime-venv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install \
+          rm -rf runtime-dependencies
+          mkdir -p runtime-dependencies
+          python -m pip install --no-compile --target runtime-dependencies \
             "playwright>=1.51.0" \
             "python-pptx>=1.0.2" \
             "python-docx>=1.1.2" \
             "openpyxl>=3.1.5" \
             "reportlab>=4.4.3" \
             "Pillow>=3.3.2"
-          rm -rf runtime-dependencies
-          mkdir -p runtime-dependencies
           python - <<'PY'
-          import pathlib
-          import site
-          import shutil
+          import os
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
 
-          destination = pathlib.Path("runtime-dependencies")
-          source = pathlib.Path(site.getsitepackages()[0])
-          packages = [
-              "playwright",
-              "pyee",
-              "greenlet",
-              "PIL",
-              "docx",
-              "openpyxl",
-              "reportlab",
-              "pptx",
-              "lxml",
-              "XlsxWriter",
-          ]
-          for name in packages:
-              source_path = source / name
-              if source_path.exists():
-                  shutil.copytree(source_path, destination / name, dirs_exist_ok=True)
-          for item in source.glob("*.dist-info"):
-              if any(item.name.lower().startswith(name.lower() + "-") for name in packages):
-                  shutil.copytree(item, destination / item.name, dirs_exist_ok=True)
+          root = Path("runtime-dependencies")
+          asset = Path(os.environ["ASSET_NAME"])
+          with ZipFile(asset, "w", ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in root.rglob("*"):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(root).as_posix())
           PY
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            powershell -NoProfile -Command "Compress-Archive -Path runtime-dependencies/* -DestinationPath $env:ASSET_NAME -Force"
-          else
-            ditto -c -k --sequesterRsrc --keepParent runtime-dependencies "$ASSET_NAME"
-          fi
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
