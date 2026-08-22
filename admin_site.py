@@ -110,6 +110,14 @@ def _html() -> str:
       const dt = parseDate(user?.login_valid_until);
       return !!dt && dt.getTime() < Date.now();
     };
+    const isRealtimeOnline = (user) => {
+      if (typeof user?.online_status === "boolean") return user.online_status;
+      if (!user?.is_active) return false;
+      if (isExpired(user)) return false;
+      const dt = parseDate(user?.last_login_at);
+      if (!dt) return false;
+      return (Date.now() - dt.getTime()) <= 15 * 60 * 1000;
+    };
 
     function safeJson(text) {
       try { return JSON.parse(text); } catch { return null; }
@@ -222,6 +230,8 @@ def _html() -> str:
       const [statSearch, setStatSearch] = React.useState("");
       const [statPage, setStatPage] = React.useState(0);
       const [statRowsPerPage, setStatRowsPerPage] = React.useState(10);
+      const [statDialogOpen, setStatDialogOpen] = React.useState(false);
+      const [statDialogKey, setStatDialogKey] = React.useState("total");
       const [search, setSearch] = React.useState("");
       const [filter, setFilter] = React.useState("all");
       const [expiredSearch, setExpiredSearch] = React.useState("");
@@ -271,6 +281,7 @@ def _html() -> str:
         setSelectedUser(null);
         setDetailData(null);
         setDetailOpen(false);
+        setStatDialogOpen(false);
         setEditorOpen(false);
         setCreateOpen(false);
         notify(reason, "warning");
@@ -417,6 +428,7 @@ def _html() -> str:
         active: users.filter((u) => !!u.is_active).length,
         expired: users.filter((u) => isExpired(u)).length,
         admins: users.filter((u) => String(u.role || "").toLowerCase() === "admin").length,
+        deviceOnline: users.filter((u) => isRealtimeOnline(u)).length,
         failures: history.filter((h) => !h.success).length,
       }), [users, history]);
       const days = React.useMemo(() => {
@@ -437,6 +449,43 @@ def _html() -> str:
         { label: "Expired", value: stats.expired },
         { label: "Admins", value: stats.admins },
       ]), [stats, users]);
+      const summaryCards = React.useMemo(() => ([
+        {
+          key: "total",
+          label: "Total Users",
+          value: stats.total,
+          hint: "All users loaded from the admin API.",
+          tone: "#42a5f5",
+        },
+        {
+          key: "active",
+          label: "Active Users",
+          value: stats.active,
+          hint: "Users currently allowed to sign in.",
+          tone: "#22c55e",
+        },
+        {
+          key: "expired",
+          label: "Expired Validity",
+          value: stats.expired,
+          hint: "Users whose login validity expired.",
+          tone: "#f59e0b",
+        },
+        {
+          key: "admins",
+          label: "Admin Users",
+          value: stats.admins,
+          hint: "Users with admin permissions.",
+          tone: "#a855f7",
+        },
+        {
+          key: "deviceOnline",
+          label: "Device Online",
+          value: stats.deviceOnline,
+          hint: "Check realtime users.",
+          tone: "#38bdf8",
+        },
+      ]), [stats]);
       const statViews = React.useMemo(() => ({
         total: {
           title: "Total Users",
@@ -458,8 +507,13 @@ def _html() -> str:
           description: "Users with admin permissions.",
           rows: users.filter((u) => String(u.role || "").toLowerCase() === "admin"),
         },
+        deviceOnline: {
+          title: "Device Online",
+          description: "Users currently online based on recent authenticated activity.",
+          rows: users.filter((u) => isRealtimeOnline(u)),
+        },
       }), [users]);
-      const currentStatView = statViews[activeSection] || statViews.total;
+      const currentStatView = statViews[statDialogKey] || statViews.total;
       const statRows = React.useMemo(() => {
         const q = statSearch.trim().toLowerCase();
         return (currentStatView.rows || []).filter((user) => {
@@ -468,6 +522,12 @@ def _html() -> str:
         });
       }, [currentStatView, statSearch]);
       const pagedStatRows = React.useMemo(() => statRows.slice(statPage * statRowsPerPage, statPage * statRowsPerPage + statRowsPerPage), [statRows, statPage, statRowsPerPage]);
+      const openStatDialog = (key) => {
+        setStatDialogKey(key);
+        setStatPage(0);
+        setStatSearch("");
+        setStatDialogOpen(true);
+      };
 
       const buildUserPayload = (source = form) => {
         const payload = {
@@ -741,22 +801,66 @@ def _html() -> str:
 
       const renderOverviewPage = () => (
         <Stack spacing={2.5}>
-          <Grid container spacing={2}>
-            {[
-              ["Total Users", stats.total, "All users loaded from the admin API."],
-              ["Active Users", stats.active, "Users currently allowed to sign in."],
-              ["Expired Validity", stats.expired, "Users whose login validity expired."],
-              ["Admin Users", stats.admins, "Users with admin permissions."],
-            ].map(([label, value, hint]) => (
-              <Grid item xs={12} sm={6} lg={3} key={label}>
-                <Paper sx={{ p: 2.5, height: "100%", borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-                  <Typography variant="overline" color="text.secondary" letterSpacing={2}>{label}</Typography>
-                  <Typography variant="h3" fontWeight={900} sx={{ mt: 1 }}>{value}</Typography>
-                  <Typography color="text.secondary" sx={{ mt: 2 }}>{hint}</Typography>
-                </Paper>
-              </Grid>
+          <Box
+            sx={{
+              display: "grid",
+              gap: 2,
+              gridTemplateColumns: {
+                xs: "1fr",
+                sm: "repeat(2, minmax(0, 1fr))",
+                lg: "repeat(5, minmax(0, 1fr))",
+              },
+            }}
+          >
+            {summaryCards.map((item) => (
+              <Paper
+                key={item.key}
+                component="button"
+                type="button"
+                onClick={() => openStatDialog(item.key)}
+                sx={{
+                  p: 2.5,
+                  minHeight: 210,
+                  height: "100%",
+                  borderRadius: 2,
+                  bgcolor: "background.paper",
+                  border: "1px solid",
+                  borderColor: "divider",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  color: "inherit",
+                  transition: "transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease",
+                  "&:hover": {
+                    transform: "translateY(-2px)",
+                    borderColor: item.tone,
+                    boxShadow: `0 14px 32px rgba(0,0,0,0.18)`,
+                  },
+                  "&:focus-visible": {
+                    outline: "none",
+                    borderColor: item.tone,
+                    boxShadow: `0 0 0 3px ${item.tone}33`,
+                  },
+                }}
+              >
+                <Stack spacing={1}>
+                  <Typography variant="overline" color="text.secondary" letterSpacing={2}>{item.label}</Typography>
+                  <Typography variant="h3" fontWeight={900} sx={{ mt: 1 }}>{item.value}</Typography>
+                  <Typography color="text.secondary" sx={{ mt: 2 }}>{item.hint}</Typography>
+                  <Chip
+                    size="small"
+                    label="Open list"
+                    sx={{
+                      alignSelf: "flex-start",
+                      mt: 2,
+                      bgcolor: `${item.tone}22`,
+                      color: item.tone,
+                      fontWeight: 800,
+                    }}
+                  />
+                </Stack>
+              </Paper>
             ))}
-          </Grid>
+          </Box>
 
           <Grid container spacing={2}>
             <Grid item xs={12} lg={8}>
@@ -819,7 +923,7 @@ def _html() -> str:
             <Table stickyHeader size="small">
               <TableHead>
                 <TableRow>
-                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Actions"].map((head) => (
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Actions"].map((head) => (
                     <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                   ))}
                 </TableRow>
@@ -835,6 +939,7 @@ def _html() -> str:
                     <TableCell>{formatDate(user.login_valid_until)}</TableCell>
                     <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
                     <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
+                    <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                     <TableCell>
                       <Button size="small" variant="outlined" onClick={(event) => { setMenuAnchor(event.currentTarget); setMenuUser(user); setSelectedUser(user); }}>⋮</Button>
                     </TableCell>
@@ -842,7 +947,7 @@ def _html() -> str:
                 ))}
                 {!pagedUsers.length && (
                   <TableRow>
-                    <TableCell colSpan={9}>
+                    <TableCell colSpan={10}>
                       <Typography color="text.secondary">No users found for the current search and filter.</Typography>
                     </TableCell>
                   </TableRow>
@@ -885,7 +990,7 @@ def _html() -> str:
             <Table stickyHeader size="small">
               <TableHead>
                 <TableRow>
-                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Actions"].map((head) => (
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Actions"].map((head) => (
                     <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                   ))}
                 </TableRow>
@@ -901,6 +1006,7 @@ def _html() -> str:
                     <TableCell>{formatDate(user.login_valid_until)}</TableCell>
                     <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
                     <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
+                    <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                     <TableCell>
                       <Button size="small" variant="outlined" onClick={(event) => { setMenuAnchor(event.currentTarget); setMenuUser(user); setSelectedUser(user); }}>⋮</Button>
                     </TableCell>
@@ -908,7 +1014,7 @@ def _html() -> str:
                 ))}
                 {!pagedExpiredUsers.length && (
                   <TableRow>
-                    <TableCell colSpan={9}>
+                    <TableCell colSpan={10}>
                       <Typography color="text.secondary">No expired users match the search.</Typography>
                     </TableCell>
                   </TableRow>
@@ -1315,6 +1421,7 @@ def _html() -> str:
                           ["Role", detailData.user.role],
                           ["Status", detailData.user.is_active ? "Active" : "Inactive"],
                           ["Online Status", detailData.online_status ? "Online" : "Offline"],
+                          ["Emails Sent", Number(detailData.user.sent_email_count || 0).toLocaleString()],
                           ["Validity", formatDate(detailData.user.login_valid_until) || "No expiry set"],
                           ["Last Login", `${formatDate(detailData.user.last_login_at)} ${fmt(detailData.user.last_login_ip)}`],
                         ].map(([label, value]) => (
@@ -1450,6 +1557,111 @@ def _html() -> str:
                       </Grid>
                     </Stack>
                   )}
+                </Box>
+              </Box>
+            </Dialog>
+
+            <Dialog fullScreen open={statDialogOpen} onClose={() => setStatDialogOpen(false)}>
+              <Box sx={{ bgcolor: "background.default", minHeight: "100vh" }}>
+                <Box sx={{ px: { xs: 2, md: 3 }, py: 2, borderBottom: "1px solid", borderColor: "divider", position: "sticky", top: 0, zIndex: 2, bgcolor: "background.paper" }}>
+                  <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} spacing={2}>
+                    <Box>
+                      <Typography variant="h5" fontWeight={900}>{currentStatView.title}</Typography>
+                      <Typography color="text.secondary">{currentStatView.description}</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {statRows.length} matching users
+                      </Typography>
+                    </Box>
+                    <Stack direction="row" spacing={1.5} flexWrap="wrap">
+                      <Button variant="outlined" onClick={() => refreshUsers(auth)} disabled={loading}>Refresh Users</Button>
+                      <Button variant="contained" onClick={() => setStatDialogOpen(false)}>Close</Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+
+                <Box sx={{ p: { xs: 2, md: 3 } }}>
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} sx={{ mb: 2 }}>
+                    <TextField
+                      label="Search username, name, role, device..."
+                      value={statSearch}
+                      onChange={(e) => { setStatSearch(e.target.value); setStatPage(0); }}
+                      fullWidth
+                    />
+                    <FormControl sx={{ minWidth: 140 }}>
+                      <InputLabel>Rows</InputLabel>
+                      <Select
+                        label="Rows"
+                        value={statRowsPerPage}
+                        onChange={(e) => { setStatRowsPerPage(Number(e.target.value)); setStatPage(0); }}
+                      >
+                        {[5, 10, 20, 50].map((n) => <MenuItem key={n} value={n}>{n} / page</MenuItem>)}
+                      </Select>
+                    </FormControl>
+                  </Stack>
+
+                  <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
+                    <Table stickyHeader size="small">
+                      <TableHead>
+                        <TableRow>
+                          {["ID", "Username", "Name", "Role", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Online"].map((head) => (
+                            <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                          ))}
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {pagedStatRows.map((user) => (
+                          <TableRow key={user.id} hover selected={selectedUser?.id === user.id}>
+                            <TableCell>{user.id}</TableCell>
+                            <TableCell>{fmt(user.username)}</TableCell>
+                            <TableCell>{fmt(user.display_name)}</TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={fmt(user.role)}
+                                color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"}
+                              />
+                            </TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={user.is_active ? "Active" : "Inactive"}
+                                color={user.is_active ? "success" : "error"}
+                              />
+                            </TableCell>
+                            <TableCell>{formatDate(user.login_valid_until)}</TableCell>
+                            <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
+                            <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
+                            <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={isRealtimeOnline(user) ? "Online" : "Offline"}
+                                color={isRealtimeOnline(user) ? "success" : "default"}
+                                variant={isRealtimeOnline(user) ? "filled" : "outlined"}
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                        {!pagedStatRows.length && (
+                          <TableRow>
+                            <TableCell colSpan={10}>
+                              <Typography color="text.secondary">No users match the current search.</Typography>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+
+                  <TablePagination
+                    component="div"
+                    count={statRows.length}
+                    page={statPage}
+                    onPageChange={(_, nextPage) => setStatPage(nextPage)}
+                    rowsPerPage={statRowsPerPage}
+                    onRowsPerPageChange={(e) => { setStatRowsPerPage(Number(e.target.value)); setStatPage(0); }}
+                    rowsPerPageOptions={[5, 10, 20, 50]}
+                  />
                 </Box>
               </Box>
             </Dialog>

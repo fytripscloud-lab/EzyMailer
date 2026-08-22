@@ -29,6 +29,7 @@ from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
+import errno
 from typing import Callable
 
 from backend.local_api import (
@@ -39,6 +40,7 @@ from backend.local_api import (
     get_settings as api_get_settings,
     get_tags as api_get_tags,
     login as api_login,
+    record_sent_email_event,
     record_activity,
     delete_content as api_delete_content,
     delete_customer_variables as api_delete_customer_variables,
@@ -63,7 +65,7 @@ from PySide6.QtCore import (
     QSize,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence, QGuiApplication, QClipboard
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence, QGuiApplication, QClipboard, QTextFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -92,6 +94,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QFileDialog,
+    QPlainTextEdit,
     QTextEdit,
     QDoubleSpinBox,
     QRadioButton,
@@ -1283,6 +1286,7 @@ class BrowserSessionHandle:
     debug_port: int | None = None
     send_completed: int = 0
     send_total: int = 0
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -1373,6 +1377,7 @@ class AIValidationWorker(QObject):
 
 class CampaignSendWorker(QObject):
     log = Signal(str)
+    email_sent = Signal(str, str)
     progress = Signal(str, str, int, int)
     finished = Signal(str, str, bool, int, int, str)
 
@@ -1464,23 +1469,31 @@ class CampaignSendWorker(QObject):
                 if self.cancel_event.is_set() or not self._wait_for_resume():
                     break
                 try:
-                    self.send_callback(
-                        self.session,
-                        recipient,
-                        subject,
-                        body_text,
-                        attachment_html,
-                        attachment_formats,
-                        self.file_name_mode,
-                        file_name_value,
-                        self.convert_enabled,
-                        True,
-                        False,
-                    )
+                    # Gmail has mutable window state. Keep each browser
+                    # session strictly single-file even if a worker is
+                    # restarted or queued again after a transient failure.
+                    with self.session.send_lock:
+                        self.send_callback(
+                            self.session,
+                            recipient,
+                            subject,
+                            body_text,
+                            attachment_html,
+                            attachment_formats,
+                            self.file_name_mode,
+                            file_name_value,
+                            self.convert_enabled,
+                            True,
+                            False,
+                        )
                     sent_ok = True
                     break
                 except Exception as exc:
                     last_error = exc
+                    if getattr(exc, "errno", None) == errno.ENOSPC:
+                        error_message = "Not enough free storage space to prepare the email."
+                        self.cancel_event.set()
+                        break
                     if attempt < attempts and not self.cancel_event.is_set():
                         if not self._sleep_with_controls(self._delay_seconds()):
                             break
@@ -1488,8 +1501,9 @@ class CampaignSendWorker(QObject):
             completed += 1
             if sent_ok:
                 self.log.emit(f"[{self._timestamp()}] {self.window_label} sent {recipient}")
+                self.email_sent.emit(recipient, subject)
             elif last_error is not None:
-                error_message = str(last_error)
+                error_message = error_message or str(last_error)
                 self.log.emit(f"[{self._timestamp()}] {self.window_label} failed {recipient}: {error_message}")
             else:
                 self.log.emit(f"[{self._timestamp()}] {self.window_label} cancelled {recipient}")
@@ -1661,9 +1675,11 @@ class TitleBar(QWidget):
         version_badge.setObjectName("versionBadge")
         self.status_badge = QLabel("LOCKED")
         self.status_badge.setObjectName("statusBadge")
-        self.theme_badge = QLabel("◐")
-        self.theme_badge.setObjectName("statusBadge")
-        self.theme_badge.setToolTip("System appearance")
+        self.theme_badge = QPushButton()
+        self.theme_badge.setObjectName("themeButton")
+        self.theme_badge.setCursor(Qt.PointingHandCursor)
+        self.theme_badge.setToolTip("Switch between light and dark mode")
+        self.theme_badge.clicked.connect(self._window.toggle_theme)
         self.user_id_label = QLabel("")
         self.user_id_label.setObjectName("statusBadge")
         for badge in (version_badge, self.status_badge):
@@ -1675,6 +1691,7 @@ class TitleBar(QWidget):
         version_badge.hide()
         self.status_badge.hide()
         self.theme_badge.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
+        self.theme_badge.setMinimumWidth(_scaled_int(62 if IS_MAC else 72, self._scale))
         self.user_id_label.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
 
         self.logout_button = QPushButton("Logout")
@@ -1695,7 +1712,7 @@ class TitleBar(QWidget):
     def set_state(self, username: str, logged_in: bool) -> None:
         self.status_badge.setText("READY" if logged_in else "LOCKED")
         self.user_id_label.setText(username if logged_in else "")
-        self.theme_badge.setText("☾" if self._window._system_is_dark() else "☀")
+        self._window._update_theme_button()
         self.theme_badge.setVisible(logged_in)
         self.user_id_label.setVisible(logged_in)
         self.logout_button.setVisible(logged_in)
@@ -3094,15 +3111,16 @@ class LoginPage(QWidget):
 
         shell = QFrame()
         shell.setObjectName("loginShell")
-        shell.setMaximumWidth(_scaled_int(540, self._scale))
+        shell.setMinimumWidth(_scaled_int(500, self._scale))
+        shell.setMaximumWidth(_scaled_int(560, self._scale))
         shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(_scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale), _scaled_int(22, self._scale))
-        shell_layout.setSpacing(_scaled_int(12, self._scale))
+        shell_layout.setContentsMargins(_scaled_int(26, self._scale), _scaled_int(26, self._scale), _scaled_int(26, self._scale), _scaled_int(26, self._scale))
+        shell_layout.setSpacing(_scaled_int(14, self._scale))
 
         header = QHBoxLayout()
         header.setSpacing(_scaled_int(10, self._scale))
         logo = AnimatedLogoBadge(scale=self._scale)
-        logo.setFixedSize(_scaled_int(48, self._scale), _scaled_int(48, self._scale))
+        logo.setFixedSize(_scaled_int(56, self._scale), _scaled_int(56, self._scale))
 
         title_block = QVBoxLayout()
         title_block.setSpacing(0)
@@ -3129,8 +3147,8 @@ class LoginPage(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
         form.setFormAlignment(Qt.AlignTop)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(_scaled_int(14, self._scale))
+        form.setVerticalSpacing(_scaled_int(12, self._scale))
 
         self.username_input.setPlaceholderText("Username")
         self.username_input.setText("")
@@ -3139,6 +3157,9 @@ class LoginPage(QWidget):
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setText("")
         self.password_input.setToolTip("Enter your login password")
+        for field in (self.username_input, self.password_input):
+            field.setMinimumHeight(_scaled_int(40, self._scale))
+            field.setMinimumWidth(_scaled_int(300, self._scale))
 
         form.addRow("Username", self.username_input)
         form.addRow("Password", self.password_input)
@@ -3148,7 +3169,7 @@ class LoginPage(QWidget):
         self.error_label.setAlignment(Qt.AlignCenter)
 
         self.login_button.setObjectName("primaryButton")
-        self.login_button.setMinimumHeight(_scaled_int(38, self._scale))
+        self.login_button.setMinimumHeight(_scaled_int(44, self._scale))
         self.login_button.clicked.connect(lambda: self._attempt_login())
         self.login_button.setToolTip("Authenticate and open the workspace")
 
@@ -3287,6 +3308,98 @@ class LoginPage(QWidget):
         )
 
 
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event) -> None:
+        self.editor.paint_line_numbers(event)
+
+
+class LineNumberPlainTextEdit(QPlainTextEdit):
+    """Plain-text editor with a synchronized line-number gutter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.line_number_area = LineNumberArea(self)
+        self.blockCountChanged.connect(self._update_line_number_area_width)
+        self.updateRequest.connect(self._update_line_number_area)
+        self.cursorPositionChanged.connect(self._highlight_current_line)
+        self._update_line_number_area_width(0)
+        self._highlight_current_line()
+
+    def line_number_area_width(self) -> int:
+        digits = len(str(max(1, self.blockCount())))
+        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_line_number_area_width(self, _new_block_count: int) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_line_number_area(self, rect, dy: int) -> None:
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_line_number_area_width(0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.line_number_area.setGeometry(
+            0,
+            0,
+            self.line_number_area_width(),
+            self.height(),
+        )
+
+    def _highlight_current_line(self) -> None:
+        extra = QTextEdit.ExtraSelection()
+        light = self.palette().base().color().lightness() > 150
+        extra.format.setBackground(QColor("#eef2f7" if light else "#2a2d2e"))
+        extra.format.setProperty(QTextFormat.FullWidthSelection, True)
+        extra.cursor = self.textCursor()
+        extra.cursor.clearSelection()
+        self.setExtraSelections([extra])
+        self.line_number_area.update()
+
+    def paint_line_numbers(self, event) -> None:
+        painter = QPainter(self.line_number_area)
+        light = self.palette().base().color().lightness() > 150
+        painter.fillRect(event.rect(), QColor("#eef2f7" if light else "#181818"))
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+        current_block = self.textCursor().blockNumber()
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                if block_number == current_block:
+                    painter.setPen(QColor("#1f2937" if light else "#d4d4d4"))
+                else:
+                    painter.setPen(QColor("#64748b" if light else "#858585"))
+                if block_number == current_block:
+                    painter.setFont(QFont(self.font().family(), self.font().pointSize(), QFont.Bold))
+                else:
+                    painter.setFont(self.font())
+                painter.drawText(
+                    0,
+                    top,
+                    self.line_number_area.width() - 5,
+                    int(self.fontMetrics().height()),
+                    Qt.AlignRight,
+                    str(block_number + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            block_number += 1
+
+
 class DashboardPage(QWidget):
     def __init__(self, state: AppState, on_logout, notify, scale: float = 1.0):
         super().__init__()
@@ -3320,7 +3433,7 @@ class DashboardPage(QWidget):
         self.attach_file_name_mode = "auto"
         self.attach_file_name_value = ""
         self.attach_format_label = QLabel(self._attachment_format_summary(self.attach_format_value))
-        self.pending_emails_editor = QTextEdit()
+        self.pending_emails_editor = LineNumberPlainTextEdit()
         self.subject_input = QLineEdit()
         self.body_editor = QTextEdit()
         self.html_message_editor = QTextEdit()
@@ -3674,8 +3787,9 @@ class DashboardPage(QWidget):
         filter_row = QHBoxLayout()
         self.standard_email_radio = QRadioButton("Gmail only (@gmail.com)")
         self.mix_email_radio = QRadioButton("All domains and aliases")
-        self.standard_email_radio.setChecked(True)
+        self.standard_email_radio.setChecked(False)
         self.standard_email_radio.setToolTip("Accept only Gmail addresses")
+        self.mix_email_radio.setChecked(True)
         self.mix_email_radio.setToolTip("Allow all domains and aliases")
         filter_row.addWidget(self.standard_email_radio)
         filter_row.addWidget(self.mix_email_radio)
@@ -6130,8 +6244,6 @@ class DashboardPage(QWidget):
             missing.append("subject")
         if not (str(payload.get("body_text") or "").strip() or str(payload.get("body_html") or "").strip()):
             missing.append("body content")
-        if not str(payload.get("attachment_html") or "").strip():
-            missing.append("attachment content")
         return missing
 
     def _refresh_campaign_action_state(self) -> None:
@@ -6369,6 +6481,7 @@ class DashboardPage(QWidget):
         # queued-start race that can leave the modal loader indeterminate.
         thread.started.connect(worker.run, Qt.DirectConnection)
         worker.log.connect(self._append_campaign_send_log)
+        worker.email_sent.connect(self._on_campaign_email_sent)
         worker.progress.connect(self._on_campaign_worker_progress)
         worker.finished.connect(self._on_campaign_worker_finished)
         worker.finished.connect(worker.deleteLater)
@@ -6377,6 +6490,20 @@ class DashboardPage(QWidget):
         self._campaign_threads.append(thread)
         self._campaign_workers[str(job["session"].session_id)] = worker
         thread.start()
+
+    def _on_campaign_email_sent(self, recipient: str, subject: str) -> None:
+        auth_token = str(getattr(self.state, "auth_token", "") or "")
+        if not auth_token:
+            return
+
+        def record() -> None:
+            try:
+                record_sent_email_event(auth_token, recipient, subject)
+            except Exception:
+                # Sending has already succeeded; reporting must not interrupt the campaign.
+                pass
+
+        threading.Thread(target=record, name="ezymailer-sent-counter", daemon=True).start()
 
     def _start_next_campaign_worker(self) -> None:
         if self._campaign_cancel_event.is_set() or self._campaign_paused:
@@ -6415,7 +6542,38 @@ class DashboardPage(QWidget):
         elif message:
             self.notify(message)
         self._pending_campaign_payload = None
+        self._cleanup_campaign_temp_files_async()
+        self.window().hide_launch_loader()
         self._update_campaign_action_state()
+
+    def _cleanup_campaign_temp_files_async(self) -> None:
+        """Remove generated attachment folders without blocking the UI."""
+        temp_root = Path(tempfile.gettempdir())
+
+        def cleanup() -> None:
+            try:
+                for path in temp_root.glob("ezymailer-gmail-*"):
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=cleanup, name="ezymailer-temp-cleanup", daemon=True).start()
+
+    def _cleanup_campaign_temp_files_now(self) -> None:
+        """Remove abandoned attachment folders before a new campaign starts."""
+        try:
+            for path in Path(tempfile.gettempdir()).glob("ezymailer-gmail-*"):
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _temp_storage_available(self) -> int:
+        try:
+            return int(shutil.disk_usage(tempfile.gettempdir()).free)
+        except OSError:
+            return 0
 
     def _on_campaign_worker_finished(
         self,
@@ -6482,6 +6640,12 @@ class DashboardPage(QWidget):
     def _begin_campaign_send(self, payload: dict[str, object]) -> None:
         if self._campaign_active:
             self.notify("Campaign is already running")
+            return
+
+        self._cleanup_campaign_temp_files_now()
+        if self._temp_storage_available() < 256 * 1024 * 1024:
+            self.notify("Please free some storage space before starting")
+            self._log_action("Campaign blocked: not enough free storage space")
             return
 
         recipients_raw = payload.get("recipients") or []
@@ -6563,6 +6727,9 @@ class DashboardPage(QWidget):
         self._campaign_worker_queue = list(jobs)
         self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
         self.notify("Sending campaign")
+        # The Campaign tab already exposes the progress bar and sent/remaining
+        # count. Keep the workspace visible while workers are running.
+        self.window().hide_launch_loader()
 
         if self.state.window_send_mode == "Sequential":
             self._start_next_campaign_worker()
@@ -6835,9 +7002,10 @@ class DashboardPage(QWidget):
         file_name_value: str,
         convert_enabled: bool,
         already_resolved: bool = False,
+        temp_dir: Path | None = None,
     ) -> list[Path]:
         ensure_external_dependencies()
-        temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
+        temp_dir = temp_dir or Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
         resolved_attachment_html = attachment_html if already_resolved else self._apply_tags_to_text(attachment_html, recipient, subject)
         base_name = self._attachment_output_name_base(
             recipient,
@@ -6888,6 +7056,99 @@ class DashboardPage(QWidget):
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         return page
 
+    def _close_stale_gmail_compose(self, page) -> None:
+        """Close unsent Gmail drafts before opening the next compose window."""
+        discard_selectors = (
+            '[aria-label*="Discard draft" i]',
+            '[data-tooltip*="Discard draft" i]',
+            '[aria-label*="Discard" i][role="button"]',
+        )
+        for selector in discard_selectors:
+            try:
+                controls = page.locator(selector)
+                for index in range(controls.count() - 1, -1, -1):
+                    control = controls.nth(index)
+                    if control.is_visible():
+                        control.click(timeout=1500)
+                        page.wait_for_timeout(250)
+                        return
+            except Exception:
+                continue
+
+        # A compose draft may be minimized. Close the visible compose window
+        # so its old fields cannot be mistaken for the next message.
+        close_selectors = (
+            '[aria-label^="Save & close" i]',
+            '[aria-label="Close" i][role="button"]',
+        )
+        for selector in close_selectors:
+            try:
+                controls = page.locator(selector)
+                for index in range(controls.count() - 1, -1, -1):
+                    control = controls.nth(index)
+                    if control.is_visible():
+                        control.click(timeout=1500)
+                        page.wait_for_timeout(250)
+                        return
+            except Exception:
+                continue
+
+    def _fill_gmail_field(self, locator, value: str, label: str) -> None:
+        locator.wait_for(state="visible", timeout=10000)
+        locator.click()
+        locator.fill(value)
+        try:
+            if locator.input_value() != value:
+                raise RuntimeError(f"Gmail {label} was not filled.")
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+
+    def _verify_gmail_body(self, locator, expected: str) -> None:
+        locator.wait_for(state="visible", timeout=10000)
+        try:
+            locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            locator.click(timeout=3000)
+            locator.fill(expected)
+        except Exception:
+            # Small Compose windows can leave Gmail's attachment row over the
+            # editor. Focus and dispatch an input event without mouse hit
+            # testing, then verify that Gmail received the message body.
+            locator.evaluate(
+                """
+                (element, value) => {
+                    element.focus();
+                    element.textContent = value;
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: value
+                    }));
+                }
+                """,
+                expected,
+            )
+        actual = str(locator.evaluate("element => element.innerText || element.textContent || ''"))
+        if expected.strip() and not actual.strip():
+            raise RuntimeError("Gmail message body was not filled.")
+
+    def _wait_for_gmail_attachment_layout(self, page) -> None:
+        """Let Gmail finish positioning attachment controls in small Compose windows."""
+        page.wait_for_timeout(700)
+        body_locator = page.locator(
+            'div[role="textbox"][aria-label*="Message Body"], '
+            'div[contenteditable="true"][aria-label*="Message Body"]'
+        ).first
+        try:
+            body_locator.wait_for(state="visible", timeout=5000)
+            body_locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+
     def _send_compose_with_playwright(
         self,
         session: BrowserSessionHandle,
@@ -6902,17 +7163,30 @@ class DashboardPage(QWidget):
         already_resolved: bool = False,
         log_steps: bool = True,
     ) -> None:
-        attachment_paths = self._compose_attachment_paths(
-            recipient,
-            subject,
-            attachment_html,
-            attachment_format,
-            file_name_mode,
-            file_name_value,
-            convert_enabled,
-            already_resolved=already_resolved,
-        )
+        if not attachment_html.strip():
+            self._send_compose_with_playwright_attachment(
+                session,
+                recipient,
+                subject,
+                body_text,
+                [],
+                log_steps=log_steps,
+            )
+            return
+        attachment_temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
+        attachment_paths: list[Path] = []
         try:
+            attachment_paths = self._compose_attachment_paths(
+                recipient,
+                subject,
+                attachment_html,
+                attachment_format,
+                file_name_mode,
+                file_name_value,
+                convert_enabled,
+                already_resolved=already_resolved,
+                temp_dir=attachment_temp_dir,
+            )
             if log_steps:
                 self._log_action(f"Preparing attachment file for {recipient}")
             self._send_compose_with_playwright_attachment(
@@ -6925,8 +7199,7 @@ class DashboardPage(QWidget):
             )
         finally:
             try:
-                if attachment_paths:
-                    shutil.rmtree(attachment_paths[0].parent, ignore_errors=True)
+                shutil.rmtree(attachment_temp_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -6963,7 +7236,9 @@ class DashboardPage(QWidget):
                 if not browser.contexts:
                     raise RuntimeError("No browser context was available for Gmail automation.")
                 context = browser.contexts[0]
-                page = context.pages[0] if context.pages else context.new_page()
+                pages = context.pages
+                page = next((item for item in pages if "mail.google.com" in (item.url or "")), None)
+                page = page or (pages[0] if pages else context.new_page())
                 page.set_default_timeout(10000)
                 page.set_default_navigation_timeout(15000)
                 self._gmail_page_from_session(page)
@@ -6974,6 +7249,7 @@ class DashboardPage(QWidget):
                 # Use the already authenticated Gmail page. Do not redirect
                 # during login or between recipients.
                 page.wait_for_timeout(400)
+                self._close_stale_gmail_compose(page)
                 compose_button = page.locator(
                     'div.z0 div[role="button"][gh="cm"], '
                     'div.z0 [role="button"][jslog*="20510"]'
@@ -6996,39 +7272,38 @@ class DashboardPage(QWidget):
                 except Exception:
                     pass
 
-                recipient_box = self._gmail_recipient_input(page)
-                recipient_box.fill(recipient)
-                recipient_box.press("Enter")
+                page = self._expand_gmail_compose(page)
+                self._ensure_gmail_recipient_selected(page, recipient)
                 if log_steps:
                     self._log_action("Recipient entered")
 
                 subject_box = self._gmail_subject_input(page)
-                subject_box.fill(subject)
+                self._fill_gmail_field(subject_box, subject, "subject")
                 if log_steps:
                     self._log_action("Subject entered")
 
                 body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
-                body_box.wait_for(state="visible", timeout=10000)
-                body_box.click()
-                body_box.fill(body_text)
+                self._verify_gmail_body(body_box, body_text)
                 if log_steps:
                     self._log_action("Body entered")
 
-                attach_candidates = page.locator('input[type="file"]')
-                if attach_candidates.count() == 0:
-                    attach_button = page.get_by_role("button", name=re.compile(r"Attach files", re.IGNORECASE))
-                    attach_button.first.click(timeout=8000)
+                if attachment_paths:
                     attach_candidates = page.locator('input[type="file"]')
-                if log_steps:
-                    self._log_action("Attachment picker ready")
-                files_to_attach = [str(path) for path in attachment_paths if path.exists()]
-                if not files_to_attach:
-                    raise RuntimeError("No attachment files were generated.")
-                attach_candidates.last.set_input_files(files_to_attach)
-                if log_steps:
-                    self._log_action(
-                        "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
-                    )
+                    if attach_candidates.count() == 0:
+                        attach_button = page.get_by_role("button", name=re.compile(r"Attach files", re.IGNORECASE))
+                        attach_button.first.click(timeout=8000)
+                        attach_candidates = page.locator('input[type="file"]')
+                    if log_steps:
+                        self._log_action("Attachment picker ready")
+                    files_to_attach = [str(path) for path in attachment_paths if path.exists()]
+                    if not files_to_attach:
+                        raise RuntimeError("No attachment files were generated.")
+                    attach_candidates.last.set_input_files(files_to_attach)
+                    if log_steps:
+                        self._log_action(
+                            "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
+                        )
+                    self._wait_for_gmail_attachment_layout(page)
 
                 page.wait_for_timeout(1000)
                 send_button = self._gmail_visible_control(
@@ -7041,7 +7316,11 @@ class DashboardPage(QWidget):
                     timeout=10000,
                 )
                 send_button.click(timeout=10000)
-                page.wait_for_timeout(1500)
+                try:
+                    send_button.wait_for(state="hidden", timeout=7000)
+                except Exception as exc:
+                    raise RuntimeError("Gmail did not finish sending the message.") from exc
+                page.wait_for_timeout(500)
                 if log_steps:
                     self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
@@ -7141,6 +7420,129 @@ class DashboardPage(QWidget):
             page.wait_for_timeout(250)
 
         raise RuntimeError("Gmail compose recipient field did not become available.")
+
+    def _expand_gmail_compose(self, page):
+        """Restore a minimized Compose bar and use its expanded page."""
+        popout_selectors = (
+            '[aria-label*="Pop-out" i]',
+            '[data-tooltip*="Pop-out" i]',
+            '[aria-label*="Expand" i][role="button"]',
+        )
+        for selector in popout_selectors:
+            try:
+                control = page.locator(selector).last
+                if not control.is_visible():
+                    continue
+                existing_pages = list(page.context.pages)
+                control.click(timeout=3000)
+                page.wait_for_timeout(500)
+                new_pages = [item for item in page.context.pages if item not in existing_pages]
+                if new_pages:
+                    page = new_pages[-1]
+                    page.set_default_timeout(10000)
+                    page.set_default_navigation_timeout(15000)
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    page.bring_to_front()
+                break
+            except Exception:
+                continue
+
+        recipient_selectors = (
+            'input[aria-label="To recipients"]',
+            'input[aria-label^="To"]',
+            '[role="combobox"][aria-label*="To"]',
+            'input[name="to"]',
+        )
+        recipient_visible = False
+        for selector in recipient_selectors:
+            try:
+                locator = page.locator(selector)
+                if any(locator.nth(index).is_visible() for index in range(locator.count())):
+                    recipient_visible = True
+                    break
+            except Exception:
+                continue
+
+        if not recipient_visible:
+            try:
+                title = page.get_by_text("New Message", exact=True).last
+                if title.is_visible():
+                    title.click(timeout=3000)
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            for selector in recipient_selectors:
+                try:
+                    locator = page.locator(selector)
+                    if any(locator.nth(index).is_visible() for index in range(locator.count())):
+                        return page
+                except Exception:
+                    continue
+            page.wait_for_timeout(200)
+        raise RuntimeError("Gmail Compose could not be expanded.")
+
+    def _gmail_recipient_is_selected(self, page, recipient: str) -> bool:
+        """Detect a committed recipient chip, including saved contacts."""
+        target = (recipient or "").strip().lower()
+        if not target:
+            return False
+        selectors = (
+            '.agP [email], .agP [data-hovercard-id], .agP [data-email], .agP [aria-label*="@"]',
+            '[role="dialog"] [email], [role="dialog"] [data-hovercard-id], [role="dialog"] [data-email]',
+        )
+        for selector in selectors:
+            try:
+                candidates = page.locator(selector)
+                for index in range(candidates.count()):
+                    candidate = candidates.nth(index)
+                    if not candidate.is_visible():
+                        continue
+                    values = candidate.evaluate(
+                        """
+                        element => [
+                            element.getAttribute('email'),
+                            element.getAttribute('data-hovercard-id'),
+                            element.getAttribute('data-email'),
+                            element.getAttribute('aria-label'),
+                            element.innerText
+                        ].filter(Boolean).join(' ')
+                        """
+                    )
+                    if target in str(values).lower():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _ensure_gmail_recipient_selected(self, page, recipient: str) -> None:
+        """Commit an address or retry when autocomplete consumed the first key."""
+        recipient_box = self._gmail_recipient_input(page)
+        if self._gmail_recipient_is_selected(page, recipient):
+            return
+
+        for _attempt in range(2):
+            recipient_box.click()
+            recipient_box.fill(recipient)
+            recipient_box.press("Enter")
+            page.wait_for_timeout(350)
+            if self._gmail_recipient_is_selected(page, recipient):
+                return
+
+            # Gmail can leave the typed address in the editor when a contact
+            # suggestion consumes the first Enter key.
+            try:
+                if recipient_box.input_value().strip():
+                    recipient_box.press("Enter")
+                    page.wait_for_timeout(350)
+                    if self._gmail_recipient_is_selected(page, recipient):
+                        return
+            except Exception:
+                pass
+
+        raise RuntimeError("Gmail could not select the recipient address.")
 
     def _maybe_send_with_playwright(
         self,
@@ -7853,9 +8255,14 @@ class DashboardPage(QWidget):
                 pass
         self._log_action(f"Started {len(launched)} browser window(s)")
         self.notify(f"Launch started for {len(launched)} browser window(s)")
+        self.window().launch_loader.set_message(
+            "Getting Gmail ready",
+            "Opening your email windows. This will only take a moment.",
+            status_prefix="Getting ready",
+        )
         if self._pending_campaign_payload:
             payload = self._pending_campaign_payload
-            QTimer.singleShot(2500, lambda p=payload: self._execute_campaign_send(p))
+            QTimer.singleShot(800, lambda p=payload: self._execute_campaign_send(p))
 
     def _clear_subject_body(self) -> None:
         self._subject_body_save_timer.stop()
@@ -8768,6 +9175,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.state = AppState()
+        self._dark_mode = self._system_is_dark()
         self._toasts = []
         self._pending_launch_target = 0
         self._last_login_username = ""
@@ -8808,17 +9216,49 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self.show_login()
 
+    def _update_theme_button(self) -> None:
+        if not hasattr(self, "title_bar"):
+            return
+        label = "Dark" if self._dark_mode else "Light"
+        icon = "☾" if self._dark_mode else "☀"
+        self.title_bar.theme_badge.setText(f"{icon} {label}")
+        self.title_bar.theme_badge.setToolTip(
+            "Switch to light mode" if self._dark_mode else "Switch to dark mode"
+        )
+
+    def toggle_theme(self) -> None:
+        self._dark_mode = not self._dark_mode
+        self._apply_styles()
+        self._update_theme_button()
+        self.show_toast(
+            f"Switched to {'dark' if self._dark_mode else 'light'} mode",
+            "success",
+        )
+
     def show_toast(self, message: str, kind: str = "info") -> None:
+        if kind == "info":
+            normalized = message.lower()
+            if re.search(r"failed|failure|error|unable|cannot|invalid|missing|incorrect", normalized):
+                kind = "error"
+            elif re.search(r"success|saved|connected|ready|created|updated|copied|reset", normalized):
+                kind = "success"
         toast = Toast(self, message, kind, scale=self._scale)
         self._toasts.append(toast)
         toast.destroyed.connect(lambda: self._remove_toast(toast))
         toast.adjustSize()
-        toast.move(
-            max(12, self.width() - toast.width() - 16),
-            max(12, self.title_bar.height() + 12),
-        )
+        self._position_toast(toast)
         toast.show()
         toast.raise_()
+
+    def _position_toast(self, toast: QWidget) -> None:
+        x = max(12, (self.width() - toast.width()) // 2)
+        y = max(self.title_bar.height() + 12, self.height() - toast.height() - 24)
+        toast.move(x, y)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        for toast in self._toasts:
+            self._position_toast(toast)
 
     def _remove_toast(self, toast: QWidget) -> None:
         if toast in self._toasts:
@@ -9034,6 +9474,28 @@ class MainWindow(QMainWindow):
                 background: transparent;
                 border: none;
             }
+            QMenu {
+                background: #252526;
+                color: #d4d4d4;
+                border: 1px solid #4b4b4b;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 28px 6px 10px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background: #094771;
+                color: #ffffff;
+            }
+            QMenu::item:disabled {
+                color: #777777;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3c3c3c;
+                margin: 4px 0px;
+            }
             QFrame#heroPanel,
             QFrame#loginCard,
             QFrame#topBar,
@@ -9080,8 +9542,8 @@ class MainWindow(QMainWindow):
                 background: #252526;
             }
             QFrame#toast {
-                background: #202020;
-                border: 1px solid #3a3d41;
+                background: #263244;
+                border: 1px solid #64748b;
                 border-radius: 6px;
             }
             QFrame#loaderCard {
@@ -9093,16 +9555,20 @@ class MainWindow(QMainWindow):
                 background: rgba(0, 0, 0, 0.32);
             }
             QFrame#toast[kind="info"] {
-                border-left: 3px solid #007acc;
+                background: #164e63;
+                border: 1px solid #22d3ee;
             }
             QFrame#toast[kind="success"] {
-                border-left: 3px solid #6a9955;
+                background: #14532d;
+                border: 1px solid #22c55e;
             }
             QFrame#toast[kind="warning"] {
-                border-left: 3px solid #d7ba7d;
+                background: #78350f;
+                border: 1px solid #f59e0b;
             }
             QFrame#toast[kind="error"] {
-                border-left: 3px solid #f48771;
+                background: #7f1d1d;
+                border: 1px solid #ef4444;
             }
             QFrame#toast[kind="info"] QLabel#toastIcon {
                 color: #9cdcfe;
@@ -9199,6 +9665,17 @@ class MainWindow(QMainWindow):
                 padding: 3px 7px;
                 font-weight: 700;
             }
+            QPushButton#themeButton {
+                background: #3c3c3c;
+                color: #f8fafc;
+                border: 1px solid #5b6470;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-weight: 800;
+            }
+            QPushButton#themeButton:hover {
+                background: #505a66;
+            }
             QLabel#sectionTitle {
                 color: #ffffff;
                 font-size: 10pt;
@@ -9227,6 +9704,7 @@ class MainWindow(QMainWindow):
             QLineEdit,
             QTextEdit,
             QSpinBox,
+            QDoubleSpinBox,
             QComboBox,
             QTableWidget {
                 background: #1e1e1e;
@@ -9238,6 +9716,7 @@ class MainWindow(QMainWindow):
             QLineEdit:focus,
             QTextEdit:focus,
             QSpinBox:focus,
+            QDoubleSpinBox:focus,
             QComboBox:focus {
                 border: 1px solid #007acc;
             }
@@ -9405,7 +9884,8 @@ class MainWindow(QMainWindow):
             }
             QTextEdit#activityList,
             QTextEdit#bodyEditor,
-            QTextEdit#htmlEditor {
+            QTextEdit#htmlEditor,
+            QPlainTextEdit#bodyEditor {
                 background: #1e1e1e;
                 border: 1px solid #3c3c3c;
                 border-radius: 4px;
@@ -9500,6 +9980,84 @@ class MainWindow(QMainWindow):
         style = style.replace("min-width: 96px;", f"min-width: {_scaled_int(96, self._scale)}px;")
         style = style.replace("width: 10px;", f"width: {_scaled_int(10, self._scale)}px;")
         style = style.replace("height: 10px;", f"height: {_scaled_int(10, self._scale)}px;")
+        if not self._dark_mode:
+            light_colors = {
+                "#1e1e1e": "#f4f7fb",
+                "#1f1f1f": "#ffffff",
+                "#252526": "#ffffff",
+                "#333333": "#d7dee8",
+                "#3c3c3c": "#e7edf4",
+                "#4b4b4b": "#b8c4d1",
+                "#5d5d5d": "#94a3b8",
+                "#2d2d30": "#eef2f7",
+                "#d4d4d4": "#1f2937",
+                "#c8c8c8": "#334155",
+                "#94a3b8": "#64748b",
+                "#9e9e9e": "#64748b",
+                "#111827": "#ffffff",
+                "#0f172a": "#f8fafc",
+                "#cbd5e1": "#334155",
+                "#094771": "#bfdbfe",
+                "#202020": "#ffffff",
+            }
+            for dark_color, light_color in light_colors.items():
+                style = style.replace(dark_color, light_color)
+            style += """
+                QMainWindow, QWidget#tabPage, QDialog#outputDialog { background: #f4f7fb; }
+                QDialog#confirmDialog, QMessageBox { background: rgba(15, 23, 42, 0.22); color: #0f172a; }
+                QFrame#topBar, QFrame#sidebar, QFrame#contentArea { background: #ffffff; }
+                QFrame#panelCard, QFrame#heroPanel, QFrame#loginCard, QFrame#loginShell,
+                QFrame#dialogCard, QFrame#confirmCard, QFrame#loaderCard { background: #ffffff; }
+                QLabel#brandTitle, QLabel#heroTitle, QLabel#loginTitle, QLabel#sectionTitle,
+                QLabel#loaderTitle, QLabel#confirmTitle, QLabel#loginAppName { color: #0f172a; }
+                QLabel#windowPill {
+                    background: #e7edf4;
+                    color: #334155;
+                    border-color: #b8c4d1;
+                }
+                QDialog#confirmDialog QLabel, QMessageBox QLabel,
+                QDialog#confirmDialog QRadioButton, QMessageBox QRadioButton { color: #0f172a; }
+                QDialog#confirmDialog QDialogButtonBox QPushButton,
+                QMessageBox QPushButton {
+                    background: #e7edf4;
+                    color: #1f2937;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 4px;
+                    padding: 6px 14px;
+                    min-width: 72px;
+                }
+                QDialog#confirmDialog QDialogButtonBox QPushButton:hover,
+                QMessageBox QPushButton:hover { background: #dbe5ef; color: #0f172a; }
+                QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTableWidget, QListWidget,
+                QTextEdit#activityList, QTextEdit#bodyEditor, QTextEdit#htmlEditor, QPlainTextEdit#bodyEditor {
+                    background: #ffffff;
+                    color: #1f2937;
+                    border-color: #cbd5e1;
+                }
+                QHeaderView::section, QTabBar::tab { background: #eef2f7; color: #334155; }
+                QMenu {
+                    background: #ffffff;
+                    color: #1f2937;
+                    border: 1px solid #cbd5e1;
+                }
+                QMenu::item { color: #1f2937; }
+                QMenu::item:selected { background: #dbeafe; color: #0f172a; }
+                QMenu::item:disabled { color: #94a3b8; }
+                QMenu::separator { background: #e2e8f0; }
+                QPushButton#secondaryButton, QPushButton#themeButton,
+                QPushButton#windowControlButton { background: #e7edf4; color: #1f2937; }
+                QPushButton#secondaryButton:hover, QPushButton#themeButton:hover,
+                QPushButton#windowControlButton:hover { background: #dbe5ef; color: #0f172a; }
+                QFrame#toast[kind="info"] { background: #dbeafe; border: 1px solid #3b82f6; }
+                QFrame#toast[kind="success"] { background: #dcfce7; border: 1px solid #22c55e; }
+                QFrame#toast[kind="warning"] { background: #fef3c7; border: 1px solid #f59e0b; }
+                QFrame#toast[kind="error"] { background: #fee2e2; border: 1px solid #ef4444; }
+                QFrame#toast QLabel#toastText { color: #1f2937; }
+                QFrame#toast[kind="info"] QLabel#toastIcon { color: #1d4ed8; }
+                QFrame#toast[kind="success"] QLabel#toastIcon { color: #15803d; }
+                QFrame#toast[kind="warning"] QLabel#toastIcon { color: #b45309; }
+                QFrame#toast[kind="error"] QLabel#toastIcon { color: #b91c1c; }
+            """
         self.setStyleSheet(style)
 
     def show_login(self) -> None:

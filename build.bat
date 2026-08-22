@@ -10,7 +10,7 @@ set EZYM_MAILER_BOOTSTRAP_API=0
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
-pyinstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --hidden-import PIL.Image --hidden-import greenlet._greenlet --exclude-module playwright --exclude-module docx --exclude-module openpyxl --exclude-module reportlab --exclude-module pptx main.py
+pyinstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --hidden-import PIL.Image --hidden-import greenlet._greenlet --exclude-module playwright main.py
 
 echo.
 echo Build complete. Check dist for EazyMailer.exe.

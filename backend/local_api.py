@@ -145,6 +145,12 @@ class ActivityLogRequest(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class SentEmailRequest(BaseModel):
+    recipient: str = Field(min_length=3, max_length=255)
+    subject: str = Field(default="", max_length=255)
+    campaign_id: str = Field(default="", max_length=128)
+
+
 class BrowserSessionRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=128)
@@ -520,6 +526,22 @@ def _ensure_schema() -> None:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sent_email_log (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NULL,
+                    username VARCHAR(64) NOT NULL,
+                    recipient VARCHAR(255) NOT NULL,
+                    subject VARCHAR(255) NULL,
+                    campaign_id VARCHAR(128) NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    KEY idx_sent_email_user (user_id, created_at),
+                    KEY idx_sent_email_username (username, created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS browser_sessions (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
                     user_id INT UNSIGNED NULL,
@@ -789,7 +811,8 @@ def _list_users() -> list[dict[str, str]]:
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
-                       last_login_at, last_login_ip, last_login_device, created_at, updated_at
+                       last_login_at, last_login_ip, last_login_device, created_at, updated_at,
+                       (SELECT COUNT(*) FROM sent_email_log sent WHERE sent.user_id = user_db.id) AS sent_email_count
                 FROM user_db
                 ORDER BY id ASC
                 """
@@ -869,6 +892,7 @@ def _parse_login_valid_until(value: object) -> datetime | None:
 
 
 def _user_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    online_status = _is_user_online(row)
     return {
         "id": str(row["id"]),
         "username": str(row["username"]),
@@ -886,6 +910,9 @@ def _user_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "device_bound_at": row.get("device_bound_at"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
+        "sent_email_count": int(row.get("sent_email_count") or 0),
+        "online_status": online_status,
+        "online_status_label": "Online" if online_status else "Offline",
     }
 
 
@@ -1201,6 +1228,33 @@ def record_activity(
                     json.dumps(details or {}, ensure_ascii=False),
                     ip_address,
                     _location_label(ip_address),
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def record_sent_email(
+    username: str,
+    recipient: str,
+    subject: str = "",
+    campaign_id: str = "",
+    user_id: int | None = None,
+) -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO sent_email_log (user_id, username, recipient, subject, campaign_id)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    username,
+                    recipient.strip(),
+                    subject.strip() or None,
+                    campaign_id.strip() or None,
                 ),
             )
     finally:
@@ -1587,7 +1641,8 @@ def admin_get_user_details(
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
-                       last_login_at, last_login_ip, last_login_device, created_at, updated_at
+                       last_login_at, last_login_ip, last_login_device, created_at, updated_at,
+                       (SELECT COUNT(*) FROM sent_email_log sent WHERE sent.user_id = user_db.id) AS sent_email_count
                 FROM user_db
                 WHERE id = %s
                 LIMIT 1
@@ -1625,6 +1680,18 @@ def admin_get_user_details(
             )
             activity_rows = cursor.fetchall() or []
 
+            cursor.execute(
+                """
+                SELECT id, recipient, subject, campaign_id, created_at
+                FROM sent_email_log
+                WHERE user_id = %s OR username = %s
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (user_id, str(user_row["username"])),
+            )
+            sent_email_rows = cursor.fetchall() or []
+
             return {
                 "ok": True,
                 "user": user,
@@ -1633,6 +1700,7 @@ def admin_get_user_details(
                 "login_history": login_rows,
                 "activity": activity_rows,
                 "device_history": _build_device_history(login_rows),
+                "sent_emails": sent_email_rows,
                 "current_device": {
                     "device_fingerprint": str(user_row.get("device_fingerprint") or ""),
                     "mac_id": str(user_row.get("device_fingerprint") or ""),
@@ -1773,6 +1841,21 @@ def create_activity(
         payload.action,
         payload.category,
         payload.details,
+        user_id=int(current_user["id"]) if current_user.get("id") else None,
+    )
+    return {"ok": True}
+
+
+@app.post("/api/email-sent")
+def create_sent_email(
+    payload: SentEmailRequest,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    record_sent_email(
+        current_user["username"],
+        payload.recipient,
+        payload.subject,
+        payload.campaign_id,
         user_id=int(current_user["id"]) if current_user.get("id") else None,
     )
     return {"ok": True}
@@ -2300,6 +2383,26 @@ def _authorized_request(
 
 def get_settings(auth_token: str, timeout: float = 5.0) -> dict:
     return _authorized_request("GET", "/api/settings", auth_token, timeout=timeout)
+
+
+def record_sent_email_event(
+    auth_token: str,
+    recipient: str,
+    subject: str = "",
+    campaign_id: str = "",
+    timeout: float = 5.0,
+) -> dict:
+    return _authorized_request(
+        "POST",
+        "/api/email-sent",
+        auth_token,
+        {
+            "recipient": recipient,
+            "subject": subject,
+            "campaign_id": campaign_id,
+        },
+        timeout=timeout,
+    )
 
 
 def get_content(auth_token: str, timeout: float = 5.0, content_type: str | None = None) -> dict:
