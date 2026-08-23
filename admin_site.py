@@ -1328,18 +1328,18 @@ def _html() -> str:
               {[
                 ["details", "View details"],
                 ["edit", "Edit user"],
-                ["activate", "Activate"],
-                ["deactivate", "Deactivate"],
-                ["admin", "Set Admin"],
-                ["user", "Set User"],
-                ["any-device", "Allow any device"],
-                ["keep-device", "Keep current device"],
+                ["activate", "Activate", menuUser && !menuUser.is_active],
+                ["deactivate", "Deactivate", menuUser && !!menuUser.is_active],
+                ["admin", "Set Admin", menuUser && String(menuUser.role || "").toLowerCase() !== "admin"],
+                ["user", "Set User", menuUser && String(menuUser.role || "").toLowerCase() === "admin"],
+                ["any-device", "Allow any device", menuUser && !!(menuUser.device_fingerprint || menuUser.device_name)],
+                ["keep-device", "Keep current device", menuUser && !(menuUser.device_fingerprint || menuUser.device_name)],
                 ["valid-30", "Validity +30d"],
                 ["valid-90", "Validity +90d"],
-                ["clear-validity", "Clear validity"],
+                ["clear-validity", "Clear validity", menuUser && !!menuUser.login_valid_until],
                 ["reset-password", "Reset password"],
-                ["reset-device", "Reset device"],
-              ].map(([value, label]) => <MenuItem key={value} onClick={() => handleMenu(value)}>{label}</MenuItem>)}
+                ["reset-device", "Reset device", menuUser && !!(menuUser.device_fingerprint || menuUser.device_name)],
+              ].filter(([, , visible = true]) => visible).map(([value, label]) => <MenuItem key={value} onClick={() => handleMenu(value)}>{label}</MenuItem>)}
             </Menu>
 
             <Dialog fullScreen open={detailOpen} onClose={() => setDetailOpen(false)}>
