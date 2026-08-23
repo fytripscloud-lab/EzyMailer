@@ -91,7 +91,7 @@ def _html() -> str:
     const STORAGE_KEY = "ezymailer_admin_auth";
     const FP_KEY = "ezymailer_admin_device_fp";
     const THEME_KEY = "ezymailer_admin_theme";
-    const drawerWidth = 300;
+    const drawerWidth = 264;
 
     const fmt = (value) => (value === null || value === undefined || value === "" ? "" : String(value));
     const formatDate = (value) => {
@@ -209,7 +209,7 @@ def _html() -> str:
         },
         components: {
           MuiPaper: { styleOverrides: { root: { backgroundImage: "none" } } },
-          MuiTableCell: { styleOverrides: { root: { whiteSpace: "nowrap" } } },
+          MuiTableCell: { styleOverrides: { root: { whiteSpace: "normal", wordBreak: "break-word" } } },
         },
       }), [mode]);
       const isDesktop = useMediaQuery(theme.breakpoints.up("md"));
@@ -1283,9 +1283,8 @@ def _html() -> str:
       }
 
       const sidebar = (
-        <Box sx={{ p: 2.25, height: "100%", display: "flex", flexDirection: "column" }}>
-          <Paper sx={{ p: 1.5, borderRadius: 2, bgcolor: "background.paper", border: "1px solid", borderColor: "divider" }}>
-            <List dense>
+        <Box sx={{ px: 1, py: 1.5, height: "100%" }}>
+            <List dense disablePadding>
               {[
                 ["overview", "Overview"],
                 ["users", "Users"],
@@ -1301,13 +1300,12 @@ def _html() -> str:
                     setActiveSection(key);
                     if (!isDesktop) setMobileOpen(false);
                   }}
-                  sx={{ borderRadius: 1.5, mb: 1 }}
+                  sx={{ borderRadius: 1, mb: 0.5, px: 1.5, py: 1.1 }}
                 >
                   <ListItemText primary={label} primaryTypographyProps={{ fontWeight: 700 }} />
                 </ListItemButton>
               ))}
             </List>
-          </Paper>
         </Box>
       );
 
@@ -1323,22 +1321,25 @@ def _html() -> str:
           }} />
           <Box sx={{ display: "flex", minHeight: "100vh" }}>
             <AppBar position="fixed" elevation={0} sx={{ zIndex: (t) => t.zIndex.drawer + 1, borderBottom: "1px solid", borderColor: "divider", bgcolor: "background.paper", color: "text.primary" }}>
-              <Toolbar sx={{ gap: 1.5 }}>
+              <Toolbar sx={{ gap: { xs: 1, sm: 1.5 }, flexWrap: { xs: "wrap", md: "nowrap" }, py: { xs: 1, md: 0 }, minHeight: { xs: "auto", md: 64 } }}>
                 {!isDesktop && (
                   <IconButton edge="start" onClick={() => setMobileOpen(true)} sx={{ mr: 1 }}>
                     <Box component="span" sx={{ fontSize: 22 }}>☰</Box>
                   </IconButton>
                 )}
-                <Box sx={{ flexGrow: 1 }}>
-                  <Typography variant="h6" fontWeight={900}>CRM Dashboard</Typography>
-                  <Typography variant="caption" color="text.secondary">Users, permissions, validity, login restrictions, charts, and activity.</Typography>
+                <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+                  <Typography variant="h6" fontWeight={900} noWrap>CRM Dashboard</Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: { xs: "none", sm: "block" }, whiteSpace: "normal" }}>Users, permissions, validity, login restrictions, charts, and activity.</Typography>
                 </Box>
-                <FormControlLabel
-                  control={<Switch checked={mode === "dark"} onChange={() => setMode((m) => m === "dark" ? "light" : "dark")} />}
-                  label={mode === "dark" ? "Dark" : "Light"}
-                />
-                <Button variant="outlined" onClick={() => refreshAll(auth)}>Refresh All</Button>
-                <Button variant="contained" color="inherit" onClick={() => logoutCurrentSession("Logged out")}>Logout</Button>
+                <Stack direction="row" spacing={{ xs: 0.5, sm: 1 }} alignItems="center" sx={{ ml: { xs: "auto", md: 0 } }}>
+                  <FormControlLabel
+                    sx={{ mr: { xs: 0, sm: 1 } }}
+                    control={<Switch size="small" checked={mode === "dark"} onChange={() => setMode((m) => m === "dark" ? "light" : "dark")} />}
+                    label={<Box component="span" sx={{ display: { xs: "none", sm: "inline" } }}>{mode === "dark" ? "Dark" : "Light"}</Box>}
+                  />
+                  <Button size="small" variant="outlined" onClick={() => refreshAll(auth)}>Refresh All</Button>
+                  <Button size="small" variant="contained" color="inherit" onClick={() => logoutCurrentSession("Logged out")}>Logout</Button>
+                </Stack>
               </Toolbar>
             </AppBar>
 
