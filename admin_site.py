@@ -1727,7 +1727,15 @@ def _html() -> str:
                       </FormControl>
                     </Grid>
                     <Grid item xs={12} md={6}>
-                      <TextField label="Validity Until" value={form.login_valid_until} onChange={(e) => setForm((prev) => ({ ...prev, login_valid_until: e.target.value }))} helperText="YYYY-MM-DDTHH:MM or blank" fullWidth />
+                      <TextField
+                        label="Validity Until"
+                        type="datetime-local"
+                        value={form.login_valid_until}
+                        onChange={(e) => setForm((prev) => ({ ...prev, login_valid_until: e.target.value }))}
+                        InputLabelProps={{ shrink: true }}
+                        helperText="Optional. Choose a date and time or leave blank."
+                        fullWidth
+                      />
                     </Grid>
                     <Grid item xs={12} md={6}>
                       <TextField label="New Password" type="password" value={form.password} onChange={(e) => setForm((prev) => ({ ...prev, password: e.target.value }))} fullWidth />
