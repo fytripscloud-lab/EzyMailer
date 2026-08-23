@@ -923,7 +923,7 @@ def _html() -> str:
             <Table stickyHeader size="small">
               <TableHead>
                 <TableRow>
-                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Actions"].map((head) => (
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Last Login", "Emails Sent", "Actions"].map((head) => (
                     <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                   ))}
                 </TableRow>
@@ -937,7 +937,6 @@ def _html() -> str:
                     <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
                     <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
                     <TableCell>{formatDate(user.login_valid_until)}</TableCell>
-                    <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
                     <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
                     <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                     <TableCell>
@@ -947,7 +946,7 @@ def _html() -> str:
                 ))}
                 {!pagedUsers.length && (
                   <TableRow>
-                    <TableCell colSpan={10}>
+                    <TableCell colSpan={9}>
                       <Typography color="text.secondary">No users found for the current search and filter.</Typography>
                     </TableCell>
                   </TableRow>
@@ -990,7 +989,7 @@ def _html() -> str:
             <Table stickyHeader size="small">
               <TableHead>
                 <TableRow>
-                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Actions"].map((head) => (
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Last Login", "Emails Sent", "Actions"].map((head) => (
                     <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                   ))}
                 </TableRow>
@@ -1004,7 +1003,6 @@ def _html() -> str:
                     <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
                     <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
                     <TableCell>{formatDate(user.login_valid_until)}</TableCell>
-                    <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
                     <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
                     <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                     <TableCell>
@@ -1014,7 +1012,7 @@ def _html() -> str:
                 ))}
                 {!pagedExpiredUsers.length && (
                   <TableRow>
-                    <TableCell colSpan={10}>
+                    <TableCell colSpan={9}>
                       <Typography color="text.secondary">No expired users match the search.</Typography>
                     </TableCell>
                   </TableRow>
@@ -1603,7 +1601,7 @@ def _html() -> str:
                     <Table stickyHeader size="small">
                       <TableHead>
                         <TableRow>
-                          {["ID", "Username", "Name", "Role", "Status", "Validity", "Device", "Last Login", "Emails Sent", "Online"].map((head) => (
+                          {["ID", "Username", "Name", "Role", "Status", "Validity", "Last Login", "Emails Sent", "Online"].map((head) => (
                             <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                           ))}
                         </TableRow>
@@ -1629,7 +1627,6 @@ def _html() -> str:
                               />
                             </TableCell>
                             <TableCell>{formatDate(user.login_valid_until)}</TableCell>
-                            <TableCell>{fmt(user.device_name || user.device_fingerprint)}</TableCell>
                             <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
                             <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                             <TableCell>
@@ -1644,7 +1641,7 @@ def _html() -> str:
                         ))}
                         {!pagedStatRows.length && (
                           <TableRow>
-                            <TableCell colSpan={10}>
+                            <TableCell colSpan={9}>
                               <Typography color="text.secondary">No users match the current search.</Typography>
                             </TableCell>
                           </TableRow>
