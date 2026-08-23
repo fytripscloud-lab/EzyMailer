@@ -1462,6 +1462,37 @@ def _html() -> str:
                         </TableContainer>
                       </Paper>
 
+                      <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5 }}>
+                        <Typography variant="h6" fontWeight={900}>Sent Email List</Typography>
+                        <TableContainer sx={{ maxHeight: 360, overflow: "auto", mt: 1.5 }}>
+                          <Table stickyHeader size="small">
+                            <TableHead>
+                              <TableRow>
+                                {["Recipient", "Subject", "Sent At"].map((head) => (
+                                  <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                                ))}
+                              </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {(detailData.sent_emails || []).map((row) => (
+                                <TableRow key={row.id} hover>
+                                  <TableCell>{fmt(row.recipient)}</TableCell>
+                                  <TableCell>{fmt(row.subject)}</TableCell>
+                                  <TableCell>{formatDate(row.created_at)}</TableCell>
+                                </TableRow>
+                              ))}
+                              {!(detailData.sent_emails || []).length && (
+                                <TableRow>
+                                  <TableCell colSpan={3}>
+                                    <Typography color="text.secondary">No sent emails found.</Typography>
+                                  </TableCell>
+                                </TableRow>
+                              )}
+                            </TableBody>
+                          </Table>
+                        </TableContainer>
+                      </Paper>
+
                       <Grid container spacing={2}>
                         <Grid item xs={12} lg={4}>
                           <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5, height: "100%" }}>
