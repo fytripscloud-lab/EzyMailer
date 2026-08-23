@@ -85,6 +85,10 @@ JWT_EXPIRES_MINUTES = 24 * 60
 
 _server_thread: threading.Thread | None = None
 _bootstrap_lock = threading.Lock()
+_cron_stop = threading.Event()
+_cron_thread: threading.Thread | None = None
+CRON_RETENTION_DAYS = 15
+CRON_INTERVAL_SECONDS = CRON_RETENTION_DAYS * 24 * 60 * 60
 
 
 def _api_target_is_local() -> bool:
@@ -538,6 +542,34 @@ def _ensure_schema() -> None:
                     UNIQUE KEY uq_sent_email_daily (user_id, username, sent_date),
                     KEY idx_sent_email_daily_user (user_id, sent_date)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cron_job_status (
+                    job_key VARCHAR(128) NOT NULL,
+                    job_name VARCHAR(255) NOT NULL,
+                    schedule_label VARCHAR(128) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'Scheduled',
+                    last_run_at TIMESTAMP NULL,
+                    last_sync_at TIMESTAMP NULL,
+                    next_run_at TIMESTAMP NULL,
+                    last_result VARCHAR(255) NULL,
+                    PRIMARY KEY (job_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO cron_job_status
+                    (job_key, job_name, schedule_label, status, next_run_at, last_result)
+                VALUES
+                    ('activity-login-cleanup', 'Remove old user activity and login history',
+                     'Every 15 days', 'Scheduled',
+                     DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 15 DAY), 'Waiting for first scheduled run')
+                ON DUPLICATE KEY UPDATE
+                    job_name = VALUES(job_name),
+                    schedule_label = VALUES(schedule_label)
                 """
             )
             cursor.execute(
@@ -1494,9 +1526,72 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict[s
     return user
 
 
+def _run_activity_login_cleanup() -> None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM activity_log WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %s DAY)",
+                (CRON_RETENTION_DAYS,),
+            )
+            activity_deleted = cursor.rowcount
+            cursor.execute(
+                "DELETE FROM login_history WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %s DAY)",
+                (CRON_RETENTION_DAYS,),
+            )
+            login_deleted = cursor.rowcount
+            cursor.execute(
+                """
+                UPDATE cron_job_status
+                SET status = 'Completed', last_run_at = CURRENT_TIMESTAMP,
+                    last_sync_at = CURRENT_TIMESTAMP,
+                    next_run_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 15 DAY),
+                    last_result = %s
+                WHERE job_key = 'activity-login-cleanup'
+                """,
+                (f"Removed {activity_deleted} activity and {login_deleted} login records",),
+            )
+    finally:
+        connection.close()
+
+
+def _cron_scheduler() -> None:
+    # Run the cleanup once on startup, then repeat on the 15-day schedule.
+    try:
+        _run_activity_login_cleanup()
+    except Exception:
+        pass
+    while not _cron_stop.wait(3600):
+        try:
+            connection = _connect(DB_NAME)
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT next_run_at FROM cron_job_status WHERE job_key = 'activity-login-cleanup' LIMIT 1"
+                    )
+                    row = cursor.fetchone()
+            finally:
+                connection.close()
+            next_run = row[0] if row else None
+            if next_run is not None and next_run <= datetime.now():
+                _run_activity_login_cleanup()
+        except Exception:
+            continue
+
+
+def _start_cron_scheduler() -> None:
+    global _cron_thread
+    if _cron_thread is not None and _cron_thread.is_alive():
+        return
+    _cron_stop.clear()
+    _cron_thread = threading.Thread(target=_cron_scheduler, name="ezymailer-cron", daemon=True)
+    _cron_thread.start()
+
+
 @app.on_event("startup")
 def _startup() -> None:
     _ensure_schema()
+    _start_cron_scheduler()
 
 
 @app.get("/api/health")
@@ -1905,6 +2000,27 @@ def admin_list_activity(
             )
             rows = cursor.fetchall() or []
             return {"ok": True, "activity": rows}
+    finally:
+        connection.close()
+
+
+@app.get("/api/admin/cron-jobs")
+def admin_list_cron_jobs(
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    _require_admin(current_user)
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT job_key, job_name, schedule_label, status,
+                       last_run_at, last_sync_at, next_run_at, last_result
+                FROM cron_job_status
+                ORDER BY job_name ASC
+                """
+            )
+            return {"ok": True, "cron_jobs": cursor.fetchall() or []}
     finally:
         connection.close()
 

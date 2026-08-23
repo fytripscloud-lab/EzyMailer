@@ -218,6 +218,7 @@ def _html() -> str:
       const [users, setUsers] = React.useState([]);
       const [activity, setActivity] = React.useState([]);
       const [history, setHistory] = React.useState([]);
+      const [cronJobs, setCronJobs] = React.useState([]);
       const [selectedUser, setSelectedUser] = React.useState(null);
       const [page, setPage] = React.useState(0);
       const [rowsPerPage, setRowsPerPage] = React.useState(10);
@@ -327,11 +328,15 @@ def _html() -> str:
         const payload = await request(authValue, "/api/admin/login-history?limit=200");
         setHistory(Array.isArray(payload.history) ? payload.history : []);
       }
+      async function refreshCronJobs(authValue = auth) {
+        const payload = await request(authValue, "/api/admin/cron-jobs");
+        setCronJobs(Array.isArray(payload.cron_jobs) ? payload.cron_jobs : []);
+      }
       async function refreshAll(authValue = auth) {
         if (!authValue?.access_token) return;
         setLoading(true);
         try {
-          await Promise.all([refreshUsers(authValue), refreshActivity(authValue), refreshHistory(authValue)]);
+          await Promise.all([refreshUsers(authValue), refreshActivity(authValue), refreshHistory(authValue), refreshCronJobs(authValue)]);
         } catch (error) {
           notify(error.message || String(error), "error");
         } finally {
@@ -1156,11 +1161,52 @@ def _html() -> str:
         </Stack>
       );
 
+      const renderCronJobsPage = () => (
+        <Stack spacing={2.5}>
+          {renderPageHeader(
+            "Cron Jobs",
+            "Scheduled maintenance jobs and their latest synchronization status.",
+            [<Button key="refresh" variant="outlined" onClick={() => refreshCronJobs(auth)}>Refresh Cron Jobs</Button>],
+          )}
+
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: "auto" }}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  {["Job", "Schedule", "Status", "Last Run", "Last Synced", "Next Run", "Result"].map((head) => (
+                    <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                  ))}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {cronJobs.map((job) => (
+                  <TableRow key={job.job_key} hover>
+                    <TableCell>{fmt(job.job_name)}</TableCell>
+                    <TableCell>{fmt(job.schedule_label)}</TableCell>
+                    <TableCell><Chip size="small" label={fmt(job.status)} color={job.status === "Completed" ? "success" : "default"} /></TableCell>
+                    <TableCell>{formatDate(job.last_run_at) || "Not run yet"}</TableCell>
+                    <TableCell>{formatDate(job.last_sync_at) || "Not synced yet"}</TableCell>
+                    <TableCell>{formatDate(job.next_run_at) || "Not scheduled"}</TableCell>
+                    <TableCell>{fmt(job.last_result)}</TableCell>
+                  </TableRow>
+                ))}
+                {!cronJobs.length && (
+                  <TableRow>
+                    <TableCell colSpan={7}><Typography color="text.secondary">No cron jobs configured.</Typography></TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </Stack>
+      );
+
       const renderActiveSection = () => {
         if (activeSection === "users") return renderUsersPage();
         if (activeSection === "expired") return renderExpiredPage();
         if (activeSection === "activity") return renderActivityPage();
         if (activeSection === "history") return renderHistoryPage();
+        if (activeSection === "cron-jobs") return renderCronJobsPage();
         return renderOverviewPage();
       };
 
@@ -1246,6 +1292,7 @@ def _html() -> str:
                 ["expired", "Validity Expired"],
                 ["activity", "Activity"],
                 ["history", "Login History"],
+                ["cron-jobs", "Cron Jobs"],
               ].map(([key, label]) => (
                 <ListItemButton
                   key={key}
