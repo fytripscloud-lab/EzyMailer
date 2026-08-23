@@ -45,15 +45,15 @@ CREATE TABLE IF NOT EXISTS customer_variables (
     UNIQUE KEY uq_user_customer_variables (username, email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS sent_email_log (
+CREATE TABLE IF NOT EXISTS sent_email_daily (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     user_id INT UNSIGNED NULL,
     username VARCHAR(64) NOT NULL,
-    recipient VARCHAR(255) NOT NULL,
-    subject VARCHAR(255) NULL,
-    campaign_id VARCHAR(128) NULL,
+    sent_date DATE NOT NULL,
+    sent_count INT UNSIGNED NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    KEY idx_sent_email_user (user_id, created_at),
-    KEY idx_sent_email_username (username, created_at)
+    UNIQUE KEY uq_sent_email_daily (user_id, username, sent_date),
+    KEY idx_sent_email_daily_user (user_id, sent_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

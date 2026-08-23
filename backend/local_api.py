@@ -526,17 +526,17 @@ def _ensure_schema() -> None:
             )
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS sent_email_log (
+                CREATE TABLE IF NOT EXISTS sent_email_daily (
                     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
                     user_id INT UNSIGNED NULL,
                     username VARCHAR(64) NOT NULL,
-                    recipient VARCHAR(255) NOT NULL,
-                    subject VARCHAR(255) NULL,
-                    campaign_id VARCHAR(128) NULL,
+                    sent_date DATE NOT NULL,
+                    sent_count INT UNSIGNED NOT NULL DEFAULT 0,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (id),
-                    KEY idx_sent_email_user (user_id, created_at),
-                    KEY idx_sent_email_username (username, created_at)
+                    UNIQUE KEY uq_sent_email_daily (user_id, username, sent_date),
+                    KEY idx_sent_email_daily_user (user_id, sent_date)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
@@ -812,7 +812,7 @@ def _list_users() -> list[dict[str, str]]:
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
                        last_login_at, last_login_ip, last_login_device, created_at, updated_at,
-                       (SELECT COUNT(*) FROM sent_email_log sent WHERE sent.user_id = user_db.id) AS sent_email_count
+                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count
                 FROM user_db
                 ORDER BY id ASC
                 """
@@ -1246,16 +1246,11 @@ def record_sent_email(
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO sent_email_log (user_id, username, recipient, subject, campaign_id)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO sent_email_daily (user_id, username, sent_date, sent_count)
+                VALUES (%s, %s, UTC_DATE(), 1)
+                ON DUPLICATE KEY UPDATE sent_count = sent_count + 1
                 """,
-                (
-                    user_id,
-                    username,
-                    recipient.strip(),
-                    subject.strip() or None,
-                    campaign_id.strip() or None,
-                ),
+                (user_id, username),
             )
     finally:
         connection.close()
@@ -1642,7 +1637,7 @@ def admin_get_user_details(
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
                        last_login_at, last_login_ip, last_login_device, created_at, updated_at,
-                       (SELECT COUNT(*) FROM sent_email_log sent WHERE sent.user_id = user_db.id) AS sent_email_count
+                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count
                 FROM user_db
                 WHERE id = %s
                 LIMIT 1
@@ -1682,22 +1677,9 @@ def admin_get_user_details(
 
             cursor.execute(
                 """
-                SELECT id, recipient, subject, campaign_id, created_at
-                FROM sent_email_log
+                SELECT sent_date, sent_count
+                FROM sent_email_daily
                 WHERE user_id = %s OR username = %s
-                ORDER BY id DESC
-                LIMIT 200
-                """,
-                (user_id, str(user_row["username"])),
-            )
-            sent_email_rows = cursor.fetchall() or []
-
-            cursor.execute(
-                """
-                SELECT DATE(created_at) AS sent_date, COUNT(*) AS sent_count
-                FROM sent_email_log
-                WHERE user_id = %s OR username = %s
-                GROUP BY DATE(created_at)
                 ORDER BY sent_date DESC
                 LIMIT 366
                 """,
@@ -1713,7 +1695,6 @@ def admin_get_user_details(
                 "login_history": login_rows,
                 "activity": activity_rows,
                 "device_history": _build_device_history(login_rows),
-                "sent_emails": sent_email_rows,
                 "sent_email_daily": sent_email_daily_rows,
                 "current_device": {
                     "device_fingerprint": str(user_row.get("device_fingerprint") or ""),
