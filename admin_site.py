@@ -1432,6 +1432,36 @@ def _html() -> str:
                         ))}
                       </Grid>
 
+                      <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5 }}>
+                        <Typography variant="h6" fontWeight={900}>Daily Email Sent Count</Typography>
+                        <TableContainer sx={{ maxHeight: 320, overflow: "auto", mt: 1.5 }}>
+                          <Table stickyHeader size="small">
+                            <TableHead>
+                              <TableRow>
+                                {["Date", "Emails Sent"].map((head) => (
+                                  <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                                ))}
+                              </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {(detailData.sent_email_daily || []).map((row) => (
+                                <TableRow key={String(row.sent_date)} hover>
+                                  <TableCell>{formatDate(row.sent_date)}</TableCell>
+                                  <TableCell>{Number(row.sent_count || 0).toLocaleString()}</TableCell>
+                                </TableRow>
+                              ))}
+                              {!(detailData.sent_email_daily || []).length && (
+                                <TableRow>
+                                  <TableCell colSpan={2}>
+                                    <Typography color="text.secondary">No emails sent yet.</Typography>
+                                  </TableCell>
+                                </TableRow>
+                              )}
+                            </TableBody>
+                          </Table>
+                        </TableContainer>
+                      </Paper>
+
                       <Grid container spacing={2}>
                         <Grid item xs={12} lg={4}>
                           <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5, height: "100%" }}>

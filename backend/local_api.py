@@ -1692,6 +1692,19 @@ def admin_get_user_details(
             )
             sent_email_rows = cursor.fetchall() or []
 
+            cursor.execute(
+                """
+                SELECT DATE(created_at) AS sent_date, COUNT(*) AS sent_count
+                FROM sent_email_log
+                WHERE user_id = %s OR username = %s
+                GROUP BY DATE(created_at)
+                ORDER BY sent_date DESC
+                LIMIT 366
+                """,
+                (user_id, str(user_row["username"])),
+            )
+            sent_email_daily_rows = cursor.fetchall() or []
+
             return {
                 "ok": True,
                 "user": user,
@@ -1701,6 +1714,7 @@ def admin_get_user_details(
                 "activity": activity_rows,
                 "device_history": _build_device_history(login_rows),
                 "sent_emails": sent_email_rows,
+                "sent_email_daily": sent_email_daily_rows,
                 "current_device": {
                     "device_fingerprint": str(user_row.get("device_fingerprint") or ""),
                     "mac_id": str(user_row.get("device_fingerprint") or ""),
