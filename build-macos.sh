@@ -61,11 +61,6 @@ pyinstaller \
   --hidden-import PIL.Image \
   --hidden-import greenlet._greenlet \
   --exclude-module playwright \
-  --exclude-module docx \
-  --exclude-module openpyxl \
-  --exclude-module reportlab \
-  --exclude-module pptx \
-  --exclude-module lxml \
   "$ROOT_DIR/main.py"
 
 mkdir -p "$STAGING_DIR"
