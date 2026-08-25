@@ -16,6 +16,8 @@ Build the desktop app into platform-specific packages using PyInstaller.
 3. Wait for `dist\EzyMailer.exe` to be created.
 4. On first launch, the app downloads the browser runtime into the user cache if it is not already available.
 
+The GitHub Actions workflow `.github/workflows/build-windows-exe.yml` runs the same build on Windows x64, installs every package from `requirements.txt`, validates the EXE, and uploads `EzyMailer-Windows-x64` with its SHA-256 checksum.
+
 ## macOS build steps
 
 1. Open a terminal in the project root.

@@ -2,18 +2,22 @@
 
 ## Goal
 
-Provide a dedicated workspace for HTML campaign content and attachments.
+Provide a dedicated workspace for editable campaign attachment content.
 
 ## Layout
 
-- HTML template editor
-- Preview banner
-- Preview HTML, Convert to File, and Convert & Preview actions
-- Separate HTML preview window with dark rendering for the template output
-- Preview toolbar with reload, zoom, and raw source toggle
-- Attachment configuration card
+- Per-tab HTML Code and Text Editor modes
+- Rich-text controls for fonts, size, color, bold, italic, underline, and left/center/right alignment
+- Bulleted and numbered lists, undo/redo, and clear formatting
+- Rich-text font family, size, bold, italic, underline, and color controls
+- Embedded image upload and variable insertion
+- Separate rendered preview window
+- Per-tab mode and content persistence
+- PDF, image, Word, Excel, and PowerPoint conversion through the shared attachment pipeline
+- Attachment format and file-name configuration
 
 ## Notes
 
-- The attachment workflow is currently visual only
-- Conversion logic will be attached in the business-logic phase
+- HTML Code mode preserves and sends the entered HTML source.
+- Text Editor mode serializes the formatted document to HTML before variable replacement and conversion.
+- Images inserted through Text Editor are embedded as data URLs so generated attachments do not depend on local file paths.

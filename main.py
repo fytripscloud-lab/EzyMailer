@@ -1,5 +1,8 @@
-﻿import sys
+﻿from __future__ import annotations
+
+import sys
 import html
+import base64
 import csv
 import hashlib
 import json
@@ -65,7 +68,7 @@ from PySide6.QtCore import (
     QSize,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QKeySequence, QGuiApplication, QClipboard, QTextFormat
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QKeySequence, QGuiApplication, QClipboard, QTextCharFormat, QTextFormat, QTextListFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -76,6 +79,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QFormLayout,
+    QFontComboBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -94,6 +98,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QFileDialog,
+    QColorDialog,
     QPlainTextEdit,
     QTextEdit,
     QDoubleSpinBox,
@@ -1264,11 +1269,11 @@ class AppState:
     ai_model: str = ""
     ai_connected: bool = False
     sender_limit: int = 300
-    delay_from: float = 0.5
-    delay_to: float = 1.0
+    delay_from: float = 0.2
+    delay_to: float = 0.5
     retry_count: int = 3
     retry_enabled: bool = True
-    delay_type: str = "Random range"
+    delay_type: str = "Auto (system-oriented)"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
     ai_available_models: list[str] = field(default_factory=list)
@@ -2166,6 +2171,7 @@ class BodyDraftEditor(QWidget):
 class AttachmentDraftEditor(QWidget):
     contentChanged = Signal()
     titleChanged = Signal(str)
+    modeChanged = Signal(str)
     previewRequested = Signal()
 
     def __init__(self, scale: float = 1.0):
@@ -2197,44 +2203,462 @@ class AttachmentDraftEditor(QWidget):
         title_row.addWidget(self.preview_button)
         layout.addLayout(title_row)
 
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("Mode")
+        mode_label.setObjectName("fieldLabel")
+        self.html_button = QPushButton("HTML Code")
+        self.text_button = QPushButton("Text Editor")
+        self.html_button.setCheckable(True)
+        self.text_button.setCheckable(True)
+        self.html_button.setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.html_button)
+        self._mode_group.addButton(self.text_button)
+        self.html_button.clicked.connect(lambda: self.set_mode("HTML Code"))
+        self.text_button.clicked.connect(lambda: self.set_mode("Text Editor"))
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.html_button)
+        mode_row.addWidget(self.text_button)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        self.stack = QStackedWidget()
+        self.stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self.html_editor = QTextEdit()
         self.html_editor.setObjectName("bodyEditor")
         self.html_editor.setPlaceholderText("<!-- Paste HTML content here -->")
         self.html_editor.setToolTip("Compose the HTML attachment content")
         self.html_editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.html_editor, 1)
+        self.stack.addWidget(self.html_editor)
+
+        rich_page = QWidget()
+        rich_layout = QVBoxLayout(rich_page)
+        rich_layout.setContentsMargins(0, 0, 0, 0)
+        rich_layout.setSpacing(_scaled_int(6, self._scale))
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(_scaled_int(5, self._scale))
+        self.font_combo = QFontComboBox()
+        self.font_combo.setToolTip("Font family")
+        self.font_combo.setMaximumWidth(_scaled_int(190, self._scale))
+        self.font_size_combo = QComboBox()
+        self.font_size_combo.addItems(["8", "9", "10", "11", "12", "14", "16", "18", "20", "24", "28", "32", "36", "48", "64", "72"])
+        self.font_size_combo.setCurrentText("12")
+        self.font_size_combo.setEditable(True)
+        self.font_size_combo.setToolTip("Font size")
+        self.font_size_combo.setMaximumWidth(_scaled_int(75, self._scale))
+        self.bold_button = QPushButton()
+        self.italic_button = QPushButton()
+        self.underline_button = QPushButton()
+        for button, tooltip in (
+            (self.bold_button, "Bold"),
+            (self.italic_button, "Italic"),
+            (self.underline_button, "Underline"),
+        ):
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+        self.bold_button.setIcon(self._toolbar_icon("bold"))
+        self.italic_button.setIcon(self._toolbar_icon("italic"))
+        self.underline_button.setIcon(self._toolbar_icon("underline"))
+        self.color_button = QPushButton()
+        self.color_button.setIcon(self._toolbar_icon("color"))
+        self.color_button.setToolTip("Text color")
+        self.align_left_button = QPushButton()
+        self.align_center_button = QPushButton()
+        self.align_right_button = QPushButton()
+        self.align_left_button.setIcon(self._toolbar_icon("align-left"))
+        self.align_center_button.setIcon(self._toolbar_icon("align-center"))
+        self.align_right_button.setIcon(self._toolbar_icon("align-right"))
+        for button, tooltip in (
+            (self.align_left_button, "Align paragraph left"),
+            (self.align_center_button, "Center paragraph"),
+            (self.align_right_button, "Align paragraph right"),
+        ):
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+        self._alignment_group = QButtonGroup(self)
+        self._alignment_group.setExclusive(True)
+        self._alignment_group.addButton(self.align_left_button)
+        self._alignment_group.addButton(self.align_center_button)
+        self._alignment_group.addButton(self.align_right_button)
+        self.align_left_button.setChecked(True)
+        self.bullet_list_button = QPushButton()
+        self.bullet_list_button.setIcon(self._toolbar_icon("bullets"))
+        self.bullet_list_button.setToolTip("Create a bulleted list")
+        self.numbered_list_button = QPushButton()
+        self.numbered_list_button.setIcon(self._toolbar_icon("numbered"))
+        self.numbered_list_button.setToolTip("Create a numbered list")
+        self.image_button = QPushButton()
+        self.image_button.setIcon(self._toolbar_icon("image"))
+        self.image_button.setToolTip("Embed an image at the cursor")
+        self.variable_combo = QComboBox()
+        self.variable_combo.addItems(
+            [
+                "{{first_name}}",
+                "{{last_name}}",
+                "{{name}}",
+                "{{email}}",
+                "{{subject}}",
+                "$custom1",
+                "$custom2",
+            ]
+        )
+        self.variable_combo.setEditable(True)
+        self.variable_combo.setToolTip("Choose or type a variable token")
+        self.variable_combo.setMaximumWidth(_scaled_int(170, self._scale))
+        self.insert_variable_button = QPushButton()
+        self.insert_variable_button.setIcon(self._toolbar_icon("variable"))
+        self.insert_variable_button.setToolTip("Insert the selected variable at the cursor")
+
+        icon_buttons = (
+            self.bold_button,
+            self.italic_button,
+            self.underline_button,
+            self.color_button,
+            self.align_left_button,
+            self.align_center_button,
+            self.align_right_button,
+            self.bullet_list_button,
+            self.numbered_list_button,
+            self.image_button,
+            self.insert_variable_button,
+        )
+        for button in icon_buttons:
+            button.setFixedSize(_scaled_int(42, self._scale), _scaled_int(38, self._scale))
+            button.setIconSize(QSize(_scaled_int(21, self._scale), _scaled_int(21, self._scale)))
+
+        toolbar.addWidget(self.font_combo)
+        toolbar.addWidget(self.font_size_combo)
+        toolbar.addWidget(self.bold_button)
+        toolbar.addWidget(self.italic_button)
+        toolbar.addWidget(self.underline_button)
+        toolbar.addWidget(self.color_button)
+        toolbar.addWidget(self.align_left_button)
+        toolbar.addWidget(self.align_center_button)
+        toolbar.addWidget(self.align_right_button)
+        toolbar.addWidget(self.bullet_list_button)
+        toolbar.addWidget(self.numbered_list_button)
+        toolbar.addStretch()
+        rich_layout.addLayout(toolbar)
+
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(_scaled_int(5, self._scale))
+        self.undo_button = QPushButton()
+        self.redo_button = QPushButton()
+        self.clear_format_button = QPushButton()
+        self.undo_button.setIcon(self._toolbar_icon("undo"))
+        self.redo_button.setIcon(self._toolbar_icon("redo"))
+        self.clear_format_button.setIcon(self._toolbar_icon("clear"))
+        self.undo_button.setToolTip("Undo the last edit")
+        self.redo_button.setToolTip("Redo the last edit")
+        self.clear_format_button.setToolTip("Remove formatting from the selected text")
+        self.undo_button.setEnabled(False)
+        self.redo_button.setEnabled(False)
+        for button in (self.undo_button, self.redo_button, self.clear_format_button):
+            button.setFixedSize(_scaled_int(42, self._scale), _scaled_int(38, self._scale))
+            button.setIconSize(QSize(_scaled_int(21, self._scale), _scaled_int(21, self._scale)))
+        tools_row.addWidget(self.undo_button)
+        tools_row.addWidget(self.redo_button)
+        tools_row.addWidget(self.clear_format_button)
+        tools_row.addWidget(self.image_button)
+        tools_row.addStretch()
+        tools_row.addWidget(self.variable_combo)
+        tools_row.addWidget(self.insert_variable_button)
+        rich_layout.addLayout(tools_row)
+
+        self.rich_editor = QTextEdit()
+        self.rich_editor.setObjectName("bodyEditor")
+        self.rich_editor.setAcceptRichText(True)
+        self.rich_editor.setPlaceholderText("Write and format attachment content here...")
+        self.rich_editor.setToolTip("Rich text attachment editor")
+        self.rich_editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        rich_layout.addWidget(self.rich_editor, 1)
+        self.stack.addWidget(rich_page)
+        layout.addWidget(self.stack, 1)
 
         self.title_input.textChanged.connect(lambda _text: self.titleChanged.emit(self.title_text()))
         self.title_input.textChanged.connect(self.contentChanged.emit)
         self.html_editor.textChanged.connect(self.contentChanged.emit)
         self.html_editor.textChanged.connect(self._sync_preview_button_state)
+        self.rich_editor.textChanged.connect(self.contentChanged.emit)
+        self.rich_editor.textChanged.connect(self._sync_preview_button_state)
+        self.font_combo.currentFontChanged.connect(self._set_font_family)
+        self.font_size_combo.currentTextChanged.connect(self._set_font_size)
+        self.bold_button.toggled.connect(self._set_bold)
+        self.italic_button.toggled.connect(self._set_italic)
+        self.underline_button.toggled.connect(self._set_underline)
+        self.color_button.clicked.connect(self._choose_text_color)
+        self.align_left_button.clicked.connect(lambda: self._set_alignment(Qt.AlignLeft))
+        self.align_center_button.clicked.connect(lambda: self._set_alignment(Qt.AlignHCenter))
+        self.align_right_button.clicked.connect(lambda: self._set_alignment(Qt.AlignRight))
+        self.bullet_list_button.clicked.connect(lambda: self._insert_list(QTextListFormat.ListDisc))
+        self.numbered_list_button.clicked.connect(lambda: self._insert_list(QTextListFormat.ListDecimal))
+        self.undo_button.clicked.connect(self.rich_editor.undo)
+        self.redo_button.clicked.connect(self.rich_editor.redo)
+        self.clear_format_button.clicked.connect(self._clear_formatting)
+        self.rich_editor.undoAvailable.connect(self.undo_button.setEnabled)
+        self.rich_editor.redoAvailable.connect(self.redo_button.setEnabled)
+        self.rich_editor.cursorPositionChanged.connect(self._sync_alignment_controls)
+        self.image_button.clicked.connect(self._insert_image)
+        self.insert_variable_button.clicked.connect(self._insert_variable)
+        self.modeChanged.connect(lambda _mode: self._sync_preview_button_state())
         self._sync_preview_button_state()
+
+    def _toolbar_icon(self, kind: str, accent: QColor | None = None) -> QIcon:
+        size = 24
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        color = self.palette().buttonText().color()
+        painter.setPen(QPen(color, 2, Qt.SolidLine, Qt.RoundCap))
+
+        if kind.startswith("align-"):
+            lengths = (16, 12, 16, 10)
+            for row, length in enumerate(lengths):
+                if kind == "align-center":
+                    x = (size - length) // 2
+                elif kind == "align-right":
+                    x = size - 4 - length
+                else:
+                    x = 4
+                y = 6 + row * 4
+                painter.drawLine(x, y, x + length, y)
+        elif kind in {"bullets", "numbered"}:
+            painter.setFont(QFont("Sans Serif", 7, QFont.Bold))
+            for row in range(3):
+                y = 7 + row * 6
+                if kind == "bullets":
+                    painter.drawEllipse(3, y - 2, 3, 3)
+                else:
+                    painter.drawText(1, y + 2, str(row + 1))
+                painter.drawLine(9, y, 21, y)
+        elif kind == "image":
+            painter.drawRect(3, 4, 18, 16)
+            painter.drawEllipse(15, 7, 2, 2)
+            painter.drawLine(5, 18, 10, 12)
+            painter.drawLine(10, 12, 14, 16)
+            painter.drawLine(14, 16, 17, 13)
+            painter.drawLine(17, 13, 20, 17)
+        else:
+            symbols = {
+                "bold": "B",
+                "italic": "I",
+                "underline": "U̲",
+                "color": "A",
+                "undo": "↶",
+                "redo": "↷",
+                "clear": "Tx̸",
+                "variable": "{x}",
+            }
+            font = QFont("Sans Serif", 13)
+            font.setBold(kind in {"bold", "variable"})
+            font.setItalic(kind == "italic")
+            painter.setFont(font)
+            painter.drawText(pixmap.rect(), Qt.AlignCenter, symbols.get(kind, "•"))
+            if kind == "color":
+                painter.setPen(QPen(accent if accent and accent.isValid() else color, 3, Qt.SolidLine, Qt.RoundCap))
+                painter.drawLine(6, 21, 18, 21)
+
+        painter.end()
+        return QIcon(pixmap)
 
     def title_text(self) -> str:
         return self.title_input.text().strip()
 
-    def set_content(self, title: str, html_text: str, *, local_only: bool = False) -> None:
+    def mode_text(self) -> str:
+        return "Text Editor" if self.text_button.isChecked() else "HTML Code"
+
+    def set_mode(self, mode: str) -> None:
+        normalized = "Text Editor" if mode == "Text Editor" else "HTML Code"
+        self.html_button.setChecked(normalized == "HTML Code")
+        self.text_button.setChecked(normalized == "Text Editor")
+        self.stack.setCurrentIndex(1 if normalized == "Text Editor" else 0)
+        self.modeChanged.emit(normalized)
+        self.contentChanged.emit()
+        self._sync_preview_button_state()
+
+    def set_content(
+        self,
+        title: str,
+        html_text: str,
+        *,
+        mode: str = "HTML Code",
+        rich_html: str = "",
+        local_only: bool = False,
+    ) -> None:
         self.blockSignals(True)
         self.title_input.blockSignals(True)
         self.html_editor.blockSignals(True)
+        self.rich_editor.blockSignals(True)
         try:
             self.local_only = local_only
             self.title_input.setText(title)
             self.html_editor.setPlainText(html_text)
+            self.rich_editor.setHtml(rich_html) if rich_html.strip() else self.rich_editor.clear()
+            self.set_mode(mode)
             self._sync_preview_button_state()
         finally:
             self.title_input.blockSignals(False)
             self.html_editor.blockSignals(False)
+            self.rich_editor.blockSignals(False)
             self.blockSignals(False)
 
     def payload(self) -> dict[str, str]:
         return {
             "title": self.title_text(),
+            "mode": self.mode_text(),
             "html_text": self.html_editor.toPlainText(),
+            "rich_html": self.rich_editor.toHtml() if self._rich_has_content() else "",
         }
 
+    def content_html(self) -> str:
+        if self.mode_text() == "Text Editor":
+            return self.rich_editor.toHtml() if self._rich_has_content() else ""
+        return self.html_editor.toPlainText()
+
+    def has_content(self) -> bool:
+        return bool(self.content_html().strip())
+
+    def _rich_has_content(self) -> bool:
+        if self.rich_editor.toPlainText().strip():
+            return True
+        return "<img" in self.rich_editor.toHtml().lower()
+
+    def _merge_char_format(self, char_format: QTextCharFormat) -> None:
+        cursor = self.rich_editor.textCursor()
+        cursor.mergeCharFormat(char_format)
+        self.rich_editor.mergeCurrentCharFormat(char_format)
+        self.rich_editor.setFocus()
+
+    def _set_font_family(self, font: QFont) -> None:
+        char_format = QTextCharFormat()
+        char_format.setFontFamily(font.family())
+        self._merge_char_format(char_format)
+
+    def _set_font_size(self, value: str) -> None:
+        try:
+            size = float(value)
+        except (TypeError, ValueError):
+            return
+        if size <= 0:
+            return
+        char_format = QTextCharFormat()
+        char_format.setFontPointSize(size)
+        self._merge_char_format(char_format)
+
+    def _set_bold(self, enabled: bool) -> None:
+        char_format = QTextCharFormat()
+        char_format.setFontWeight(QFont.Bold if enabled else QFont.Normal)
+        self._merge_char_format(char_format)
+
+    def _set_italic(self, enabled: bool) -> None:
+        char_format = QTextCharFormat()
+        char_format.setFontItalic(enabled)
+        self._merge_char_format(char_format)
+
+    def _set_underline(self, enabled: bool) -> None:
+        char_format = QTextCharFormat()
+        char_format.setFontUnderline(enabled)
+        self._merge_char_format(char_format)
+
+    def _choose_text_color(self) -> None:
+        color = QColorDialog.getColor(self.rich_editor.textColor(), self, "Choose text color")
+        if not color.isValid():
+            return
+        char_format = QTextCharFormat()
+        char_format.setForeground(color)
+        self._merge_char_format(char_format)
+        self.color_button.setIcon(self._toolbar_icon("color", color))
+
+    def _set_alignment(self, alignment: Qt.AlignmentFlag) -> None:
+        self.rich_editor.setAlignment(alignment)
+        self._sync_alignment_controls()
+        self.rich_editor.setFocus()
+
+    def _sync_alignment_controls(self) -> None:
+        alignment = self.rich_editor.alignment()
+        self.align_center_button.setChecked(bool(alignment & Qt.AlignHCenter))
+        self.align_right_button.setChecked(bool(alignment & Qt.AlignRight))
+        if not self.align_center_button.isChecked() and not self.align_right_button.isChecked():
+            self.align_left_button.setChecked(True)
+
+    def _insert_list(self, style: QTextListFormat.Style) -> None:
+        cursor = self.rich_editor.textCursor()
+        list_format = QTextListFormat()
+        list_format.setStyle(style)
+        cursor.createList(list_format)
+        self.rich_editor.setTextCursor(cursor)
+        self.rich_editor.setFocus()
+
+    def _clear_formatting(self) -> None:
+        cursor = self.rich_editor.textCursor()
+        char_format = QTextCharFormat()
+        if cursor.hasSelection():
+            cursor.setCharFormat(char_format)
+        else:
+            self.rich_editor.setCurrentCharFormat(char_format)
+        self.rich_editor.setTextCursor(cursor)
+        self.rich_editor.setFocus()
+
+    def _insert_image(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;All files (*)",
+        )
+        if not file_path:
+            return
+        self._insert_image_file(Path(file_path))
+
+    def _insert_image_file(self, path: Path) -> bool:
+        try:
+            if not path.is_file():
+                raise ValueError("The selected image does not exist.")
+            if path.stat().st_size > 50 * 1024 * 1024:
+                raise ValueError("Please choose an image smaller than 50 MB.")
+
+            from PIL import Image, ImageOps
+
+            with Image.open(path) as source_image:
+                image = ImageOps.exif_transpose(source_image)
+                resampling = getattr(Image, "Resampling", Image)
+                image.thumbnail((1600, 1600), resampling.LANCZOS)
+                width, height = image.size
+                output = BytesIO()
+                has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
+                if has_alpha:
+                    image.convert("RGBA").save(output, format="PNG", optimize=True)
+                    mime_type = "image/png"
+                else:
+                    image.convert("RGB").save(output, format="JPEG", quality=88, optimize=True)
+                    mime_type = "image/jpeg"
+            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        except Exception as exc:
+            QMessageBox.warning(self, "Unable to upload image", str(exc))
+            return False
+
+        image_html = (
+            f'<img src="data:{mime_type};base64,{encoded}" '
+            f'alt="{html.escape(path.stem)}" width="{width}" height="{height}" '
+            'style="max-width:100%; height:auto;" />'
+        )
+        self.rich_editor.textCursor().insertHtml(image_html)
+        self.rich_editor.setFocus()
+        return True
+
+    def _insert_variable(self) -> None:
+        token = self.variable_combo.currentText().strip()
+        if not token:
+            return
+        self.rich_editor.textCursor().insertText(token)
+        self.rich_editor.setFocus()
+
     def _sync_preview_button_state(self) -> None:
-        self.preview_button.setVisible(bool(self.html_editor.toPlainText().strip()))
+        self.preview_button.setVisible(self.has_content())
 
 class SubjectDraftsDialog(QDialog):
     def __init__(
@@ -3507,7 +3931,7 @@ class DashboardPage(QWidget):
         self.ai_status_label = QLabel("Not connected")
         self.ai_model_combo = QComboBox()
         self.delay_fixed_radio = QRadioButton("Fixed")
-        self.delay_random_radio = QRadioButton("Random range")
+        self.delay_random_radio = QRadioButton("Auto (system-oriented)")
         self.delay_human_radio = QRadioButton("Human-like pattern")
         self.send_seq_radio = QRadioButton("Sequential")
         self.send_rand_radio = QRadioButton("Random shuffle")
@@ -3933,13 +4357,13 @@ class DashboardPage(QWidget):
         content_label.setObjectName("sectionTitle")
         content_header.addWidget(content_label)
         content_header.addStretch()
-        content_hint = QLabel("Upload HTML or paste HTML code, then choose an output format before sending.")
+        content_hint = QLabel("Use HTML Code or the rich Text Editor, then choose an output format before sending.")
         content_hint.setObjectName("sectionHint")
         content_hint.setWordWrap(True)
         content_layout.addWidget(content_hint)
         self.attach_add_button.setObjectName("secondaryButton")
         self.attach_add_button.setFixedWidth(_scaled_int(34, self._scale))
-        self.attach_add_button.setToolTip("Add a new HTML attachment tab")
+        self.attach_add_button.setToolTip("Add a new attachment content tab")
         self.attach_add_button.clicked.connect(self._new_attachment_draft_tab)
         self._apply_button_icon(self.attach_add_button, QStyle.SP_FileDialogNewFolder)
         self.attach_upload_button.setObjectName("secondaryButton")
@@ -3964,7 +4388,7 @@ class DashboardPage(QWidget):
         self.attach_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         content_layout.addWidget(self.attach_tabs, 1)
 
-        export_card, export_layout = self._card("ATTACHMENT FORMAT OPTIONS", "Choose the attachment file format and preview behavior for the active HTML content.")
+        export_card, export_layout = self._card("ATTACHMENT FORMAT OPTIONS", "Choose the file format and conversion behavior for the active attachment content.")
         export_form = QFormLayout()
         export_form.setLabelAlignment(Qt.AlignLeft)
 
@@ -4025,11 +4449,11 @@ class DashboardPage(QWidget):
         self.delay_from.setDecimals(1)
         self.delay_from.setRange(0.0, 60.0)
         self.delay_from.setSingleStep(0.1)
-        self.delay_from.setValue(0.5)
+        self.delay_from.setValue(0.2)
         self.delay_to.setDecimals(1)
         self.delay_to.setRange(0.0, 60.0)
         self.delay_to.setSingleStep(0.1)
-        self.delay_to.setValue(1.0)
+        self.delay_to.setValue(0.5)
         self.retry_count.setRange(0, 20)
         self.retry_count.setValue(3)
         self.delay_from.setToolTip("Minimum delay between emails")
@@ -4050,7 +4474,7 @@ class DashboardPage(QWidget):
 
         delay_type_row = QHBoxLayout()
         self.delay_fixed_radio.setToolTip("Use the same delay for every send")
-        self.delay_random_radio.setToolTip("Use a random delay within the range")
+        self.delay_random_radio.setToolTip("Automatically choose a random delay within the configured range for every email")
         self.delay_human_radio.setToolTip("Use a human-like delay pattern")
         self.delay_type_group = QButtonGroup(self)
         self.delay_type_group.setExclusive(True)
@@ -4199,7 +4623,7 @@ class DashboardPage(QWidget):
         self.ai_model_combo.blockSignals(False)
 
     def _current_sending_settings_payload(self) -> dict[str, object]:
-        delay_type = "Random range"
+        delay_type = "Auto (system-oriented)"
         if self.delay_fixed_radio.isChecked():
             delay_type = "Fixed"
         elif self.delay_human_radio.isChecked():
@@ -4263,11 +4687,13 @@ class DashboardPage(QWidget):
                 widget.blockSignals(False)
 
         sender_limit = _as_int(payload.get("sender_limit"), 300)
-        delay_from = _as_float(payload.get("delay_from"), 0.5)
-        delay_to = _as_float(payload.get("delay_to"), 1.0)
+        delay_from = _as_float(payload.get("delay_from"), 0.2)
+        delay_to = _as_float(payload.get("delay_to"), 0.5)
         retry_count = _as_int(payload.get("retry_count"), 3)
         retry_enabled = _as_bool(payload.get("retry_enabled"), True)
-        delay_type = str(payload.get("delay_type") or "Random range")
+        delay_type = str(payload.get("delay_type") or "Auto (system-oriented)")
+        if delay_type == "Random range":
+            delay_type = "Auto (system-oriented)"
         email_send_order = str(payload.get("email_send_order") or "Sequential")
         window_send_mode = str(payload.get("window_send_mode") or "Parallel")
         ai_provider = str(payload.get("ai_provider") or "ChatGPT")
@@ -4284,7 +4710,7 @@ class DashboardPage(QWidget):
         _block(self.retry_enable_checkbox, lambda: self.retry_enable_checkbox.setChecked(retry_enabled))
 
         _block(self.delay_fixed_radio, lambda: self.delay_fixed_radio.setChecked(delay_type == "Fixed"))
-        _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Random range"))
+        _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Auto (system-oriented)"))
         _block(self.delay_human_radio, lambda: self.delay_human_radio.setChecked(delay_type == "Human-like pattern"))
         if not any((self.delay_fixed_radio.isChecked(), self.delay_random_radio.isChecked(), self.delay_human_radio.isChecked())):
             self.delay_random_radio.setChecked(True)
@@ -5753,7 +6179,7 @@ class DashboardPage(QWidget):
         current_widget = self._current_attachment_widget()
         html_content = ""
         if current_widget is not None:
-            html_content = self._apply_tags_to_text(current_widget.html_editor.toPlainText().strip())
+            html_content = self._apply_tags_to_text(current_widget.content_html().strip())
         elif hasattr(self, "html_editor") and isinstance(self.html_editor, QTextEdit):
             html_content = self._apply_tags_to_text(self.html_editor.toPlainText().strip())
         if not html_content:
@@ -6220,7 +6646,7 @@ class DashboardPage(QWidget):
             body_text = str(payload.get("plain_text") or "").strip()
             body_html = str(payload.get("html_text") or "").strip()
         attachment_widget = self._current_attachment_widget()
-        attachment_html = attachment_widget.html_editor.toPlainText().strip() if attachment_widget is not None else ""
+        attachment_html = attachment_widget.content_html().strip() if attachment_widget is not None else ""
         return {
             "recipients": recipients,
             "subject": subject,
@@ -6462,9 +6888,9 @@ class DashboardPage(QWidget):
             self._campaign_cancel_event,
             self._send_compose_with_playwright,
             window_label=str(job["window_label"]),
-            delay_mode=getattr(self.state, "delay_type", "Random range"),
-            delay_from=float(getattr(self.state, "delay_from", 0.5)),
-            delay_to=float(getattr(self.state, "delay_to", 1.0)),
+            delay_mode=getattr(self.state, "delay_type", "Auto (system-oriented)"),
+            delay_from=float(getattr(self.state, "delay_from", 0.2)),
+            delay_to=float(getattr(self.state, "delay_to", 0.5)),
             retry_count=int(getattr(self.state, "retry_count", 3)),
             retry_enabled=bool(getattr(self.state, "retry_enabled", True)),
             convert_enabled=bool(self.attach_convert_checkbox.isChecked()),
@@ -6827,7 +7253,10 @@ class DashboardPage(QWidget):
                 context.route(
                     "**/*",
                     lambda route: route.abort()
-                    if route.request.resource_type in {"image", "media", "font", "stylesheet", "xhr", "fetch", "script"}
+                    if (
+                        route.request.resource_type in {"image", "media", "font", "stylesheet", "xhr", "fetch", "script"}
+                        and not route.request.url.startswith("data:")
+                    )
                     else route.continue_(),
                 )
                 page = context.new_page()
@@ -7599,7 +8028,7 @@ class DashboardPage(QWidget):
     def _update_attachment_tab_controls(self) -> None:
         limit_reached = self.attach_tabs.count() >= MAX_ATTACHMENT_TABS
         self.attach_add_button.setEnabled(not limit_reached)
-        self.attach_add_button.setToolTip("Maximum of 50 content tabs reached" if limit_reached else "Add a new HTML content tab")
+        self.attach_add_button.setToolTip("Maximum of 50 content tabs reached" if limit_reached else "Add a new attachment content tab")
 
     def _set_subject_item_data(
         self,
@@ -7923,12 +8352,13 @@ class DashboardPage(QWidget):
         self._active_attachment_widget = widget
         if widget is not None:
             self.html_editor = widget.html_editor
-            self.state.html_template_text = widget.html_editor.toPlainText()
+            self.state.html_template_text = widget.content_html()
         self._update_attachment_tab_controls()
 
     def _attachment_tab_label(self, widget: AttachmentDraftEditor, index: int) -> str:
         title = widget.title_text() or f"Content {index + 1}"
-        return f"{title} [HTML]"
+        mode_label = "Text" if widget.mode_text() == "Text Editor" else "HTML"
+        return f"{title} [{mode_label}]"
 
     def _refresh_attachment_tab_labels(self) -> None:
         for index in range(self.attach_tabs.count()):
@@ -7972,13 +8402,17 @@ class DashboardPage(QWidget):
         if record:
             title = self._attachment_record_title(record, self.attach_tabs.count())
             html_text = str(record.get("html_text") or record.get("body_html") or record.get("body_text") or "")
-            widget.set_content(title, html_text, local_only=True)
+            mode = str(record.get("mode") or "HTML Code")
+            rich_html = str(record.get("rich_html") or "")
+            widget.set_content(title, html_text, mode=mode, rich_html=rich_html, local_only=True)
         else:
             title = self._next_attachment_title()
             widget.set_content(title, "")
 
         widget.titleChanged.connect(lambda title_text, w=widget: self._rename_attachment_tab(w, title_text))
         widget.titleChanged.connect(lambda _title, self=self: self._persist_attachment_state())
+        widget.modeChanged.connect(lambda _mode, w=widget: self._rename_attachment_tab(w, w.title_text()))
+        widget.modeChanged.connect(lambda _mode, self=self: self._persist_attachment_state())
         widget.contentChanged.connect(self._persist_attachment_state)
         widget.previewRequested.connect(lambda w=widget: self._preview_attachment_editor_html(w))
         return widget
@@ -8080,7 +8514,7 @@ class DashboardPage(QWidget):
 
         if self.attach_tabs.count() == 1:
             placeholder = self._current_attachment_widget()
-            if placeholder is not None and not placeholder.html_editor.toPlainText().strip():
+            if placeholder is not None and not placeholder.has_content():
                 self.attach_tabs.removeTab(0)
 
         imported = 0
@@ -8176,7 +8610,9 @@ class DashboardPage(QWidget):
                 tabs_payload.append(
                     {
                         "title": title[:64] or "Content",
+                        "mode": payload["mode"],
                         "html_text": html_text,
+                        "rich_html": payload["rich_html"],
                         "kind": "attachment",
                     }
                 )
@@ -8184,7 +8620,7 @@ class DashboardPage(QWidget):
                 self.attach_tabs.setTabText(index, self._attachment_tab_label(widget, index))
             active_widget = self._current_attachment_widget()
             if active_widget is not None:
-                self.state.html_template_text = active_widget.html_editor.toPlainText()
+                self.state.html_template_text = active_widget.content_html()
             _delete_local_drafts("attachment")
             _upsert_attachment_state(
                 {
@@ -8205,12 +8641,12 @@ class DashboardPage(QWidget):
         if widget is None:
             self.notify("No attachment content available")
             return
-        html_content = widget.html_editor.toPlainText().strip()
+        html_content = widget.content_html().strip()
         if not html_content:
-            self.notify("Add HTML content first")
+            self.notify("Add attachment content first")
             return
-        title = widget.title_text() or "HTML Content Preview"
-        dialog = self._build_preview_dialog(title, html_content, "Previewing the selected HTML attachment content.")
+        title = widget.title_text() or "Attachment Content Preview"
+        dialog = self._build_preview_dialog(title, html_content, "Previewing the selected attachment content.")
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -8556,7 +8992,7 @@ class DashboardPage(QWidget):
         plain_body = str(body_payload["plain_text"])
         html_body = str(body_payload["html_text"])
         body_title = str(body_payload["title"] or "Body")
-        attachment_html = current_attachment.html_editor.toPlainText() if current_attachment is not None else ""
+        attachment_html = current_attachment.content_html() if current_attachment is not None else ""
 
         self.state.subject_text = subject
         self.state.plain_body_text = plain_body
@@ -9052,10 +9488,10 @@ class DashboardPage(QWidget):
         self.sender_limit.setValue(int(getattr(self.state, "sender_limit", 300)))
         self.sender_limit.blockSignals(False)
         self.delay_from.blockSignals(True)
-        self.delay_from.setValue(float(getattr(self.state, "delay_from", 0.5)))
+        self.delay_from.setValue(float(getattr(self.state, "delay_from", 0.2)))
         self.delay_from.blockSignals(False)
         self.delay_to.blockSignals(True)
-        self.delay_to.setValue(float(getattr(self.state, "delay_to", 1.0)))
+        self.delay_to.setValue(float(getattr(self.state, "delay_to", 0.5)))
         self.delay_to.blockSignals(False)
         self.retry_count.blockSignals(True)
         self.retry_count.setValue(int(getattr(self.state, "retry_count", 3)))
@@ -9066,7 +9502,7 @@ class DashboardPage(QWidget):
         self.delay_fixed_radio.blockSignals(True)
         self.delay_random_radio.blockSignals(True)
         self.delay_human_radio.blockSignals(True)
-        delay_type = getattr(self.state, "delay_type", "Random range")
+        delay_type = getattr(self.state, "delay_type", "Auto (system-oriented)")
         self.delay_fixed_radio.setChecked(delay_type == "Fixed")
         self.delay_random_radio.setChecked(delay_type != "Fixed" and delay_type != "Human-like pattern")
         self.delay_human_radio.setChecked(delay_type == "Human-like pattern")

@@ -60,6 +60,7 @@ pyinstaller \
   --collect-all charset_normalizer \
   --hidden-import PIL.Image \
   --hidden-import greenlet._greenlet \
+  --hidden-import eval_type_backport \
   --exclude-module playwright \
   "$ROOT_DIR/main.py"
 

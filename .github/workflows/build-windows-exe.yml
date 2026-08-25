@@ -17,19 +17,33 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Build EXE
+      - name: Build Windows EXE with all requirements
         shell: cmd
         env:
           EZYM_MAILER_API_BASE_URL: http://15.206.161.73:8765
           EZYM_MAILER_BOOTSTRAP_API: "0"
         run: build.bat
 
+      - name: Validate EXE and create checksum
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\EazyMailer.exe")) {
+            throw "dist\EazyMailer.exe was not generated"
+          }
+          $hash = (Get-FileHash "dist\EazyMailer.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  EazyMailer.exe" | Set-Content -Encoding ascii "dist\EazyMailer.exe.sha256"
+          Get-Item "dist\EazyMailer.exe" | Format-List Name, Length, LastWriteTime
+          Get-Content "dist\EazyMailer.exe.sha256"
+
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EzyMailer-Windows-EXE
+          name: EzyMailer-Windows-x64
           path: |
             dist\EazyMailer.exe
-            dist\playwright-browsers\**
+            dist\EazyMailer.exe.sha256
           if-no-files-found: error
+          retention-days: 30
