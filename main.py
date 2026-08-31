@@ -144,6 +144,24 @@ DEPENDENCY_RELEASE_BASE = (
     f"{DEPENDENCY_RELEASE_TAG}"
 )
 
+# Launching every browser window at once makes all Gmail tabs run their
+# heavy first-load (JS parse, sign-in, inbox render, background sync) on the
+# same cores simultaneously, which pins low-core machines at 100% CPU for
+# minutes. Space the window launches out so each one settles before the
+# next starts. Steady-state load is unchanged; the start-up spike is not.
+BROWSER_LAUNCH_STAGGER_MS = 4000
+# Extra Chrome flags that cut per-window CPU and memory without affecting
+# campaign sending (sending uses DOM selectors on the compose box, not
+# rendered images or extensions).
+BROWSER_RESOURCE_FLAGS = (
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-component-update",
+    "--disable-breakpad",
+    "--blink-settings=imagesEnabled=false",
+    "--js-flags=--max-old-space-size=512",
+)
+
 
 def _runtime_root() -> Path:
     if getattr(sys, "frozen", False):
@@ -6693,6 +6711,7 @@ class DashboardPage(QWidget):
                 "--remote-allow-origins=*",
             ]
         )
+        args.extend(BROWSER_RESOURCE_FLAGS)
         if incognito:
             args.append(_browser_private_flag(browser_name))
         x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
@@ -6807,6 +6826,8 @@ class DashboardPage(QWidget):
         self.active_windows_value.setText(str(self.state.window_count))
 
     def _terminate_browser_sessions(self, log_reason: str | None = None) -> None:
+        # Invalidate any staggered window launch still queued for a later tick.
+        self._launch_generation = getattr(self, "_launch_generation", 0) + 1
         for session in self._browser_sessions:
             process = session.process
             if process is not None and process.poll() is None:
@@ -9553,40 +9574,62 @@ class DashboardPage(QWidget):
         self.window().hide_launch_loader()
         if target <= 0:
             return
-        launched: list[BrowserSessionHandle] = []
+        # Bump the launch generation so any window step still queued from a
+        # previous launch (they are spaced out with QTimer) aborts instead of
+        # appending a stray window to this run.
+        self._launch_generation = getattr(self, "_launch_generation", 0) + 1
+        self._browser_sessions = []
+        self._sync_session_state_from_handles()
+        self._refresh_sessions()
+        self._browser_watch_timer.start()
+        self._launch_window_step(1, target, self._launch_generation)
+
+    def _launch_window_step(self, index: int, target: int, generation: int) -> None:
+        if generation != getattr(self, "_launch_generation", 0):
+            return
         try:
-            for index in range(1, target + 1):
-                launched.append(self._launch_browser_process(index))
+            session = self._launch_browser_process(index)
         except Exception as exc:
             self._terminate_browser_sessions()
             self._log_action(f"Browser launch failed: {exc}")
             self.notify("Unable to launch browser")
             return
-
-        self._browser_sessions = launched
+        self._browser_sessions.append(session)
         self._sync_session_state_from_handles()
         self._refresh_sessions()
-        self._browser_watch_timer.start()
-        for session in self._browser_sessions:
-            try:
-                _upsert_local_browser_session(
-                    self.state.username,
-                    session.session_id,
-                    session.title,
-                    session.browser_name,
-                    session.mode,
-                    session.status,
-                    session.process.pid if session.process is not None else None,
-                    self.state.launch_preset or "Default",
-                    {
-                        "browser_mode": self.state.browser_mode,
-                        "profile_dir": str(session.profile_dir) if session.profile_dir else "",
-                        "tab_count": session.tab_count,
-                    },
-                )
-            except Exception:
-                pass
-        total_tabs = sum(session.tab_count for session in launched)
+        try:
+            _upsert_local_browser_session(
+                self.state.username,
+                session.session_id,
+                session.title,
+                session.browser_name,
+                session.mode,
+                session.status,
+                session.process.pid if session.process is not None else None,
+                self.state.launch_preset or "Default",
+                {
+                    "browser_mode": self.state.browser_mode,
+                    "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                    "tab_count": session.tab_count,
+                },
+            )
+        except Exception:
+            pass
+
+        if index < target:
+            wait_s = BROWSER_LAUNCH_STAGGER_MS // 1000
+            self._log_action(
+                f"Opened browser window {index}/{target}; next window in {wait_s}s "
+                f"(staggered to keep CPU steady)"
+            )
+            QTimer.singleShot(
+                BROWSER_LAUNCH_STAGGER_MS,
+                lambda nxt=index + 1, t=target, g=generation: self._launch_window_step(nxt, t, g),
+            )
+            return
+
+        launched = self._browser_sessions
+        total_tabs = sum(item.tab_count for item in launched)
         self._log_action(f"Started {len(launched)} browser window(s) with {total_tabs} Gmail tab(s)")
         self.notify(f"Launch started for {len(launched)} window(s) and {total_tabs} tab(s)")
         self.window().launch_loader.set_message(
