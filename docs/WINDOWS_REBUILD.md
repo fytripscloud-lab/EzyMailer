@@ -18,7 +18,8 @@ Use this when working from the Windows machine.
 
 - The Windows EXE uses the live backend API at `http://15.206.161.73:8765/`.
 - The Windows EXE uses the dedicated AWS database through the live backend.
-- On first launch, the app downloads the browser runtime into the local cache if Chromium is missing.
+- The build downloads the matching Playwright Chromium runtime and embeds it in the one-file EXE.
+- At runtime, EzyMailer prefers its embedded Chromium and does not require Google Chrome.
 
 ## Notes
 

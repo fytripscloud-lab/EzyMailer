@@ -17,6 +17,7 @@ import shutil
 import ssl
 import sqlite3
 import socket
+import select
 import string
 import threading
 import uuid
@@ -27,7 +28,7 @@ from datetime import datetime
 from io import BytesIO
 import urllib.error
 import urllib.request
-from urllib.parse import quote_plus
+from urllib.parse import urlencode
 from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,8 +44,6 @@ from backend.local_api import (
     get_settings as api_get_settings,
     get_tags as api_get_tags,
     login as api_login,
-    record_sent_email_event,
-    record_activity,
     delete_content as api_delete_content,
     delete_customer_variables as api_delete_customer_variables,
     delete_tags as api_delete_tags,
@@ -68,7 +67,7 @@ from PySide6.QtCore import (
     QSize,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QKeySequence, QGuiApplication, QClipboard, QTextCharFormat, QTextFormat, QTextListFormat
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QKeySequence, QGuiApplication, QClipboard, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -153,10 +152,10 @@ def _runtime_root() -> Path:
 
 
 def _external_dependency_dir() -> Path:
-    if getattr(sys, "frozen", False) and IS_MAC:
-        root = _runtime_root().parents[2]
-    elif getattr(sys, "frozen", False):
-        root = _runtime_root()
+    if getattr(sys, "frozen", False):
+        # Installed macOS apps normally live in /Applications, which is not a
+        # writable dependency/cache location for standard users.
+        root = LOCAL_CACHE_DIR
     else:
         root = _runtime_root()
     return root / ".ezymailer" / "dependencies" / DEPENDENCY_RELEASE_TAG
@@ -212,6 +211,31 @@ def _configure_external_dll_search(root: Path) -> None:
 
 def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] | None = None) -> Path:
     """Download and extract the versioned GitHub dependency pack once."""
+    # Normal builds now bundle every library used by campaign automation.
+    # Keep the external archive only as backward compatibility for older or
+    # deliberately slim builds.
+    try:
+        from PIL import Image as _dependency_pillow_image
+        from docx import Document as _dependency_docx_document
+        from openpyxl import Workbook as _dependency_openpyxl_workbook
+        from playwright.sync_api import sync_playwright as _dependency_playwright
+        from pptx import Presentation as _dependency_pptx_presentation
+        from reportlab.pdfgen import canvas as _dependency_reportlab_canvas
+
+        _ = (
+            _dependency_pillow_image,
+            _dependency_docx_document,
+            _dependency_openpyxl_workbook,
+            _dependency_playwright,
+            _dependency_pptx_presentation,
+            _dependency_reportlab_canvas,
+        )
+        if progress:
+            progress("Dependencies already ready", "Campaign automation is available.", 100, 100)
+        return _runtime_root()
+    except ImportError:
+        pass
+
     target = _external_dependency_dir()
     marker = target / ".ready"
     target.mkdir(parents=True, exist_ok=True)
@@ -344,12 +368,27 @@ def _browser_cache_dir() -> Path:
     # Use one deterministic cache beside the portable build. Do not inspect
     # legacy or system caches; this makes first-run behavior predictable.
     if getattr(sys, "frozen", False):
-        if IS_MAC:
-            adjacent_root = _runtime_root().parents[2]
-        else:
-            adjacent_root = _runtime_root()
-        return adjacent_root / ".ezymailer" / BUILTIN_BROWSER_DIR_NAME
+        return LOCAL_CACHE_DIR / BUILTIN_BROWSER_DIR_NAME
     return _runtime_root() / ".ezymailer" / BUILTIN_BROWSER_DIR_NAME
+
+
+def _bundled_browser_dir() -> Path | None:
+    """Locate Chromium embedded by PyInstaller on macOS or Windows."""
+    if not getattr(sys, "frozen", False):
+        return None
+
+    executable_dir = Path(sys.executable).resolve().parent
+    bundle_root = Path(getattr(sys, "_MEIPASS", executable_dir)).resolve()
+    candidates = [
+        bundle_root / BUILTIN_BROWSER_DIR_NAME,
+        executable_dir / BUILTIN_BROWSER_DIR_NAME,
+        executable_dir.parent / "Resources" / BUILTIN_BROWSER_DIR_NAME,
+        executable_dir.parent / "Frameworks" / BUILTIN_BROWSER_DIR_NAME,
+    ]
+    for candidate in candidates:
+        if _cached_browser_binary(candidate) is not None:
+            return candidate
+    return None
 
 
 def _cached_browser_binary(root: Path) -> Path | None:
@@ -369,15 +408,15 @@ def _cached_browser_binary(root: Path) -> Path | None:
 
 
 def _installed_browser_binary() -> Path | None:
-    """Prefer an installed Edge or Chrome before downloading Chromium."""
+    """Return an installed fallback browser, preferring Chromium."""
     candidates: list[Path] = []
     if IS_MAC:
         for app_root in (Path("/Applications"), Path.home() / "Applications"):
             candidates.extend(
                 [
+                    app_root / "Chromium.app/Contents/MacOS/Chromium",
                     app_root / "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
                     app_root / "Google Chrome.app/Contents/MacOS/Google Chrome",
-                    app_root / "Chromium.app/Contents/MacOS/Chromium",
                 ]
             )
     elif IS_WINDOWS:
@@ -410,6 +449,8 @@ def _installed_browser_binary() -> Path | None:
 def _browser_product_name(binary: Path) -> str:
     """Return the user-facing browser name for a selected executable."""
     normalized = str(binary).lower().replace("\\", "/")
+    if "playwright-browsers" in normalized or "chromium-" in normalized or "chrome for testing" in normalized:
+        return "Chromium"
     if "microsoft edge" in normalized or normalized.endswith("/msedge.exe") or "microsoft-edge" in normalized:
         return "Microsoft Edge"
     if "google chrome" in normalized or normalized.endswith("/chrome.exe") or "google-chrome" in normalized:
@@ -451,25 +492,24 @@ class BrowserBootstrapWorker(QObject):
             )
             self._browser_cache_dir.mkdir(parents=True, exist_ok=True)
             ensure_external_dependencies(self._report)
-            installed_browser = _installed_browser_binary()
-            existing_browser = _cached_browser_binary(self._browser_cache_dir)
-            selected_browser = installed_browser or existing_browser
-            if selected_browser is not None:
-                browser_name = "installed browser" if installed_browser and not existing_browser else "browser runtime"
-                if existing_browser is not None:
-                    self._report(
+            bundled_browser_dir = _bundled_browser_dir()
+            if bundled_browser_dir is not None:
+                self._report(
                     "Browser ready",
-                    f"Using {_browser_product_name(selected_browser)} for browser sessions.",
+                    "Using Chromium included with EzyMailer.",
                     100,
                     100,
                 )
-                else:
-                    self._report(
-                        "Browser ready",
-                        f"Using the detected {browser_name}.",
-                        100,
-                        100,
-                    )
+                self._finish(True, "Bundled Chromium runtime ready.")
+                return
+            existing_browser = _cached_browser_binary(self._browser_cache_dir)
+            if existing_browser is not None:
+                self._report(
+                    "Browser ready",
+                    "Using the app-managed Chromium runtime for browser sessions.",
+                    100,
+                    100,
+                )
                 self._finish(True, "Browser runtime already configured.")
                 return
 
@@ -539,6 +579,8 @@ class BrowserBootstrapWorker(QObject):
 
             if process.returncode != 0:
                 raise RuntimeError("Playwright could not download Chromium.")
+            if _cached_browser_binary(self._browser_cache_dir) is None:
+                raise RuntimeError("The Chromium download completed without a usable browser executable.")
             self._report(
                 "The app is building",
                 "Automatically configuring the downloaded files.",
@@ -1251,6 +1293,7 @@ class AppState:
     auth_token: str = ""
     browser_mode: str = "Incognito"
     window_count: int = 1
+    tab_count: int = 1
     launch_preset: str = "Default"
     active_sessions: list[str] = field(default_factory=list)
     activity_log: list[str] = field(default_factory=list)
@@ -1273,10 +1316,51 @@ class AppState:
     delay_to: float = 0.5
     retry_count: int = 3
     retry_enabled: bool = True
+    automatic_no_delay: bool = True
     delay_type: str = "Auto (system-oriented)"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
     ai_available_models: list[str] = field(default_factory=list)
+
+
+class FairThreadLock:
+    """A FIFO context-manager lock used for browser CDP handshakes.
+
+    A regular threading.Lock does not guarantee waiter order. In no-delay
+    campaigns, fast lanes can therefore reconnect repeatedly while a later
+    tab never gets its first connection. Ticket ordering guarantees that each
+    queued tab receives the browser handshake in arrival order.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+        self._held = False
+
+    def acquire(self) -> bool:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            while ticket != self._serving_ticket or self._held:
+                self._condition.wait()
+            self._held = True
+        return True
+
+    def release(self) -> None:
+        with self._condition:
+            if not self._held:
+                raise RuntimeError("Cannot release an unlocked FairThreadLock")
+            self._held = False
+            self._serving_ticket += 1
+            self._condition.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.release()
 
 
 @dataclass
@@ -1288,13 +1372,32 @@ class BrowserSessionHandle:
     process: subprocess.Popen[str] | None = None
     status: str = "Starting"
     profile_dir: Path | None = None
+    profile_is_temporary: bool = True
     debug_port: int | None = None
+    tab_count: int = 1
     send_completed: int = 0
     send_total: int = 0
+    health_check_failures: int = 0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
+
+
+@dataclass
+class BrowserTabHandle:
+    """One independently controlled Gmail tab inside a browser window."""
+
+    session_id: str
+    window_session_id: str
+    title: str
+    mode: str
+    browser_name: str
+    debug_port: int
+    tab_index: int
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
 
 
 class AIValidationWorker(QObject):
@@ -1380,6 +1483,10 @@ class AIValidationWorker(QObject):
         return unique_models
 
 
+class CampaignBrowserClosedError(RuntimeError):
+    """Raised when a campaign's browser window is no longer available."""
+
+
 class CampaignSendWorker(QObject):
     log = Signal(str)
     email_sent = Signal(str, str)
@@ -1388,12 +1495,15 @@ class CampaignSendWorker(QObject):
 
     def __init__(
         self,
-        session: BrowserSessionHandle,
-        tasks: list[dict[str, str]],
+        session: BrowserSessionHandle | BrowserTabHandle,
+        tasks: list[dict[str, str]] | None,
         pause_event: threading.Event,
         cancel_event: threading.Event,
         send_callback: Callable[..., None],
         *,
+        recipient_queue_path: Path | None = None,
+        task_factory: Callable[[str], dict[str, str]] | None = None,
+        task_total: int | None = None,
         window_label: str,
         delay_mode: str,
         delay_from: float,
@@ -1404,10 +1514,15 @@ class CampaignSendWorker(QObject):
         attachment_formats: list[str],
         file_name_mode: str,
         window_send_mode: str,
+        automatic_no_delay: bool = True,
+        cleanup_callback: Callable[[BrowserSessionHandle | BrowserTabHandle], None] | None = None,
     ):
         super().__init__()
         self.session = session
-        self.tasks = tasks
+        self.tasks = list(tasks or [])
+        self.recipient_queue_path = recipient_queue_path
+        self.task_factory = task_factory
+        self.task_total = max(0, int(task_total if task_total is not None else len(self.tasks)))
         self.pause_event = pause_event
         self.cancel_event = cancel_event
         self.send_callback = send_callback
@@ -1417,10 +1532,12 @@ class CampaignSendWorker(QObject):
         self.delay_to = max(self.delay_from, float(delay_to))
         self.retry_count = max(0, int(retry_count))
         self.retry_enabled = bool(retry_enabled)
+        self.automatic_no_delay = bool(automatic_no_delay)
         self.convert_enabled = bool(convert_enabled)
         self.attachment_formats = list(attachment_formats)
         self.file_name_mode = file_name_mode
         self.window_send_mode = window_send_mode
+        self.cleanup_callback = cleanup_callback
 
     def _timestamp(self) -> str:
         return QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -1450,73 +1567,128 @@ class CampaignSendWorker(QObject):
             return max(self.delay_from, min(self.delay_to, base * random.uniform(0.75, 1.15)))
         return random.uniform(self.delay_from, self.delay_to)
 
+    def _iter_tasks(self):
+        if self.recipient_queue_path is None:
+            yield from self.tasks
+            return
+        if self.task_factory is None:
+            raise RuntimeError("Campaign recipient queue has no task factory.")
+        with self.recipient_queue_path.open("r", encoding="utf-8") as queue_file:
+            for raw_recipient in queue_file:
+                recipient = raw_recipient.rstrip("\r\n").strip()
+                if recipient:
+                    yield self.task_factory(recipient)
+
     def run(self) -> None:
         completed = 0
-        total = len(self.tasks)
+        processed = 0
+        total = self.task_total
         error_message = ""
-        for task in self.tasks:
-            if self.cancel_event.is_set():
-                break
-            if not self._wait_for_resume():
-                break
-
-            recipient = task["recipient"]
-            subject = task["subject"]
-            body_text = task["body_text"]
-            attachment_html = task["attachment_html"]
-            attachment_formats = self.attachment_formats or [task["attachment_format"]]
-            file_name_value = task["file_name_value"]
-            attempts = self.retry_count + 1 if self.retry_enabled else 1
-            last_error: Exception | None = None
-            sent_ok = False
-
-            for attempt in range(1, attempts + 1):
-                if self.cancel_event.is_set() or not self._wait_for_resume():
+        try:
+            task_iterator = self._iter_tasks()
+            for task in task_iterator:
+                if self.cancel_event.is_set():
                     break
-                try:
-                    # Gmail has mutable window state. Keep each browser
-                    # session strictly single-file even if a worker is
-                    # restarted or queued again after a transient failure.
-                    with self.session.send_lock:
-                        self.send_callback(
-                            self.session,
-                            recipient,
-                            subject,
-                            body_text,
-                            attachment_html,
-                            attachment_formats,
-                            self.file_name_mode,
-                            file_name_value,
-                            self.convert_enabled,
-                            True,
-                            False,
-                        )
-                    sent_ok = True
+                if not self._wait_for_resume():
                     break
-                except Exception as exc:
-                    last_error = exc
-                    if getattr(exc, "errno", None) == errno.ENOSPC:
-                        error_message = "Not enough free storage space to prepare the email."
-                        self.cancel_event.set()
+
+                recipient = task["recipient"]
+                subject = task["subject"]
+                body_text = task["body_text"]
+                attachment_html = task["attachment_html"]
+                attachment_formats = self.attachment_formats or [task["attachment_format"]]
+                file_name_value = task["file_name_value"]
+                attempts = self.retry_count + 1 if self.retry_enabled else 1
+                last_error: Exception | None = None
+                sent_ok = False
+
+                for attempt in range(1, attempts + 1):
+                    if self.cancel_event.is_set() or not self._wait_for_resume():
                         break
-                    if attempt < attempts and not self.cancel_event.is_set():
-                        if not self._sleep_with_controls(self._delay_seconds()):
+                    try:
+                        # Gmail has mutable page state. Keep each browser tab
+                        # strictly single-file even if its worker is retried.
+                        with self.session.send_lock:
+                            self.send_callback(
+                                self.session,
+                                recipient,
+                                subject,
+                                body_text,
+                                attachment_html,
+                                attachment_formats,
+                                self.file_name_mode,
+                                file_name_value,
+                                self.convert_enabled,
+                                True,
+                                False,
+                            )
+                        sent_ok = True
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        self.log.emit(
+                            f"[{self._timestamp()}] {self.window_label} attempt {attempt}/{attempts} "
+                            f"failed for {recipient}: {exc}"
+                        )
+                        if isinstance(exc, CampaignBrowserClosedError):
+                            # A single manually closed Gmail window must stop
+                            # only its own queue. Other browser workers remain
+                            # independent and continue sending.
+                            error_message = str(exc)
                             break
+                        if getattr(exc, "errno", None) == errno.ENOSPC:
+                            error_message = "Not enough free storage space to prepare the email."
+                            self.cancel_event.set()
+                            break
+                        if (
+                            attempt < attempts
+                            and not self.cancel_event.is_set()
+                            and not self.automatic_no_delay
+                        ):
+                            if not self._sleep_with_controls(self._delay_seconds()):
+                                break
 
-            completed += 1
-            if sent_ok:
-                self.log.emit(f"[{self._timestamp()}] {self.window_label} sent {recipient}")
-                self.email_sent.emit(recipient, subject)
-            elif last_error is not None:
-                error_message = error_message or str(last_error)
-                self.log.emit(f"[{self._timestamp()}] {self.window_label} failed {recipient}: {error_message}")
-            else:
-                self.log.emit(f"[{self._timestamp()}] {self.window_label} cancelled {recipient}")
-            self.progress.emit(self.session.session_id, self.window_label, completed, total)
+                processed += 1
+                if sent_ok:
+                    completed += 1
+                    self.log.emit(f"[{self._timestamp()}] {self.window_label} sent {recipient}")
+                    self.email_sent.emit(recipient, subject)
+                elif last_error is not None:
+                    error_message = error_message or str(last_error)
+                    self.log.emit(f"[{self._timestamp()}] {self.window_label} failed {recipient}: {error_message}")
+                else:
+                    self.log.emit(f"[{self._timestamp()}] {self.window_label} cancelled {recipient}")
+                self.progress.emit(self.session.session_id, self.window_label, completed, total)
 
-            if completed < total and not self.cancel_event.is_set():
-                if not self._sleep_with_controls(self._delay_seconds()):
+                if isinstance(last_error, CampaignBrowserClosedError):
                     break
+                if (
+                    processed < total
+                    and not self.cancel_event.is_set()
+                    and not self.automatic_no_delay
+                ):
+                    if not self._sleep_with_controls(self._delay_seconds()):
+                        break
+        except Exception as exc:
+            error_message = str(exc)
+            self.log.emit(f"[{self._timestamp()}] {self.window_label} failed to read its recipient queue: {error_message}")
+
+        if self.cleanup_callback is not None:
+            try:
+                self.cleanup_callback(self.session)
+            except Exception:
+                pass
+
+        # PySide wrapper destruction can require the Python GIL. Deleting the
+        # worker inside its QThread while the GUI thread is laying out text can
+        # create a cross-thread lock inversion. Transfer ownership back to the
+        # application thread before the finished -> deleteLater signal runs.
+        try:
+            application = QApplication.instance()
+            if application is not None and self.thread() is not application.thread():
+                self.moveToThread(application.thread())
+        except Exception:
+            pass
 
         self.finished.emit(
             self.session.session_id,
@@ -3627,14 +3799,14 @@ class LoginPage(QWidget):
             QApplication.restoreOverrideCursor()
 
     def _attempt_login(self) -> None:
-        username = self.username_input.text()
+        username = self.username_input.text().strip()
         password = self.password_input.text()
 
-        if not username.strip() or not password.strip():
+        if not username or not password:
             self._show_login_error("Please enter both a username and password.")
             return
-        if re.search(r"\s", username) or re.search(r"\s", password):
-            self._show_login_error("Username and password cannot contain whitespace.")
+        if re.search(r"\s", username):
+            self._show_login_error("Username cannot contain whitespace.")
             return
 
         self.error_label.setText("")
@@ -3643,9 +3815,9 @@ class LoginPage(QWidget):
         payload: dict[str, object] | None = None
         try:
             payload = api_login(
-                username.strip(),
-                password.strip(),
-                timeout=5.0,
+                username,
+                password,
+                timeout=15.0,
                 device_fingerprint=_device_fingerprint(),
                 device_name=_device_name(),
             )
@@ -3686,9 +3858,9 @@ class LoginPage(QWidget):
                     return
                 try:
                     payload = api_login(
-                        username.strip(),
-                        password.strip(),
-                        timeout=5.0,
+                        username,
+                        password,
+                        timeout=15.0,
                         device_fingerprint=_device_fingerprint(),
                         device_name=_device_name(),
                         force_logout_other_device=True,
@@ -3833,6 +4005,7 @@ class DashboardPage(QWidget):
         self._scale = scale
         self.session_list = QListWidget()
         self.window_spin = QSpinBox()
+        self.tab_spin = QSpinBox()
         self.incognito_button = QPushButton("Incognito")
         self.normal_button = QPushButton("Normal Mode")
         self.normal_message_button = QPushButton("Plain Text")
@@ -3862,8 +4035,11 @@ class DashboardPage(QWidget):
         self.body_editor = QTextEdit()
         self.html_message_editor = QTextEdit()
         self.html_editor = QTextEdit()
-        self.send_log_view = QTextEdit()
-        self.activity_log_view = QTextEdit()
+        # Runtime logs use QPlainTextEdit: it is substantially cheaper and
+        # more stable than rebuilding QTextDocument rich-text layouts while
+        # multiple campaign signals arrive.
+        self.send_log_view = QPlainTextEdit()
+        self.activity_log_view = QPlainTextEdit()
         self.progress_bar = QProgressBar()
         self.active_windows_value = QLabel("0")
         self.campaign_progress_text = QLabel("0 / 0 sent")
@@ -3911,13 +4087,27 @@ class DashboardPage(QWidget):
         self.delay_to = QDoubleSpinBox()
         self.retry_count = QSpinBox()
         self.retry_enable_checkbox = QCheckBox("Enable")
+        self.automatic_send_checkbox = QCheckBox("Automatic (no delay)")
         self._campaign_threads: list[QThread] = []
         self._campaign_workers: dict[str, CampaignSendWorker] = {}
+        self._campaign_running_workers: set[str] = set()
         self._campaign_worker_queue: list[dict[str, object]] = []
         self._campaign_worker_order: list[str] = []
         self._campaign_worker_progress: dict[str, int] = {}
         self._campaign_worker_totals: dict[str, int] = {}
+        self._campaign_lane_parents: dict[str, str] = {}
         self._campaign_send_log_entries: list[str] = []
+        self._rendered_send_log_entries: tuple[str, ...] = ()
+        self._rendered_activity_log_entries: tuple[str, ...] = ()
+        self._campaign_queue_dir: Path | None = None
+        self._campaign_ui_refresh_timer = QTimer(self)
+        self._campaign_ui_refresh_timer.setSingleShot(True)
+        self._campaign_ui_refresh_timer.setInterval(200)
+        self._campaign_ui_refresh_timer.timeout.connect(self._flush_campaign_runtime_ui)
+        self._log_scroll_timer = QTimer(self)
+        self._log_scroll_timer.setSingleShot(True)
+        self._log_scroll_timer.setInterval(0)
+        self._log_scroll_timer.timeout.connect(self._scroll_runtime_logs_to_end)
         self._campaign_pause_event = threading.Event()
         self._campaign_cancel_event = threading.Event()
         self._campaign_active = False
@@ -4060,6 +4250,10 @@ class DashboardPage(QWidget):
         self.window_spin.setValue(self.state.window_count)
         self.window_spin.setObjectName("windowSpin")
         self.window_spin.valueChanged.connect(self._window_count_changed)
+        self.tab_spin.setRange(1, 50)
+        self.tab_spin.setValue(self.state.tab_count)
+        self.tab_spin.setObjectName("tabSpin")
+        self.tab_spin.valueChanged.connect(self._tab_count_changed)
 
         launch_row = QHBoxLayout()
         launch_row.setSpacing(8)
@@ -4067,7 +4261,7 @@ class DashboardPage(QWidget):
         launch_button = QPushButton("Start Browser")
         launch_button.setObjectName("primaryButton")
         launch_button.clicked.connect(lambda: self._handle_launch())
-        launch_button.setToolTip("Launch browser windows for the selected session count")
+        launch_button.setToolTip("Launch the selected browser windows and Gmail tabs")
 
         pause_button = QPushButton("Pause")
         pause_button.setObjectName("warningButton")
@@ -4083,6 +4277,7 @@ class DashboardPage(QWidget):
         self._apply_button_icon(reset_button, QStyle.SP_BrowserReload)
 
         launch_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
+        launch_layout.addWidget(self._labeled_value_row("Tabs", self.tab_spin))
         launch_row.addWidget(launch_button)
         launch_row.addWidget(pause_button)
         launch_row.addWidget(reset_button)
@@ -4141,6 +4336,7 @@ class DashboardPage(QWidget):
         activity_card, activity_layout = self._card("Activity Log", "Recent actions and workflow updates.")
         self.activity_log_view.setObjectName("activityList")
         self.activity_log_view.setReadOnly(True)
+        self.activity_log_view.setMaximumBlockCount(30)
         self.activity_log_view.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.activity_log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         activity_layout.addWidget(self.activity_log_view)
@@ -4221,21 +4417,21 @@ class DashboardPage(QWidget):
         filter_layout.addLayout(filter_row)
 
         actions_row = QHBoxLayout()
-        load_button = QPushButton("Load from File")
-        load_button.setObjectName("secondaryButton")
-        clear_button = QPushButton("Clear List")
-        clear_button.setObjectName("secondaryButton")
-        validate_button = QPushButton("Validate and Count")
-        validate_button.setObjectName("primaryButton")
-        load_button.setToolTip("Load recipient emails from a file")
-        clear_button.setToolTip("Clear the current recipient list")
-        validate_button.setToolTip("Validate the list and count the results")
-        load_button.clicked.connect(self._load_pending_emails_from_file)
-        clear_button.clicked.connect(lambda: self._clear_pending_emails())
-        validate_button.clicked.connect(self._validate_pending_emails)
-        actions_row.addWidget(load_button)
-        actions_row.addWidget(clear_button)
-        actions_row.addWidget(validate_button)
+        self.data_load_button = QPushButton("Load from File")
+        self.data_load_button.setObjectName("secondaryButton")
+        self.data_clear_button = QPushButton("Clear List")
+        self.data_clear_button.setObjectName("secondaryButton")
+        self.data_validate_button = QPushButton("Validate and Count")
+        self.data_validate_button.setObjectName("primaryButton")
+        self.data_load_button.setToolTip("Load recipient emails from a file")
+        self.data_clear_button.setToolTip("Clear the current recipient list")
+        self.data_validate_button.setToolTip("Validate the list and count the results")
+        self.data_load_button.clicked.connect(self._load_pending_emails_from_file)
+        self.data_clear_button.clicked.connect(self._clear_pending_emails)
+        self.data_validate_button.clicked.connect(self._validate_pending_emails)
+        actions_row.addWidget(self.data_load_button)
+        actions_row.addWidget(self.data_clear_button)
+        actions_row.addWidget(self.data_validate_button)
         actions_row.addStretch()
         filter_layout.addLayout(actions_row)
 
@@ -4461,6 +4657,11 @@ class DashboardPage(QWidget):
         self.retry_count.setToolTip("Number of retry attempts for failed sends")
 
         form.addRow("Per-sender limit", self.sender_limit)
+        self.automatic_send_checkbox.setChecked(True)
+        self.automatic_send_checkbox.setToolTip(
+            "Send the next assigned email immediately; configured delays are ignored"
+        )
+        form.addRow("Fast sending", self.automatic_send_checkbox)
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("Delay between emails"))
         delay_row.addWidget(self.delay_from)
@@ -4577,6 +4778,7 @@ class DashboardPage(QWidget):
         self.delay_to.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.retry_count.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.retry_enable_checkbox.toggled.connect(lambda _value: self._schedule_sending_settings_save())
+        self.automatic_send_checkbox.toggled.connect(self._on_automatic_sending_toggled)
         self.delay_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.send_order_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.window_mode_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
@@ -4586,8 +4788,24 @@ class DashboardPage(QWidget):
 
         self._refresh_ai_models()
         self._sync_ai_connection_ui()
+        self._sync_automatic_sending_ui()
 
         return self._tab_scroll(page)
+
+    def _on_automatic_sending_toggled(self, _checked: bool) -> None:
+        self._sync_automatic_sending_ui()
+        self._schedule_sending_settings_save()
+
+    def _sync_automatic_sending_ui(self) -> None:
+        delay_enabled = not self.automatic_send_checkbox.isChecked()
+        for widget in (
+            self.delay_from,
+            self.delay_to,
+            self.delay_fixed_radio,
+            self.delay_random_radio,
+            self.delay_human_radio,
+        ):
+            widget.setEnabled(delay_enabled)
 
     def _refresh_ai_models(self) -> None:
         self.ai_model_combo.blockSignals(True)
@@ -4643,6 +4861,8 @@ class DashboardPage(QWidget):
             "delay_to": float(self.delay_to.value()),
             "retry_count": int(self.retry_count.value()),
             "retry_enabled": bool(self.retry_enable_checkbox.isChecked()),
+            "automatic_no_delay": bool(self.automatic_send_checkbox.isChecked()),
+            "automatic_no_delay_default_version": 1,
             "delay_type": delay_type,
             "email_send_order": email_send_order,
             "window_send_mode": window_send_mode,
@@ -4691,6 +4911,14 @@ class DashboardPage(QWidget):
         delay_to = _as_float(payload.get("delay_to"), 0.5)
         retry_count = _as_int(payload.get("retry_count"), 3)
         retry_enabled = _as_bool(payload.get("retry_enabled"), True)
+        automatic_default_version = _as_int(
+            payload.get("automatic_no_delay_default_version"), 0
+        )
+        automatic_no_delay = (
+            True
+            if automatic_default_version < 1
+            else _as_bool(payload.get("automatic_no_delay"), True)
+        )
         delay_type = str(payload.get("delay_type") or "Auto (system-oriented)")
         if delay_type == "Random range":
             delay_type = "Auto (system-oriented)"
@@ -4708,6 +4936,7 @@ class DashboardPage(QWidget):
         _block(self.delay_to, lambda: self.delay_to.setValue(delay_to))
         _block(self.retry_count, lambda: self.retry_count.setValue(retry_count))
         _block(self.retry_enable_checkbox, lambda: self.retry_enable_checkbox.setChecked(retry_enabled))
+        _block(self.automatic_send_checkbox, lambda: self.automatic_send_checkbox.setChecked(automatic_no_delay))
 
         _block(self.delay_fixed_radio, lambda: self.delay_fixed_radio.setChecked(delay_type == "Fixed"))
         _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Auto (system-oriented)"))
@@ -4729,6 +4958,7 @@ class DashboardPage(QWidget):
         self.state.delay_to = delay_to
         self.state.retry_count = retry_count
         self.state.retry_enabled = retry_enabled
+        self.state.automatic_no_delay = automatic_no_delay
         self.state.delay_type = delay_type
         self.state.email_send_order = email_send_order
         self.state.window_send_mode = window_send_mode
@@ -4741,6 +4971,7 @@ class DashboardPage(QWidget):
 
         self._refresh_ai_models()
         self._sync_ai_connection_ui()
+        self._sync_automatic_sending_ui()
 
     def _load_sending_settings_state(self, mysql_settings_map: dict[str, object] | None = None) -> None:
         local_payload = _load_ui_state(LOCAL_SETTINGS_STATE_KEY)
@@ -4766,6 +4997,7 @@ class DashboardPage(QWidget):
         self.state.delay_to = float(payload["delay_to"])
         self.state.retry_count = int(payload["retry_count"])
         self.state.retry_enabled = bool(payload["retry_enabled"])
+        self.state.automatic_no_delay = bool(payload["automatic_no_delay"])
         self.state.delay_type = str(payload["delay_type"])
         self.state.email_send_order = str(payload["email_send_order"])
         self.state.window_send_mode = str(payload["window_send_mode"])
@@ -4776,11 +5008,21 @@ class DashboardPage(QWidget):
         self.state.ai_available_models = [str(item) for item in payload.get("available_models") or []]
         self._available_ai_models = list(self.state.ai_available_models)
         if self.state.logged_in and self.state.username:
-            try:
-                for key, value in payload.items():
-                    upsert_setting(self.state.username, str(key), value)
-            except Exception:
-                pass
+            username = self.state.username
+            remote_settings = list(payload.items())
+
+            def persist_remote_settings() -> None:
+                try:
+                    for key, value in remote_settings:
+                        upsert_setting(username, str(key), value)
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=persist_remote_settings,
+                name="ezymailer-settings-save",
+                daemon=True,
+            ).start()
 
     def _save_sending_settings(self) -> None:
         self._persist_sending_settings_state()
@@ -4941,6 +5183,7 @@ class DashboardPage(QWidget):
 
         log_card, log_layout = self._card("SEND LOG")
         self.send_log_view.setReadOnly(True)
+        self.send_log_view.setMaximumBlockCount(80)
         self.send_log_view.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.send_log_view.setObjectName("activityList")
         log_layout.addWidget(self.send_log_view)
@@ -5688,10 +5931,19 @@ class DashboardPage(QWidget):
             self.state.custom_tag_2 = str(payload.get("custom2") or "")
             self.state.tag_samples = dict(payload.get("samples") or {})
             if self.state.logged_in and self.state.auth_token:
-                try:
-                    api_save_tags(self.state.auth_token, payload)
-                except Exception:
-                    pass
+                auth_token = self.state.auth_token
+
+                def save_remote_tags() -> None:
+                    try:
+                        api_save_tags(auth_token, payload)
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=save_remote_tags,
+                    name="ezymailer-tag-save",
+                    daemon=True,
+                ).start()
         except Exception as exc:
             self._log_action(f"Failed to save tags: {exc}")
 
@@ -6250,10 +6502,19 @@ class DashboardPage(QWidget):
         if current_body is not None:
             current_body.set_mode(mode)
         if self.state.username:
-            try:
-                upsert_setting(self.state.username, "body_mode", mode)
-            except Exception:
-                pass
+            username = self.state.username
+
+            def persist_body_mode() -> None:
+                try:
+                    upsert_setting(username, "body_mode", mode)
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=persist_body_mode,
+                name="ezymailer-body-mode-save",
+                daemon=True,
+            ).start()
         self._schedule_subject_body_save()
         label = "Plain Text" if mode == "Normal Message" else "HTML Body"
         self._log_action(f"Body mode set to {label}")
@@ -6272,6 +6533,7 @@ class DashboardPage(QWidget):
             "browser_mode": self.state.browser_mode,
             "launch_preset": self.state.launch_preset,
             "window_count": int(self.state.window_count),
+            "tab_count": int(self.state.tab_count),
         }
 
     def _apply_browser_state_payload(self, payload: dict[str, object]) -> None:
@@ -6281,10 +6543,19 @@ class DashboardPage(QWidget):
             window_count = max(1, int(payload.get("window_count") or 1))
         except Exception:
             window_count = 1
+        try:
+            tab_count = max(1, min(50, int(payload.get("tab_count") or 1)))
+        except Exception:
+            tab_count = 1
 
         self.state.browser_mode = browser_mode if browser_mode in {"Incognito", "Normal"} else "Incognito"
         self.state.launch_preset = launch_preset
         self.state.window_count = window_count
+        self.state.tab_count = tab_count
+        for spin, value in ((self.window_spin, window_count), (self.tab_spin, tab_count)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _load_browser_state(self) -> None:
         payload = _load_ui_state(LOCAL_BROWSER_STATE_KEY)
@@ -6299,6 +6570,11 @@ class DashboardPage(QWidget):
 
     def _window_count_changed(self, value: int) -> None:
         self.state.window_count = max(1, value)
+        self._persist_browser_state()
+
+    def _tab_count_changed(self, value: int) -> None:
+        self.state.tab_count = max(1, min(50, value))
+        self._persist_browser_state()
 
     def _browser_binary(self) -> Path | None:
         env_binary = os.getenv("EZYM_MAILER_BROWSER_BINARY", "").strip()
@@ -6306,7 +6582,14 @@ class DashboardPage(QWidget):
             candidate = Path(env_binary).expanduser()
             if candidate.exists():
                 return candidate
-        return _installed_browser_binary() or _cached_browser_binary(_browser_cache_dir())
+        # The Playwright-managed Chromium build matches the bundled driver
+        # and is therefore the stable default for multi-tab automation.
+        bundled_browser_dir = _bundled_browser_dir()
+        return (
+            (_cached_browser_binary(bundled_browser_dir) if bundled_browser_dir else None)
+            or _cached_browser_binary(_browser_cache_dir())
+            or _installed_browser_binary()
+        )
 
     def _browser_launch_rect(self, index: int, total: int) -> tuple[int, int, int, int]:
         screen = self.window().screen() or QApplication.primaryScreen()
@@ -6330,11 +6613,18 @@ class DashboardPage(QWidget):
         y = geometry.y() + margin + (row * (cell_height + gap))
         return x, y, cell_width, cell_height
 
-    def _create_browser_profile_dir(self, index: int) -> Path:
-        prefix = f"ezymailer-{self.state.username or 'guest'}-{index}-"
-        profile_dir = Path(tempfile.mkdtemp(prefix=prefix))
+    def _create_browser_profile_dir(self, index: int) -> tuple[Path, bool]:
+        if self.state.browser_mode == "Normal":
+            username = re.sub(r"[^A-Za-z0-9._-]+", "-", self.state.username or "guest").strip("-.") or "guest"
+            profile_dir = LOCAL_CACHE_DIR / "browser-profiles" / username / f"window-{index}"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            is_temporary = False
+        else:
+            prefix = f"ezymailer-{self.state.username or 'guest'}-{index}-"
+            profile_dir = Path(tempfile.mkdtemp(prefix=prefix))
+            is_temporary = True
         self._seed_browser_profile_dir(profile_dir)
-        return profile_dir
+        return profile_dir, is_temporary
 
     def _reserve_debug_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -6365,8 +6655,8 @@ class DashboardPage(QWidget):
         except Exception:
             pass
 
-    def _cleanup_browser_profile_dir(self, profile_dir: Path | None) -> None:
-        if profile_dir is None:
+    def _cleanup_browser_profile_dir(self, profile_dir: Path | None, is_temporary: bool = True) -> None:
+        if profile_dir is None or not is_temporary:
             return
         try:
             shutil.rmtree(profile_dir, ignore_errors=True)
@@ -6383,7 +6673,7 @@ class DashboardPage(QWidget):
         browser_slug = browser_name.lower().replace(" ", "-")
         session_id = f"{browser_slug}-{QDateTime.currentMSecsSinceEpoch()}-{index}"
         title = f"{browser_name} Window {index}"
-        profile_dir = self._create_browser_profile_dir(index)
+        profile_dir, profile_is_temporary = self._create_browser_profile_dir(index)
         debug_port = self._reserve_debug_port()
         args = [str(binary), "--new-window", f"--user-data-dir={profile_dir}"]
         # Suppress Chrome's first-run welcome dialog and default-browser prompt.
@@ -6393,6 +6683,11 @@ class DashboardPage(QWidget):
                 "--no-default-browser-check",
                 "--disable-infobars",
                 "--disable-default-apps",
+                # Campaign automation must keep running when its Gmail window
+                # is covered by EzyMailer or another browser window.
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
                 "--disable-features=ChromeWhatsNewUI",
                 f"--remote-debugging-port={debug_port}",
                 "--remote-allow-origins=*",
@@ -6403,7 +6698,11 @@ class DashboardPage(QWidget):
         x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
-        args.append("https://workspace.google.com/intl/en-US/gmail/#inbox")
+        # Open one Gmail page for every configured sending tab. Chrome accepts
+        # multiple URL arguments after --new-window and creates them as tabs
+        # in the same isolated browser profile.
+        tab_count = max(1, int(getattr(self.state, "tab_count", 1)))
+        args.extend(["https://mail.google.com/mail/u/0/#inbox"] * tab_count)
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -6418,7 +6717,9 @@ class DashboardPage(QWidget):
             process=process,
             status="Running",
             profile_dir=profile_dir,
+            profile_is_temporary=profile_is_temporary,
             debug_port=debug_port,
+            tab_count=tab_count,
         )
 
     def _sync_browser_session_states(self) -> None:
@@ -6454,7 +6755,7 @@ class DashboardPage(QWidget):
                     )
                 except Exception:
                     pass
-                self._cleanup_browser_profile_dir(session.profile_dir)
+                self._cleanup_browser_profile_dir(session.profile_dir, session.profile_is_temporary)
                 self._log_action(f"Browser window closed: {session.title}")
         else:
             self._sync_session_state_from_handles()
@@ -6463,28 +6764,39 @@ class DashboardPage(QWidget):
             self._browser_watch_timer.stop()
 
     def _browser_session_is_alive(self, session: BrowserSessionHandle) -> bool:
-        """Treat a browser as alive when its CDP endpoint is still serving.
+        """Check a browser session without ever blocking the Qt UI thread.
 
         On Windows, Edge may hand the window to another process and exit the
         Popen handle. The debugging endpoint is the reliable signal because it
         is also what campaign workers use to connect to the existing window.
         """
         if session.process is not None and session.process.poll() is None:
+            session.health_check_failures = 0
             return True
         if session.debug_port is None:
             return False
-        try:
-            with socket.create_connection(("127.0.0.1", session.debug_port), timeout=0.25):
-                return True
-        except OSError:
-            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setblocking(False)
+            result = probe.connect_ex(("127.0.0.1", session.debug_port))
+            if result in {errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK}:
+                _readable, writable, exceptional = select.select([], [probe], [probe], 0.001)
+                if writable or exceptional:
+                    result = probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if result in {0, errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK}:
+            session.health_check_failures = 0
+            return True
+
+        # Require consecutive failures so a transient local networking state
+        # does not remove a live campaign session.
+        session.health_check_failures += 1
+        return session.health_check_failures < 3
 
     def _usable_browser_sessions(self) -> list[BrowserSessionHandle]:
-        self._sync_browser_session_states()
+        """Return tracked sessions immediately; workers verify CDP off-thread."""
         return [
             session
             for session in self._browser_sessions
-            if session.debug_port is not None and self._browser_session_is_alive(session)
+            if session.debug_port is not None and session.status not in {"Closed", "Stopped"}
         ]
 
     def _sync_session_state_from_handles(self) -> None:
@@ -6519,11 +6831,12 @@ class DashboardPage(QWidget):
                     {
                         "browser_mode": self.state.browser_mode,
                         "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                        "tab_count": session.tab_count,
                     },
                 )
             except Exception:
                 pass
-            self._cleanup_browser_profile_dir(session.profile_dir)
+            self._cleanup_browser_profile_dir(session.profile_dir, session.profile_is_temporary)
             if log_reason:
                 self._log_action(f"{log_reason}: {session.title}")
         self._browser_sessions.clear()
@@ -6533,8 +6846,10 @@ class DashboardPage(QWidget):
 
     def _handle_launch(self) -> None:
         title = "Confirm Launch"
+        tab_count = max(1, self.tab_spin.value())
         prompt = (
-            f"Launch {self.window_spin.value()} browser window(s) using {self.state.browser_mode} mode "
+            f"Launch {self.window_spin.value()} browser window(s) with {tab_count} Gmail tab(s) each "
+            f"using {self.state.browser_mode} mode "
             f"and the {self.launch_preset_label.text()} preset?"
         )
         confirm = ConfirmDialog(self.window(), title, prompt, scale=self._scale)
@@ -6609,6 +6924,7 @@ class DashboardPage(QWidget):
     def _handle_reset(self) -> None:
         self._terminate_browser_sessions()
         self.state.window_count = 1
+        self.state.tab_count = 1
         self.state.browser_mode = "Incognito"
         self.state.body_mode = "Normal Message"
         self.state.launch_preset = "Default"
@@ -6619,6 +6935,7 @@ class DashboardPage(QWidget):
         self.state.ai_available_models = []
         self._available_ai_models = []
         self.window_spin.setValue(1)
+        self.tab_spin.setValue(1)
         self.ai_provider_combo.blockSignals(True)
         self.ai_provider_combo.setCurrentText("ChatGPT")
         self.ai_provider_combo.blockSignals(False)
@@ -6676,6 +6993,9 @@ class DashboardPage(QWidget):
         self._update_campaign_action_state()
 
     def _reset_campaign_form_state(self, confirm: bool = True) -> None:
+        if self._campaign_active or self._campaign_threads:
+            self.notify("Cancel the campaign and wait for all sending tabs to stop before resetting")
+            return
         if confirm:
             reply = QMessageBox.question(
                 self,
@@ -6689,8 +7009,6 @@ class DashboardPage(QWidget):
 
         self._workspace_loading = True
         try:
-            if self._campaign_active:
-                self._handle_campaign_cancel()
             self._pending_campaign_payload = None
             self.progress_bar.setValue(0)
             self.campaign_progress_text.setText("0 / 0 sent")
@@ -6778,16 +7096,33 @@ class DashboardPage(QWidget):
             )
         except Exception:
             pass
-        self._cleanup_browser_profile_dir(session.profile_dir)
+        self._cleanup_browser_profile_dir(session.profile_dir, session.profile_is_temporary)
         self._log_action(f"Closed browser window {session.title}")
         self.notify(f"Closed {session.title}")
 
     def _append_campaign_send_log(self, message: str) -> None:
+        if not self._is_campaign_sent_log(message):
+            return
         self._campaign_send_log_entries.append(message)
-        self._refresh_activity()
+        # Keep memory and redraw cost bounded during very large campaigns.
+        if len(self._campaign_send_log_entries) > 2000:
+            del self._campaign_send_log_entries[:-2000]
+        self._sync_plain_log_view(
+            self.send_log_view,
+            self._campaign_send_log_entries,
+            "_rendered_send_log_entries",
+            "[--:--:--] No send events yet.",
+            80,
+        )
+        self._schedule_campaign_runtime_ui_refresh()
+
+    @staticmethod
+    def _is_campaign_sent_log(message: str) -> bool:
+        return bool(re.match(r"^\[[^\]]+\]\s+.+?\s+sent\s+\S+", str(message or "").strip()))
 
     def _update_campaign_action_state(self) -> None:
-        can_start = self.state.logged_in and not self._campaign_active and not self._campaign_missing_fields()
+        runtime_busy = self._campaign_active or bool(self._campaign_threads)
+        can_start = self.state.logged_in and not runtime_busy and not self._campaign_missing_fields()
         primary_label = "Start Campaign"
         if self._campaign_active:
             primary_label = "Resume Campaign" if self._campaign_paused else "Pause Campaign"
@@ -6799,6 +7134,15 @@ class DashboardPage(QWidget):
         self.campaign_pause_button.setText("Resume Campaign" if self._campaign_paused else "Pause Campaign")
         self.campaign_cancel_button.setVisible(self._campaign_active)
         self.campaign_cancel_button.setEnabled(self._campaign_active)
+        self.campaign_reset_all_button.setEnabled(not runtime_busy)
+        for control in (
+            getattr(self, "data_load_button", None),
+            getattr(self, "data_clear_button", None),
+            getattr(self, "data_validate_button", None),
+        ):
+            if control is not None:
+                control.setEnabled(not runtime_busy)
+        self.pending_emails_editor.setReadOnly(runtime_busy)
         if self._campaign_total:
             remaining = max(self._campaign_total - self._campaign_completed, 0)
             self.campaign_progress_text.setText(f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining")
@@ -6809,11 +7153,6 @@ class DashboardPage(QWidget):
         if not recipients or window_count <= 0:
             return []
         total = len(recipients)
-        if total > window_count * sender_limit:
-            raise RuntimeError(
-                f"{total} recipient(s) exceed the current window capacity of {window_count * sender_limit}. "
-                f"Increase browser windows or lower the recipient count."
-            )
         chunks: list[list[str]] = []
         index = 0
         base, remainder = divmod(total, window_count)
@@ -6821,16 +7160,118 @@ class DashboardPage(QWidget):
             size = base + (1 if window_index < remainder else 0)
             if size <= 0:
                 continue
-            next_index = min(total, index + min(size, sender_limit))
+            next_index = min(total, index + size)
             chunks.append(recipients[index:next_index])
             index = next_index
-        if index < total:
-            chunks[-1].extend(recipients[index:])
         return chunks
+
+    def _campaign_tab_lanes(self, sessions: list[BrowserSessionHandle]) -> list[BrowserTabHandle]:
+        lanes: list[BrowserTabHandle] = []
+        for window_index, session in enumerate(sessions, start=1):
+            if session.debug_port is None:
+                continue
+            for tab_index in range(1, max(1, int(session.tab_count)) + 1):
+                lanes.append(
+                    BrowserTabHandle(
+                        session_id=f"{session.session_id}:tab:{tab_index}",
+                        window_session_id=session.session_id,
+                        title=f"Window {window_index} / Tab {tab_index}",
+                        mode=session.mode,
+                        browser_name=session.browser_name,
+                        debug_port=session.debug_port,
+                        tab_index=tab_index,
+                        connect_lock=session.connect_lock,
+                    )
+                )
+        return lanes
+
+    def _campaign_task_factory(
+        self,
+        subject_template: str | list[str],
+        body_template: str,
+        attachment_html: str,
+        attachment_formats: list[str],
+        file_name_value: str,
+    ) -> Callable[[str], dict[str, str]]:
+        """Capture immutable campaign data and personalize one queued recipient locally."""
+        custom1 = self.custom1_input.text().strip()
+        custom2 = self.custom2_input.text().strip()
+        tag_definitions = [dict(item) for item in self._tag_definitions]
+        default_attachment_format = attachment_formats[0] if attachment_formats else self.attach_format_value
+        customer_records: dict[str, dict[str, object]] | None = None
+        customer_records_lock = threading.Lock()
+
+        def customer_values(recipient: str) -> dict[str, str]:
+            nonlocal customer_records
+            if customer_records is None:
+                # The first browser worker loads the optional local variable
+                # snapshot. No database or network access happens on Start.
+                with customer_records_lock:
+                    if customer_records is None:
+                        try:
+                            customer_records = _load_all_customer_variables()
+                        except Exception:
+                            customer_records = {}
+            raw_values = customer_records.get(recipient.strip().lower(), {})
+            normalized: dict[str, str] = {}
+            for key, value in raw_values.items():
+                key_text = str(key).strip()
+                value_text = str(value).strip()
+                if not key_text or not value_text:
+                    continue
+                normalized[key_text] = value_text
+                normalized[key_text.lower()] = value_text
+                if not key_text.startswith("$"):
+                    normalized[f"${key_text}"] = value_text
+            return normalized
+
+        def apply_values(value: str, replacements: dict[str, str]) -> str:
+            result = value or ""
+            brace_lookup = {
+                key.lstrip("$").lower(): replacement
+                for key, replacement in replacements.items()
+                if key and replacement
+            }
+            result = re.sub(
+                r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}",
+                lambda match: brace_lookup.get(match.group(1).strip().lower(), match.group(0)),
+                result,
+            )
+            for token, replacement in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+                if token.startswith("$") and replacement:
+                    result = result.replace(token, replacement)
+            return result
+
+        def build_task(recipient: str) -> dict[str, str]:
+            dynamic_values = {
+                item["token"]: self._generate_random_tag_value(item["token"], item["default_value"])
+                for item in tag_definitions
+            }
+            replacements = {"$custom1": custom1, "$custom2": custom2, "$subject": ""}
+            replacements.update(dynamic_values)
+            replacements.update(self._recipient_tag_values(recipient))
+            replacements.update(customer_values(recipient))
+            selected_subject = (
+                random.choice(subject_template)
+                if isinstance(subject_template, list) and subject_template
+                else str(subject_template)
+            )
+            subject = apply_values(selected_subject, replacements)
+            replacements["$subject"] = subject
+            return {
+                "recipient": recipient,
+                "subject": subject,
+                "body_text": apply_values(body_template, replacements),
+                "attachment_html": apply_values(attachment_html, replacements),
+                "attachment_format": default_attachment_format,
+                "file_name_value": apply_values(file_name_value, replacements),
+            }
+
+        return build_task
 
     def _build_campaign_jobs(
         self,
-        sessions: list[BrowserSessionHandle],
+        sessions: list[BrowserSessionHandle | BrowserTabHandle],
         recipients: list[str],
         subject_template: str | list[str],
         body_template: str,
@@ -6844,55 +7285,66 @@ class DashboardPage(QWidget):
             len(sessions),
             max(1, int(getattr(self.state, "sender_limit", 300))),
         )
+        queue_dir = Path(tempfile.mkdtemp(prefix="ezymailer-campaign-"))
+        self._campaign_queue_dir = queue_dir
+        task_factory = self._campaign_task_factory(
+            subject_template,
+            body_template,
+            attachment_html,
+            attachment_formats,
+            file_name_value,
+        )
         jobs: list[dict[str, object]] = []
         for index, (session, chunk) in enumerate(zip(sessions, chunks), start=1):
-            tasks: list[dict[str, str]] = []
-            window_label = f"Window {index}"
-            for recipient in chunk:
-                tag_values = self._dynamic_tag_values()
-                selected_subject = random.choice(subject_template) if isinstance(subject_template, list) and subject_template else str(subject_template)
-                subject = self._apply_tags_to_text(selected_subject, recipient, tag_values=tag_values)
-                body_text = self._apply_tags_to_text(body_template, recipient, subject, tag_values=tag_values)
-                attachment_text = self._apply_tags_to_text(attachment_html, recipient, subject, tag_values=tag_values)
-                file_name_text = self._apply_tags_to_text(file_name_value, recipient, subject, tag_values=tag_values)
-                tasks.append(
-                    {
-                        "recipient": recipient,
-                        "subject": subject,
-                        "body_text": body_text,
-                        "attachment_html": attachment_text,
-                        "attachment_format": attachment_formats[0] if attachment_formats else self.attach_format_value,
-                        "file_name_value": file_name_text,
-                    }
-                )
+            window_label = session.title
+            queue_path = queue_dir / f"lane-{index}.txt"
+            with queue_path.open("w", encoding="utf-8", newline="\n") as queue_file:
+                for recipient in chunk:
+                    queue_file.write(f"{recipient}\n")
             jobs.append(
                 {
                     "session": session,
                     "window_label": window_label,
-                    "tasks": tasks,
+                    "recipient_queue_path": queue_path,
+                    "task_factory": task_factory,
+                    "task_total": len(chunk),
                 }
             )
+            parent_id = (
+                session.window_session_id
+                if isinstance(session, BrowserTabHandle)
+                else session.session_id
+            )
+            self._campaign_lane_parents[session.session_id] = parent_id
         return jobs
 
     def _queue_campaign_job(self, job: dict[str, object]) -> None:
         session = job["session"]
         if isinstance(session, BrowserSessionHandle):
             session.send_completed = 0
-            session.send_total = len(job["tasks"])
-            self._refresh_sessions()
+            session.send_total = int(job["task_total"])
+        lane_id = str(session.session_id)
+        self._campaign_worker_progress.setdefault(lane_id, 0)
+        self._campaign_worker_totals[lane_id] = int(job["task_total"])
+        self._refresh_window_campaign_counts(refresh_ui=False)
+        self._schedule_campaign_runtime_ui_refresh()
         thread = QThread(self)
         worker = CampaignSendWorker(
             session,
-            job["tasks"],
+            None,
             self._campaign_pause_event,
             self._campaign_cancel_event,
             self._send_compose_with_playwright,
+            recipient_queue_path=job["recipient_queue_path"],
+            task_factory=job["task_factory"],
+            task_total=int(job["task_total"]),
             window_label=str(job["window_label"]),
             delay_mode=getattr(self.state, "delay_type", "Auto (system-oriented)"),
             delay_from=float(getattr(self.state, "delay_from", 0.2)),
             delay_to=float(getattr(self.state, "delay_to", 0.5)),
             retry_count=int(getattr(self.state, "retry_count", 3)),
             retry_enabled=bool(getattr(self.state, "retry_enabled", True)),
+            automatic_no_delay=bool(getattr(self.state, "automatic_no_delay", True)),
             convert_enabled=bool(self.attach_convert_checkbox.isChecked()),
             attachment_formats=self._normalize_attachment_format_values(
                 self._pending_campaign_payload.get("attachment_formats")
@@ -6907,29 +7359,58 @@ class DashboardPage(QWidget):
         # queued-start race that can leave the modal loader indeterminate.
         thread.started.connect(worker.run, Qt.DirectConnection)
         worker.log.connect(self._append_campaign_send_log)
-        worker.email_sent.connect(self._on_campaign_email_sent)
         worker.progress.connect(self._on_campaign_worker_progress)
         worker.finished.connect(self._on_campaign_worker_finished)
-        worker.finished.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_campaign_thread_finished)
         thread.finished.connect(thread.deleteLater)
+        thread.setProperty("campaign_lane_id", lane_id)
         self._campaign_threads.append(thread)
-        self._campaign_workers[str(job["session"].session_id)] = worker
+        self._campaign_workers[lane_id] = worker
+        self._campaign_running_workers.add(lane_id)
         thread.start()
 
-    def _on_campaign_email_sent(self, recipient: str, subject: str) -> None:
-        auth_token = str(getattr(self.state, "auth_token", "") or "")
-        if not auth_token:
-            return
-
-        def record() -> None:
+    def _on_campaign_thread_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            lane_id = str(thread.property("campaign_lane_id") or "")
+            if lane_id:
+                self._campaign_workers.pop(lane_id, None)
             try:
-                record_sent_email_event(auth_token, recipient, subject)
-            except Exception:
-                # Sending has already succeeded; reporting must not interrupt the campaign.
+                self._campaign_threads.remove(thread)
+            except ValueError:
                 pass
+        if not self._campaign_threads:
+            self._campaign_workers.clear()
+        self._update_campaign_action_state()
 
-        threading.Thread(target=record, name="ezymailer-sent-counter", daemon=True).start()
+    def _refresh_window_campaign_counts(self, *, refresh_ui: bool = True) -> None:
+        for session in self._browser_sessions:
+            lane_ids = [
+                lane_id
+                for lane_id, parent_id in self._campaign_lane_parents.items()
+                if parent_id == session.session_id
+            ]
+            session.send_completed = sum(self._campaign_worker_progress.get(lane_id, 0) for lane_id in lane_ids)
+            session.send_total = sum(self._campaign_worker_totals.get(lane_id, 0) for lane_id in lane_ids)
+        if refresh_ui:
+            self._refresh_sessions()
+
+    def _schedule_campaign_runtime_ui_refresh(self) -> None:
+        if not self._campaign_ui_refresh_timer.isActive():
+            self._campaign_ui_refresh_timer.start()
+
+    def _flush_campaign_runtime_ui(self) -> None:
+        self._refresh_window_campaign_counts(refresh_ui=True)
+        self._campaign_completed = sum(self._campaign_worker_progress.values())
+        remaining = max(self._campaign_total - self._campaign_completed, 0)
+        self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
+        if self._campaign_total:
+            self.campaign_progress_text.setText(
+                f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining"
+            )
+        self._refresh_activity()
 
     def _start_next_campaign_worker(self) -> None:
         if self._campaign_cancel_event.is_set() or self._campaign_paused:
@@ -6940,47 +7421,54 @@ class DashboardPage(QWidget):
         self._queue_campaign_job(job)
 
     def _on_campaign_worker_progress(self, session_id: str, window_label: str, completed: int, total: int) -> None:
-        session = next((item for item in self._browser_sessions if item.session_id == session_id), None)
-        if session is not None:
-            session.send_completed = completed
-            session.send_total = total
-            self._refresh_sessions()
         self._campaign_worker_progress[session_id] = completed
         self._campaign_worker_totals[session_id] = total
-        self._campaign_completed = sum(self._campaign_worker_progress.values())
-        remaining = max(self._campaign_total - self._campaign_completed, 0)
-        self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
-        self.campaign_progress_text.setText(f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining")
+        self._schedule_campaign_runtime_ui_refresh()
 
     def _finish_campaign_runtime(self, message: str | None = None, *, cancelled: bool = False) -> None:
+        if self._campaign_ui_refresh_timer.isActive():
+            self._campaign_ui_refresh_timer.stop()
+        self._flush_campaign_runtime_ui()
         self._campaign_active = False
         self._campaign_paused = False
         self._campaign_cancel_event.clear()
         self._campaign_pause_event.clear()
-        self._campaign_threads.clear()
-        self._campaign_workers.clear()
+        self._campaign_running_workers.clear()
         self._campaign_worker_queue.clear()
         self._campaign_worker_progress.clear()
         self._campaign_worker_totals.clear()
+        self._campaign_lane_parents.clear()
         if cancelled:
             self.notify("Campaign cancelled")
             self._log_action("Campaign cancelled")
         elif message:
             self.notify(message)
         self._pending_campaign_payload = None
+        queue_dir = self._campaign_queue_dir
+        self._campaign_queue_dir = None
+        if queue_dir is not None:
+            threading.Thread(
+                target=lambda path=queue_dir: shutil.rmtree(path, ignore_errors=True),
+                name="ezymailer-queue-cleanup",
+                daemon=True,
+            ).start()
         self._cleanup_campaign_temp_files_async()
         self.window().hide_launch_loader()
         self._update_campaign_action_state()
+        session_timer = getattr(self.window(), "_session_check_timer", None)
+        if session_timer is not None and self.state.logged_in:
+            session_timer.start()
 
     def _cleanup_campaign_temp_files_async(self) -> None:
-        """Remove generated attachment folders without blocking the UI."""
+        """Remove generated attachment and abandoned queue folders off the UI thread."""
         temp_root = Path(tempfile.gettempdir())
 
         def cleanup() -> None:
             try:
-                for path in temp_root.glob("ezymailer-gmail-*"):
-                    if path.is_dir():
-                        shutil.rmtree(path, ignore_errors=True)
+                for pattern in ("ezymailer-gmail-*", "ezymailer-campaign-*"):
+                    for path in temp_root.glob(pattern):
+                        if path.is_dir() and path != self._campaign_queue_dir:
+                            shutil.rmtree(path, ignore_errors=True)
             except Exception:
                 pass
 
@@ -7010,25 +7498,23 @@ class DashboardPage(QWidget):
         total: int,
         error_message: str,
     ) -> None:
-        self._campaign_workers.pop(session_id, None)
+        # Keep the Python worker wrapper alive until its QThread has fully
+        # stopped. Dropping it here can deadlock with Qt's signal teardown.
+        self._campaign_running_workers.discard(session_id)
         self._campaign_worker_progress[session_id] = completed
         self._campaign_worker_totals[session_id] = total
-        session = next((item for item in self._browser_sessions if item.session_id == session_id), None)
-        if session is not None:
-            session.send_completed = completed
-            session.send_total = total
-            self._refresh_sessions()
+        self._refresh_window_campaign_counts(refresh_ui=False)
         self._campaign_completed = sum(self._campaign_worker_progress.values())
         self.progress_bar.setValue(int((self._campaign_completed / max(self._campaign_total, 1)) * 100))
         if error_message:
             self._log_action(f"{window_label} finished with an error: {error_message}")
         if self._campaign_cancel_event.is_set() or cancelled:
-            if not self._campaign_workers:
+            if not self._campaign_running_workers:
                 self._finish_campaign_runtime(cancelled=True)
             return
         if self.state.window_send_mode == "Sequential" and self._campaign_worker_queue and not self._campaign_paused:
             self._start_next_campaign_worker()
-        elif not self._campaign_workers and not self._campaign_worker_queue:
+        elif not self._campaign_running_workers and not self._campaign_worker_queue:
             self._append_campaign_send_log(f"[{QDateTime.currentDateTime().toString('hh:mm:ss')}] Campaign complete")
             self._finish_campaign_runtime(message=f"Sent {self._campaign_completed} email(s)")
 
@@ -7046,7 +7532,7 @@ class DashboardPage(QWidget):
             self._campaign_pause_event.set()
             self._update_campaign_action_state()
             self._log_action("Campaign resumed")
-            if self.state.window_send_mode == "Sequential" and not self._campaign_workers and self._campaign_worker_queue:
+            if self.state.window_send_mode == "Sequential" and not self._campaign_running_workers and self._campaign_worker_queue:
                 self._start_next_campaign_worker()
             return
         self._campaign_paused = True
@@ -7063,12 +7549,42 @@ class DashboardPage(QWidget):
         self._update_campaign_action_state()
         self._log_action("Campaign cancel requested")
 
+    def _request_campaign_workers_stop(self) -> None:
+        """Cooperatively stop every campaign lane before its Qt owner closes."""
+        self._campaign_cancel_event.set()
+        # A paused worker waits on this event. Release it so it can observe
+        # cancellation and leave its QThread normally.
+        self._campaign_pause_event.set()
+        self._campaign_worker_queue.clear()
+        if self._campaign_active:
+            self._campaign_paused = False
+            self._log_action("Campaign stop requested")
+        self._update_campaign_action_state()
+
+    def _campaign_workers_are_running(self) -> bool:
+        for thread in self._campaign_threads:
+            try:
+                if thread.isRunning():
+                    return True
+            except RuntimeError:
+                # Qt may already have deleted a thread wrapper whose finished
+                # signal is queued for list cleanup on the next event cycle.
+                continue
+        return False
+
     def _begin_campaign_send(self, payload: dict[str, object]) -> None:
         if self._campaign_active:
             self.notify("Campaign is already running")
             return
 
-        self._cleanup_campaign_temp_files_now()
+        # Snapshot this performance-critical switch directly from the UI so a
+        # campaign started immediately after toggling it does not wait for the
+        # settings autosave timer.
+        self.state.automatic_no_delay = self.automatic_send_checkbox.isChecked()
+
+        # Old temporary output is deleted in the background; recursive disk
+        # cleanup must never delay the Start button.
+        self._cleanup_campaign_temp_files_async()
         if self._temp_storage_available() < 256 * 1024 * 1024:
             self.notify("Please free some storage space before starting")
             self._log_action("Campaign blocked: not enough free storage space")
@@ -7113,35 +7629,30 @@ class DashboardPage(QWidget):
             random.shuffle(ordered_recipients)
 
         total = len(ordered_recipients)
-        window_count = min(len(sessions), total)
-        per_sender_limit = max(1, int(getattr(self.state, "sender_limit", 300)))
-        if total > window_count * per_sender_limit:
-            QMessageBox.warning(
-                self,
-                "Campaign capacity exceeded",
-                f"The campaign needs {total} sends, but {window_count} window(s) at {per_sender_limit} per sender can only handle {window_count * per_sender_limit}.",
-            )
-            self._log_action("Campaign blocked: sender capacity exceeded")
-            self.notify("Increase browser windows or lower the recipient count")
-            return
-
+        lanes = self._campaign_tab_lanes(sessions)
+        lane_count = min(len(lanes), total)
         self._pending_campaign_payload = payload
         self._campaign_send_log_entries.clear()
         self._campaign_pause_event.set()
         self._campaign_cancel_event.clear()
         self._campaign_active = True
+        session_timer = getattr(self.window(), "_session_check_timer", None)
+        if session_timer is not None:
+            session_timer.stop()
         self._campaign_paused = False
         self._campaign_total = total
         self._campaign_completed = 0
         self._campaign_worker_queue = []
+        self._campaign_running_workers.clear()
         self._campaign_worker_progress.clear()
         self._campaign_worker_totals.clear()
+        self._campaign_lane_parents.clear()
         self.progress_bar.setValue(0)
         self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
         self._update_campaign_action_state()
 
         jobs = self._build_campaign_jobs(
-            sessions[:window_count],
+            lanes[:lane_count],
             ordered_recipients,
             subject_template,
             body_template,
@@ -7151,7 +7662,10 @@ class DashboardPage(QWidget):
             file_name_value,
         )
         self._campaign_worker_queue = list(jobs)
-        self._log_action(f"Campaign ready for {total} recipient(s) using {window_count} browser window(s)")
+        self._log_action(
+            f"Campaign ready for {total} recipient(s) using {lane_count} tab(s) "
+            f"across {len(sessions)} browser window(s)"
+        )
         self.notify("Sending campaign")
         # The Campaign tab already exposes the progress bar and sent/remaining
         # count. Keep the workspace visible while workers are running.
@@ -7184,18 +7698,9 @@ class DashboardPage(QWidget):
             self._refresh_campaign_action_state()
             return
 
-        reply = QMessageBox.question(
-            self,
-            "Start Campaign",
-            "Start sending the campaign now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            self._log_action("Campaign start cancelled by user")
-            return
-
-        recipients = payload["recipients"]
+        # The Start Campaign button is the user's explicit confirmation.
+        # Begin immediately after validation so a native modal cannot block
+        # or delay parallel workers.
         if not self._usable_browser_sessions():
             self._log_action("Campaign requested: launching browser windows first")
             self._pending_campaign_payload = payload
@@ -7220,18 +7725,36 @@ class DashboardPage(QWidget):
             return self._html_to_plain_text(body_html)
         return ""
 
-    def _gmail_compose_url(self, recipient: str, subject: str, body_text: str) -> str:
-        return (
-            "https://mail.google.com/mail/?view=cm&fs=1"
-            f"&to={quote_plus(recipient)}"
-            f"&su={quote_plus(subject)}"
-            f"&body={quote_plus(body_text)}"
+    def _gmail_compose_url(self, recipient: str = "", subject: str = "", body_text: str = "") -> str:
+        # Compose strictly through Gmail's URL. The nonce is important when a
+        # duplicate recipient has the same subject and body: it forces Gmail
+        # to process the second compose navigation as a distinct message.
+        query = urlencode(
+            {
+                "view": "cm",
+                "fs": "1",
+                "to": recipient,
+                "su": subject,
+                "body": body_text,
+                "zx": secrets.token_hex(8),
+            }
         )
+        return f"https://mail.google.com/mail/u/0/?{query}"
 
-    def _browser_cdp_url(self, session: BrowserSessionHandle) -> str:
+    def _browser_cdp_url(self, session: BrowserSessionHandle | BrowserTabHandle) -> str:
         if session.debug_port is None:
             raise RuntimeError("Browser session does not expose a CDP port.")
         return f"http://127.0.0.1:{session.debug_port}"
+
+    @staticmethod
+    def _browser_debug_endpoint_alive(session: BrowserSessionHandle | BrowserTabHandle) -> bool:
+        if session.debug_port is None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", int(session.debug_port)), timeout=0.5):
+                return True
+        except OSError:
+            return False
 
     def _render_html_to_jpg(self, html_content: str, output_path: Path) -> None:
         ensure_external_dependencies()
@@ -7522,6 +8045,53 @@ class DashboardPage(QWidget):
             except Exception:
                 continue
 
+    def _dismiss_gmail_confidential_mode(self, page) -> bool:
+        """Cancel Gmail's asynchronously restored confidential-mode dialog."""
+        try:
+            titles = page.get_by_text("Confidential mode", exact=True)
+            for index in range(titles.count()):
+                title = titles.nth(index)
+                if not title.is_visible():
+                    continue
+                dialog = title.locator('xpath=ancestor::*[@role="dialog"][1]')
+                cancel = dialog.get_by_role("button", name=re.compile(r"^Cancel$", re.IGNORECASE))
+                if cancel.count() and cancel.first.is_visible():
+                    cancel.first.click(timeout=3000)
+                else:
+                    page.keyboard.press("Escape")
+                page.wait_for_timeout(250)
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _open_fresh_gmail_compose(self, page) -> None:
+        """Open a new inline Compose window through Gmail's own UI."""
+        compose_selectors = (
+            'div.z0 div[role="button"][gh="cm"]',
+            'div.z0 [role="button"][jslog*="20510"]',
+            '[role="button"][gh="cm"]',
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            for selector in compose_selectors:
+                try:
+                    button = page.locator(selector).first
+                    if button.is_visible():
+                        button.click(timeout=3000)
+                        return
+                except Exception:
+                    continue
+            try:
+                button = page.get_by_role("button", name=re.compile(r"^Compose$", re.IGNORECASE)).first
+                if button.is_visible():
+                    button.click(timeout=3000)
+                    return
+            except Exception:
+                pass
+            page.wait_for_timeout(250)
+        raise RuntimeError("Gmail Compose button was not available. Confirm that this browser window is signed in.")
+
     def _fill_gmail_field(self, locator, value: str, label: str) -> None:
         locator.wait_for(state="visible", timeout=10000)
         locator.click()
@@ -7532,6 +8102,84 @@ class DashboardPage(QWidget):
         except Exception as exc:
             if isinstance(exc, RuntimeError):
                 raise
+
+    def _verify_url_composed_email(self, page, recipient: str, subject: str, body_text: str) -> None:
+        """Verify Gmail's visible standalone Compose form after URL prefill."""
+
+        def normalize(value: str) -> str:
+            # Gmail inserts direction markers, non-breaking spaces, and
+            # layout-dependent newlines into otherwise identical field text.
+            cleaned = html.unescape(str(value or ""))
+            cleaned = re.sub(r"[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", cleaned)
+            cleaned = cleaned.replace("\u00a0", " ").replace("\r\n", "\n")
+            return re.sub(r"\s+", " ", cleaned).strip()
+
+        deadline = time.monotonic() + 8
+        target_recipient = normalize(recipient).lower()
+        expected_subject = normalize(subject)
+        expected_body = normalize(body_text)
+        last_state = (False, False, False)
+        while time.monotonic() < deadline:
+            recipient_ready = self._gmail_recipient_is_selected(page, recipient)
+            subject_ready = False
+            body_ready = False
+
+            # Full-screen URL Compose renders its selected recipient as plain
+            # visible text instead of the chip DOM used by inbox Compose.
+            if not recipient_ready and target_recipient:
+                try:
+                    visible_page_text = normalize(page.locator("body").inner_text(timeout=1000)).lower()
+                    recipient_ready = target_recipient in visible_page_text
+                except Exception:
+                    pass
+
+            if not recipient_ready and target_recipient:
+                try:
+                    field_values = page.locator("input, textarea").evaluate_all(
+                        "elements => elements.map(element => element.value || '').join(' ')")
+                    recipient_ready = target_recipient in normalize(str(field_values)).lower()
+                except Exception:
+                    pass
+
+            try:
+                subject_box = self._gmail_subject_input(page)
+                subject_ready = normalize(subject_box.input_value()) == expected_subject
+            except Exception:
+                pass
+
+            body_boxes = page.locator(
+                'div[role="textbox"][aria-label*="Message Body"], '
+                'div[contenteditable="true"][aria-label*="Message Body"]'
+            )
+            try:
+                for index in range(body_boxes.count()):
+                    body_box = body_boxes.nth(index)
+                    if not body_box.is_visible():
+                        continue
+                    actual_body = normalize(
+                        body_box.evaluate("element => element.innerText || element.textContent || ''") or ""
+                    )
+                    # Gmail signatures may follow the campaign body, so the
+                    # expected normalized content only needs to be preserved.
+                    body_ready = bool(expected_body and expected_body in actual_body)
+                    if body_ready:
+                        break
+            except Exception:
+                pass
+
+            last_state = (recipient_ready, subject_ready, body_ready)
+            if recipient_ready and subject_ready and body_ready:
+                return
+            page.wait_for_timeout(250)
+
+        missing = [
+            label
+            for label, ready in zip(("recipient", "subject", "body"), last_state)
+            if not ready
+        ]
+        raise RuntimeError(
+            "Gmail URL Compose verification could not see: " + ", ".join(missing)
+        )
 
     def _verify_gmail_body(self, locator, expected: str) -> None:
         locator.wait_for(state="visible", timeout=10000)
@@ -7580,7 +8228,7 @@ class DashboardPage(QWidget):
 
     def _send_compose_with_playwright(
         self,
-        session: BrowserSessionHandle,
+        session: BrowserSessionHandle | BrowserTabHandle,
         recipient: str,
         subject: str,
         body_text: str,
@@ -7634,7 +8282,7 @@ class DashboardPage(QWidget):
 
     def _send_compose_with_playwright_attachment(
         self,
-        session: BrowserSessionHandle,
+        session: BrowserSessionHandle | BrowserTabHandle,
         recipient: str,
         subject: str,
         body_text: str,
@@ -7650,110 +8298,357 @@ class DashboardPage(QWidget):
             with sync_playwright() as playwright:
                 browser = None
                 last_exc: Exception | None = None
-                for _attempt in range(20):
-                    try:
-                        browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session))
+                # Multiple tabs share one Chrome debugging endpoint. Only the
+                # short CDP handshake is serialized in FIFO order; after
+                # connecting, every tab continues its compose/send work
+                # concurrently. Retry sleeps stay outside the lock so one
+                # temporarily busy connection cannot block all other tabs.
+                connect_deadline = time.monotonic() + 30
+                while time.monotonic() < connect_deadline:
+                    with session.connect_lock:
+                        try:
+                            browser = playwright.chromium.connect_over_cdp(
+                                self._browser_cdp_url(session),
+                                timeout=5000,
+                            )
+                        except Exception as exc:
+                            last_exc = exc
+                    if browser is not None:
                         break
-                    except Exception as exc:
-                        last_exc = exc
-                        time.sleep(0.5)
+                    if not self._browser_debug_endpoint_alive(session):
+                        break
+                    time.sleep(0.25)
                 if browser is None:
-                    if last_exc is not None:
-                        raise last_exc
-                    raise RuntimeError("Unable to connect to Gmail browser.")
+                    detail = f" ({last_exc})" if last_exc is not None else ""
+                    if self._browser_debug_endpoint_alive(session):
+                        raise RuntimeError(
+                            f"Gmail browser automation was temporarily busy; retrying.{detail}"
+                        )
+                    raise CampaignBrowserClosedError(
+                        f"Unable to connect to the Gmail browser; campaign stopped.{detail}"
+                    )
 
-                if not browser.contexts:
-                    raise RuntimeError("No browser context was available for Gmail automation.")
-                context = browser.contexts[0]
-                pages = context.pages
-                page = next((item for item in pages if "mail.google.com" in (item.url or "")), None)
-                page = page or (pages[0] if pages else context.new_page())
+                pages = []
+                required_page_count = session.tab_index if isinstance(session, BrowserTabHandle) else 1
+                page_deadline = time.monotonic() + 10
+                while time.monotonic() < page_deadline:
+                    pages = [
+                        page
+                        for context in browser.contexts
+                        for page in context.pages
+                        if not page.is_closed()
+                    ]
+                    if len(pages) >= required_page_count:
+                        break
+                    time.sleep(0.25)
+                if len(pages) < required_page_count:
+                    # Never call context.new_page() here. On macOS Chrome can
+                    # keep the process alive after its last window is closed;
+                    # creating a page would unexpectedly reopen the browser.
+                    if isinstance(session, BrowserTabHandle):
+                        raise CampaignBrowserClosedError(
+                            f"{session.title} was closed; its campaign queue stopped."
+                        )
+                    raise CampaignBrowserClosedError("Gmail browser window was closed; campaign stopped.")
+                if isinstance(session, BrowserTabHandle):
+                    # context.pages preserves creation order. Each lane always
+                    # reconnects to the same configured Gmail tab on retries.
+                    page = pages[session.tab_index - 1]
+                else:
+                    page = next((item for item in pages if "mail.google.com" in (item.url or "")), None)
+                if page is None:
+                    # Validate the existing controlled browser tab before any
+                    # Compose work. This does not create a page or window.
+                    page = pages[0]
+                    page.set_default_timeout(10000)
+                    page.set_default_navigation_timeout(15000)
+                    page.goto(
+                        "https://mail.google.com/mail/u/0/#inbox",
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    current_url = str(page.url or "")
+                    if "mail.google.com" not in current_url:
+                        raise RuntimeError(
+                            f"{session.title} is not signed in to Gmail. Sign in inside that EzyMailer browser window, then start again."
+                        )
                 page.set_default_timeout(10000)
                 page.set_default_navigation_timeout(15000)
                 self._gmail_page_from_session(page)
-                page.bring_to_front()
                 if log_steps:
                     self._log_action("Gmail page ready")
 
-                # Use the already authenticated Gmail page. Do not redirect
-                # during login or between recipients.
-                page.wait_for_timeout(400)
-                self._close_stale_gmail_compose(page)
-                compose_button = page.locator(
-                    'div.z0 div[role="button"][gh="cm"], '
-                    'div.z0 [role="button"][jslog*="20510"]'
-                ).first
-                try:
-                    compose_button.wait_for(state="visible", timeout=10000)
-                    compose_button.click()
-                except Exception:
-                    compose_button = page.get_by_role("button", name=re.compile(r"^Compose$", re.IGNORECASE)).first
-                    compose_button.click(timeout=10000)
+                # Compose exclusively through the Gmail URL. Recipient,
+                # subject, and body are encoded into the navigation itself;
+                # no Compose button or field is clicked to create the draft.
+                page.goto(
+                    self._gmail_compose_url(recipient, subject, body_text),
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+                current_url = str(page.url or "")
+                if "mail.google.com" not in current_url:
+                    if "accounts.google.com" in current_url or "workspace.google.com" in current_url:
+                        raise RuntimeError(
+                            f"{session.title} is not signed in to Gmail. Sign in in that browser window, then start again."
+                        )
+                    raise RuntimeError(
+                        f"{session.title} did not open Gmail. Check the browser session, then start again."
+                    )
                 if log_steps:
-                    self._log_action("Gmail compose opened")
+                    self._log_action("Gmail compose opened from URL")
 
-                # Never carry Gmail's optional Confidential mode into campaign
-                # messages. Close the dialog if Gmail restores stale UI state.
-                try:
-                    confidential_title = page.get_by_text("Confidential mode", exact=True)
-                    if confidential_title.is_visible():
-                        page.get_by_role("button", name=re.compile(r"^Cancel$", re.IGNORECASE)).click(timeout=3000)
-                except Exception:
-                    pass
+                # Gmail may restore this dialog asynchronously from draft
+                # state even though EzyMailer never enables the feature.
+                self._dismiss_gmail_confidential_mode(page)
 
-                page = self._expand_gmail_compose(page)
-                self._ensure_gmail_recipient_selected(page, recipient)
+                self._verify_url_composed_email(page, recipient, subject, body_text)
                 if log_steps:
-                    self._log_action("Recipient entered")
+                    self._log_action("Recipient, subject, and body loaded from URL")
 
-                subject_box = self._gmail_subject_input(page)
-                self._fill_gmail_field(subject_box, subject, "subject")
-                if log_steps:
-                    self._log_action("Subject entered")
-
-                body_box = page.locator('div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][aria-label*="Message Body"]').first
-                self._verify_gmail_body(body_box, body_text)
-                if log_steps:
-                    self._log_action("Body entered")
+                send_selectors = (
+                    'div.dC > div[role="button"][data-tooltip^="Send"]',
+                    'div.dC > div[role="button"][aria-label^="Send"]',
+                    'div.dC div[role="button"][aria-label^="Send"]',
+                    'div.dC div[role="button"][data-tooltip^="Send"]',
+                    'div[role="button"].aoO.v7',
+                    'div[role="button"][aria-label^="Send"]',
+                )
+                send_button = self._gmail_visible_control(page, send_selectors, timeout=10000)
 
                 if attachment_paths:
-                    attach_candidates = page.locator('input[type="file"]')
-                    if attach_candidates.count() == 0:
-                        attach_button = page.get_by_role("button", name=re.compile(r"Attach files", re.IGNORECASE))
-                        attach_button.first.click(timeout=8000)
-                        attach_candidates = page.locator('input[type="file"]')
-                    if log_steps:
-                        self._log_action("Attachment picker ready")
                     files_to_attach = [str(path) for path in attachment_paths if path.exists()]
                     if not files_to_attach:
                         raise RuntimeError("No attachment files were generated.")
-                    attach_candidates.last.set_input_files(files_to_attach)
+                    self._attach_files_to_gmail(page, send_button, files_to_attach)
                     if log_steps:
                         self._log_action(
-                            "Attachment selected: " + ", ".join(Path(path).name for path in files_to_attach)
+                            "Attachment uploaded: " + ", ".join(Path(path).name for path in files_to_attach)
                         )
                     self._wait_for_gmail_attachment_layout(page)
 
                 page.wait_for_timeout(1000)
-                send_button = self._gmail_visible_control(
-                    page,
-                    (
-                        'div.dC div[role="button"][aria-label^="Send"]',
-                        'div.dC div[role="button"][data-tooltip^="Send"]',
-                        'div.dC [role="button"]',
-                    ),
-                    timeout=10000,
-                )
+                self._dismiss_gmail_confidential_mode(page)
+                # Attachment rendering can replace portions of Compose. Find
+                # the primary control again before sending the final draft.
+                send_button = self._gmail_visible_control(page, send_selectors, timeout=10000)
+                send_button.scroll_into_view_if_needed(timeout=3000)
+                # At this point attachment upload is complete, so use a normal
+                # actionability-checked browser click on Gmail's primary Send
+                # control. This generates the same trusted event as a user.
                 send_button.click(timeout=10000)
-                try:
-                    send_button.wait_for(state="hidden", timeout=7000)
-                except Exception as exc:
-                    raise RuntimeError("Gmail did not finish sending the message.") from exc
-                page.wait_for_timeout(500)
+                send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=4)
+                if not send_confirmed:
+                    if self._confirm_gmail_send_dialog(page, timeout=3):
+                        send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=5)
+                if not send_confirmed:
+                    # Full-screen Gmail advertises Command+Enter on macOS and
+                    # Control+Enter elsewhere. Use that native shortcut only
+                    # while the original compose form is still visibly open.
+                    shortcut = "Meta+Enter" if IS_MAC else "Control+Enter"
+                    page.keyboard.press(shortcut)
+                    send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=4)
+                    if not send_confirmed:
+                        if self._confirm_gmail_send_dialog(page, timeout=3):
+                            send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=5)
+                if not send_confirmed:
+                    # Re-resolve the button because Gmail may replace toolbar
+                    # nodes after an attempted action. A fresh DOM click is the
+                    # final compatibility fallback for delegated handlers.
+                    send_button = self._gmail_visible_control(page, send_selectors, timeout=5000)
+                    send_button.evaluate(
+                        """
+                        element => {
+                            element.focus();
+                            element.dispatchEvent(new MouseEvent('mousedown', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            }));
+                            element.dispatchEvent(new MouseEvent('mouseup', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            }));
+                            element.click();
+                        }
+                        """
+                    )
+                    send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=8)
+                    if not send_confirmed:
+                        if self._confirm_gmail_send_dialog(page, timeout=3):
+                            send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=5)
+                if not send_confirmed:
+                    raise RuntimeError("Gmail did not finish sending the message.")
+                if not page.is_closed():
+                    page.wait_for_timeout(300)
                 if log_steps:
                     self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(f"Gmail automation timed out: {exc}") from exc
+
+    def _gmail_compose_root(self, page, send_button):
+        """Return the active Compose container associated with a Send button."""
+        try:
+            roots = send_button.locator('xpath=ancestor::*[.//input[@type="file"]][1]')
+            if roots.count():
+                return roots.first
+        except Exception:
+            pass
+        return page.locator("body")
+
+    def _attach_files_to_gmail(self, page, send_button, file_paths: list[str]) -> None:
+        """Attach files only to the Compose window that owns send_button."""
+        compose_root = self._gmail_compose_root(page, send_button)
+        file_inputs = compose_root.locator('input[type="file"][name="Filedata"]')
+        if file_inputs.count() == 0:
+            file_inputs = compose_root.locator('input[type="file"]')
+
+        if file_inputs.count():
+            # Gmail keeps a hidden Filedata input inside each Compose window.
+            # Scoping through the Send button prevents selecting a stale input
+            # belonging to an old or minimized draft.
+            file_inputs.last.set_input_files(file_paths, timeout=15000)
+        else:
+            attach_button = self._gmail_visible_control(
+                page,
+                (
+                    'div[role="button"][command="Files"]',
+                    'div[role="button"][aria-label*="Attach files" i]',
+                    'div[role="button"][data-tooltip*="Attach files" i]',
+                ),
+                timeout=10000,
+            )
+            try:
+                with page.expect_file_chooser(timeout=10000) as chooser_info:
+                    attach_button.click(timeout=8000, force=True)
+                chooser_info.value.set_files(file_paths, timeout=15000)
+            except Exception as chooser_error:
+                raise RuntimeError("Gmail attachment picker did not accept the generated file.") from chooser_error
+
+        self._wait_for_gmail_attachment_upload(page, compose_root, file_paths, timeout=90)
+
+    def _wait_for_gmail_attachment_upload(self, page, compose_root, file_paths: list[str], *, timeout: float) -> None:
+        """Wait until every selected attachment is visible and no longer uploading."""
+        expected_names = [Path(path).name for path in file_paths]
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        ready_streak = 0
+        last_visible_names: set[str] = set()
+        upload_in_progress = False
+        while time.monotonic() < deadline:
+            visible_names: set[str] = set()
+            for file_name in expected_names:
+                for search_root in (compose_root, page):
+                    try:
+                        # Gmail can render the finished attachment row outside
+                        # the toolbar ancestor that owns its hidden Filedata
+                        # input. Search that compose scope first, then the page;
+                        # generated filenames are unique to this draft.
+                        matches = search_root.get_by_text(file_name, exact=False)
+                        if any(matches.nth(index).is_visible() for index in range(matches.count())):
+                            visible_names.add(file_name)
+                            break
+                    except Exception:
+                        continue
+
+            if len(visible_names) != len(expected_names):
+                try:
+                    # Text locators can miss Gmail attachment names when the
+                    # filename and rendered size are split across descendants.
+                    # Visible Gmail text still exposes the full generated name.
+                    page_text = str(page.locator("body").inner_text(timeout=1000) or "")
+                    visible_names.update(name for name in expected_names if name in page_text)
+                except Exception:
+                    pass
+
+            upload_in_progress = False
+            try:
+                # Do not use Gmail's `.vX` class here. It is the attachment's
+                # remove control and stays visible after a successful upload.
+                # Only explicit busy/progress semantics are safe completion
+                # blockers across Gmail's changing generated class names.
+                progress = compose_root.locator(
+                    '[role="progressbar"]:visible, [aria-busy="true"]:visible, '
+                    '[aria-label*="Uploading" i]:visible, '
+                    '[data-tooltip*="Uploading" i]:visible, '
+                    '[title*="Uploading" i]:visible'
+                )
+                upload_in_progress = progress.count() > 0
+            except Exception:
+                pass
+
+            if len(visible_names) == len(expected_names) and not upload_in_progress:
+                # Require a short stable period so Gmail has time to finish
+                # replacing the temporary upload row with the final chip.
+                ready_streak += 1
+                if ready_streak >= 4:
+                    return
+            else:
+                ready_streak = 0
+            last_visible_names = visible_names
+            page.wait_for_timeout(250)
+
+        missing = [name for name in expected_names if name not in last_visible_names]
+        if missing:
+            detail = ", ".join(missing)
+        elif upload_in_progress:
+            detail = "Gmail still reports an upload in progress"
+        else:
+            detail = ", ".join(expected_names)
+        raise RuntimeError(f"Gmail did not finish attaching: {detail}")
+
+    def _wait_for_gmail_send_confirmation(self, page, send_button, *, timeout: float) -> bool:
+        """Confirm one send without immediately clicking the draft again."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            if page.is_closed():
+                raise CampaignBrowserClosedError(
+                    "Gmail browser window was closed before the send could be confirmed."
+                )
+            try:
+                if not send_button.is_visible():
+                    return True
+            except Exception:
+                if page.is_closed():
+                    raise CampaignBrowserClosedError(
+                        "Gmail browser window was closed before the send could be confirmed."
+                    )
+                # A transient CDP/DOM lookup failure is not proof that Gmail
+                # accepted the message; keep waiting for a positive signal.
+
+            try:
+                sent_status = page.get_by_text(re.compile(r"^Message sent\b", re.IGNORECASE))
+                for index in range(sent_status.count()):
+                    if sent_status.nth(index).is_visible():
+                        return True
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+        return False
+
+    def _confirm_gmail_send_dialog(self, page, *, timeout: float) -> bool:
+        """Accept Gmail's optional keyboard-shortcut confirmation dialog."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            try:
+                dialogs = page.locator('[role="dialog"], [role="alertdialog"]')
+                for index in range(dialogs.count()):
+                    dialog = dialogs.nth(index)
+                    if not dialog.is_visible():
+                        continue
+                    text = str(dialog.inner_text(timeout=1000) or "")
+                    if not re.search(r"send (this )?message|confirm.*send", text, re.IGNORECASE):
+                        continue
+                    buttons = dialog.get_by_role("button", name=re.compile(r"^Send$", re.IGNORECASE))
+                    for button_index in range(buttons.count()):
+                        button = buttons.nth(button_index)
+                        if button.is_visible():
+                            button.click(timeout=3000)
+                            return True
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+        return False
 
     def _gmail_visible_control(self, page, selectors: tuple[str, ...], *, timeout: int = 10000):
         deadline = time.monotonic() + (timeout / 1000)
@@ -7921,6 +8816,8 @@ class DashboardPage(QWidget):
         selectors = (
             '.agP [email], .agP [data-hovercard-id], .agP [data-email], .agP [aria-label*="@"]',
             '[role="dialog"] [email], [role="dialog"] [data-hovercard-id], [role="dialog"] [data-email]',
+            '.vR [email], .vR [data-hovercard-id], .vR [data-email]',
+            '[role="button"][email], [role="button"][data-hovercard-id], [role="button"][data-email]',
         )
         for selector in selectors:
             try:
@@ -7947,35 +8844,34 @@ class DashboardPage(QWidget):
         return False
 
     def _ensure_gmail_recipient_selected(self, page, recipient: str) -> None:
-        """Commit an address or retry when autocomplete consumed the first key."""
+        """Commit one address without ever filling the same recipient twice."""
         recipient_box = self._gmail_recipient_input(page)
         if self._gmail_recipient_is_selected(page, recipient):
             return
 
-        for _attempt in range(2):
-            recipient_box.click()
-            recipient_box.fill(recipient)
+        recipient_box.click()
+        recipient_box.fill(recipient)
+        for _attempt in range(3):
             recipient_box.press("Enter")
             page.wait_for_timeout(350)
             if self._gmail_recipient_is_selected(page, recipient):
                 return
 
-            # Gmail can leave the typed address in the editor when a contact
-            # suggestion consumes the first Enter key.
+            # A committed Gmail recipient clears the editor. This is also a
+            # reliable fallback for standalone Compose layouts whose chip DOM
+            # differs from the regular inbox Compose window.
             try:
-                if recipient_box.input_value().strip():
-                    recipient_box.press("Enter")
-                    page.wait_for_timeout(350)
-                    if self._gmail_recipient_is_selected(page, recipient):
-                        return
+                if not recipient_box.input_value().strip():
+                    return
             except Exception:
-                pass
+                if self._gmail_recipient_is_selected(page, recipient):
+                    return
 
         raise RuntimeError("Gmail could not select the recipient address.")
 
     def _maybe_send_with_playwright(
         self,
-        session: BrowserSessionHandle,
+        session: BrowserSessionHandle | BrowserTabHandle,
         recipient: str,
         subject: str,
         body_text: str,
@@ -8685,20 +9581,26 @@ class DashboardPage(QWidget):
                     {
                         "browser_mode": self.state.browser_mode,
                         "profile_dir": str(session.profile_dir) if session.profile_dir else "",
+                        "tab_count": session.tab_count,
                     },
                 )
             except Exception:
                 pass
-        self._log_action(f"Started {len(launched)} browser window(s)")
-        self.notify(f"Launch started for {len(launched)} browser window(s)")
+        total_tabs = sum(session.tab_count for session in launched)
+        self._log_action(f"Started {len(launched)} browser window(s) with {total_tabs} Gmail tab(s)")
+        self.notify(f"Launch started for {len(launched)} window(s) and {total_tabs} tab(s)")
         self.window().launch_loader.set_message(
             "Getting Gmail ready",
             "Opening your email windows. This will only take a moment.",
             status_prefix="Getting ready",
         )
         if self._pending_campaign_payload:
-            payload = self._pending_campaign_payload
-            QTimer.singleShot(800, lambda p=payload: self._execute_campaign_send(p))
+            # A newly launched profile may still require interactive Google
+            # authentication. Never start sending on a fixed timer while the
+            # user is entering credentials or completing a challenge.
+            self._pending_campaign_payload = None
+            self._log_action("Campaign waiting for Gmail sign-in")
+            self.notify("Sign in to Gmail in every window, then press Start Campaign again")
 
     def _clear_subject_body(self) -> None:
         self._subject_body_save_timer.stop()
@@ -9149,18 +10051,18 @@ class DashboardPage(QWidget):
 
         source_text = self.pending_emails_editor.toPlainText()
         candidates = self._extract_email_candidates(source_text)
+        unique_candidates = self._deduplicate_email_candidates(candidates)
         total_count = len(candidates)
         self.data_summary_labels["total"].setText(str(total_count))
+        self.data_summary_labels["duplicates"].setText(str(total_count - len(unique_candidates)))
 
         if self.state.pending_emails_validated:
             accepted_count = len(self.state.pending_recipients)
             self.data_summary_labels["valid"].setText(str(accepted_count))
             self.data_summary_labels["filter_count"].setText(str(accepted_count))
-            self.data_summary_labels["duplicates"].setText("0")
         else:
             self.data_summary_labels["valid"].setText("0")
             self.data_summary_labels["filter_count"].setText("0")
-            self.data_summary_labels["duplicates"].setText("0")
 
     def _persist_pending_emails_state(self) -> None:
         if self._workspace_loading:
@@ -9292,8 +10194,26 @@ class DashboardPage(QWidget):
             self._workspace_loading = False
             self._sync_subject_body_widgets()
 
+    @staticmethod
+    def _clear_plain_text_editor(editor: QPlainTextEdit) -> None:
+        signals_were_blocked = editor.blockSignals(True)
+        try:
+            # Avoid QWidgetTextControl.clear(), which can rebuild internal Qt
+            # signal connections while campaign QObjects are being destroyed.
+            # Removing the selected document text keeps the existing control
+            # and its connections intact.
+            cursor = editor.textCursor()
+            cursor.select(QTextCursor.Document)
+            cursor.removeSelectedText()
+            editor.setTextCursor(cursor)
+        finally:
+            editor.blockSignals(signals_were_blocked)
+
     def _clear_pending_emails(self) -> None:
-        self.pending_emails_editor.clear()
+        if self._campaign_active or self._campaign_threads:
+            self.notify("Cancel the campaign and wait for all sending tabs to stop before clearing recipients")
+            return
+        self._clear_plain_text_editor(self.pending_emails_editor)
         self.state.pending_recipients = []
         self.state.pending_emails_validated = False
         _delete_ui_state(LOCAL_PENDING_EMAILS_STATE_KEY)
@@ -9315,6 +10235,43 @@ class DashboardPage(QWidget):
             if email:
                 candidates.append(email.lower())
         return candidates
+
+    def _deduplicate_email_candidates(self, emails: list[str]) -> list[str]:
+        """Return case-insensitive unique recipients while preserving input order."""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for value in emails:
+            email = str(value or "").strip().lower()
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            unique.append(email)
+        return unique
+
+    @staticmethod
+    def _validate_email_candidates(
+        candidates: list[str],
+        gmail_only: bool,
+    ) -> tuple[list[str], list[str], int]:
+        """Filter invalid domains while retaining duplicate recipient rows."""
+        accepted: list[str] = []
+        rejected: list[str] = []
+        seen: set[str] = set()
+        duplicates = 0
+        for email in candidates:
+            domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
+            allowed = (domain == "gmail.com") if gmail_only else bool(domain)
+            if not allowed:
+                rejected.append(email)
+                continue
+            if email in seen:
+                duplicates += 1
+            else:
+                seen.add(email)
+            # A duplicate is still a separate campaign row and must receive
+            # its own email. The count remains visible for information only.
+            accepted.append(email)
+        return accepted, rejected, duplicates
 
     def _load_pending_emails_from_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -9370,13 +10327,9 @@ class DashboardPage(QWidget):
                 else:
                     rows.extend(self._extract_email_candidates(handle.read()))
 
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for email in rows:
-            if email not in seen:
-                seen.add(email)
-                deduped.append(email)
-        return deduped
+        # Preserve the source list exactly. Duplicate removal is an explicit
+        # validation action and must not happen when the user chooses No.
+        return rows
 
     def _prompt_validate_pending_emails(self) -> None:
         reply = QMessageBox.question(
@@ -9410,22 +10363,7 @@ class DashboardPage(QWidget):
             candidates = self._extract_email_candidates(source_text)
             gmail_only = self.standard_email_radio.isChecked()
 
-            accepted: list[str] = []
-            rejected: list[str] = []
-            seen: set[str] = set()
-            duplicates = 0
-
-            for email in candidates:
-                domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
-                allowed = (domain == "gmail.com") if gmail_only else bool(domain)
-                if not allowed:
-                    rejected.append(email)
-                    continue
-                if email in seen:
-                    duplicates += 1
-                    continue
-                seen.add(email)
-                accepted.append(email)
+            accepted, rejected, duplicates = self._validate_email_candidates(candidates, gmail_only)
 
             self.state.pending_recipients = accepted[:]
             self.state.pending_emails_validated = True
@@ -9443,7 +10381,8 @@ class DashboardPage(QWidget):
             mode_label = "gmail.com only" if gmail_only else "mixed domains"
             self._log_action(
                 f"Validated {len(candidates)} email candidate(s) in {mode_label}: "
-                f"{len(accepted)} valid, {len(rejected)} filtered out, {duplicates} duplicates"
+                f"{len(accepted)} valid, {len(rejected)} filtered out, "
+                f"{duplicates} duplicate row(s) retained"
             )
             self.notify(f"{len(accepted)} valid email(s) ready")
         finally:
@@ -9468,16 +10407,64 @@ class DashboardPage(QWidget):
             self.session_list.setItemWidget(list_item, row_widget)
 
     def _refresh_activity(self) -> None:
-        if not self.state.activity_log:
-            self.activity_log_view.setPlainText("[--:--:--] No activity yet.")
-        else:
-            lines = "\n".join(self.state.activity_log[-30:][::-1])
-            self.activity_log_view.setPlainText(lines)
+        self._sync_plain_log_view(
+            self.activity_log_view,
+            self.state.activity_log,
+            "_rendered_activity_log_entries",
+            "[--:--:--] No activity yet.",
+            30,
+        )
+        self._sync_plain_log_view(
+            self.send_log_view,
+            self._campaign_send_log_entries,
+            "_rendered_send_log_entries",
+            "[--:--:--] No send events yet.",
+            80,
+        )
 
-        if not self._campaign_send_log_entries:
-            self.send_log_view.setPlainText("[--:--:--] No send events yet.")
+    def _sync_plain_log_view(
+        self,
+        view: QPlainTextEdit,
+        entries: list[str],
+        rendered_attribute: str,
+        placeholder: str,
+        maximum_lines: int,
+    ) -> None:
+        """Append only the log delta; never rewrite a live QTextDocument."""
+        desired = tuple(str(item) for item in entries[-maximum_lines:])
+        rendered = tuple(getattr(self, rendered_attribute, ()))
+        if desired == rendered:
+            return
+
+        overlap = 0
+        maximum_overlap = min(len(rendered), len(desired))
+        for size in range(maximum_overlap, 0, -1):
+            if rendered[-size:] == desired[:size]:
+                overlap = size
+                break
+
+        if not desired:
+            view.clear()
+            view.appendPlainText(placeholder)
+        elif overlap == 0:
+            # Resets and workspace switches are infrequent. Rebuild only the
+            # bounded visible window, using the plain-text append path.
+            view.clear()
+            view.appendPlainText("\n".join(desired))
         else:
-            self.send_log_view.setPlainText("\n".join(self._campaign_send_log_entries[-80:]))
+            new_entries = desired[overlap:]
+            if new_entries:
+                view.appendPlainText("\n".join(new_entries))
+
+        setattr(self, rendered_attribute, desired)
+        # Coalesce parallel tab updates into one post-layout scroll operation.
+        if not self._log_scroll_timer.isActive():
+            self._log_scroll_timer.start()
+
+    def _scroll_runtime_logs_to_end(self) -> None:
+        for view in (self.activity_log_view, self.send_log_view):
+            scrollbar = view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _refresh_controls(self) -> None:
         self.incognito_button.setChecked(self.state.browser_mode == "Incognito")
@@ -9499,6 +10486,12 @@ class DashboardPage(QWidget):
         self.retry_enable_checkbox.blockSignals(True)
         self.retry_enable_checkbox.setChecked(bool(getattr(self.state, "retry_enabled", True)))
         self.retry_enable_checkbox.blockSignals(False)
+        self.automatic_send_checkbox.blockSignals(True)
+        self.automatic_send_checkbox.setChecked(
+            bool(getattr(self.state, "automatic_no_delay", True))
+        )
+        self.automatic_send_checkbox.blockSignals(False)
+        self._sync_automatic_sending_ui()
         self.delay_fixed_radio.blockSignals(True)
         self.delay_random_radio.blockSignals(True)
         self.delay_human_radio.blockSignals(True)
@@ -9539,16 +10532,10 @@ class DashboardPage(QWidget):
     def _log_action(self, message: str) -> None:
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.state.activity_log.append(f"[{timestamp}] {message}")
-        if self.state.logged_in and self.state.username:
-            try:
-                record_activity(
-                    self.state.username,
-                    message,
-                    category="ui",
-                    user_id=None,
-                )
-            except Exception:
-                pass
+        if len(self.state.activity_log) > 1000:
+            del self.state.activity_log[:-1000]
+        # Activity is intentionally local. Campaign actions must never create
+        # remote database requests or one reporting thread per event.
         self._refresh_activity()
         if callable(self.notify):
             self.notify(message)
@@ -9565,7 +10552,8 @@ class DashboardPage(QWidget):
         dot.setObjectName("sessionDot")
         label = QLabel(session.title)
         label.setObjectName("sessionTitleSmall")
-        state = QLabel(f"{session.mode} - {session.status}")
+        tab_label = "tab" if session.tab_count == 1 else "tabs"
+        state = QLabel(f"{session.mode} - {session.status} - {session.tab_count} {tab_label}")
         state.setObjectName("sessionState")
         count = QLabel(f"({session.send_completed}/{session.send_total})")
         count.setObjectName("sessionState")
@@ -9597,13 +10585,32 @@ class DashboardPage(QWidget):
 
     def refresh(self) -> None:
         self.window_spin.setValue(self.state.window_count)
+        self.tab_spin.setValue(self.state.tab_count)
         self._refresh_controls()
         self._sync_subject_body_widgets()
         self._refresh_sessions()
         self._refresh_activity()
 
 
+class EzyMailerApplication(QApplication):
+    """Keep the Qt event loop alive while campaign QThreads shut down."""
+
+    main_window: "MainWindow | None" = None
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Quit:
+            window = self.main_window
+            dashboard = getattr(window, "dashboard_page", None) if window is not None else None
+            if dashboard is not None and dashboard._campaign_workers_are_running():
+                window._defer_until_campaign_workers_stop("close")
+                event.accept()
+                return True
+        return super().event(event)
+
+
 class MainWindow(QMainWindow):
+    session_check_finished = Signal(bool, str)
+
     def _system_is_dark(self) -> bool:
         palette = QApplication.palette()
         return palette.window().color().lightness() < 150
@@ -9619,9 +10626,16 @@ class MainWindow(QMainWindow):
         self._browser_bootstrap_worker: BrowserBootstrapWorker | None = None
         self._browser_bootstrap_timer: QTimer | None = None
         self._browser_bootstrap_running = False
+        self._session_check_token_in_flight: str | None = None
+        self.session_check_finished.connect(self._on_active_login_session_checked)
         self._session_check_timer = QTimer(self)
         self._session_check_timer.setInterval(30000)
         self._session_check_timer.timeout.connect(self._check_active_login_session)
+        self._pending_app_transition: str | None = None
+        self._pending_logout_reason = ""
+        self._campaign_stop_timer = QTimer(self)
+        self._campaign_stop_timer.setInterval(100)
+        self._campaign_stop_timer.timeout.connect(self._complete_pending_app_transition)
         self._scale = _compute_layout_scale(QApplication.primaryScreen())
         self._text_scale = _compute_text_scale(QApplication.primaryScreen())
         self._centered_once = False
@@ -10532,13 +11546,61 @@ class MainWindow(QMainWindow):
     def _check_active_login_session(self) -> None:
         if not self.state.logged_in or not self.state.auth_token:
             return
-        try:
-            api_get_settings(self.state.auth_token)
-        except urllib.error.HTTPError as exc:
-            if exc.code in {401, 403}:
-                self._perform_logout(confirm=False, reason="This account was signed in on another device.")
-        except Exception:
-            pass
+        if self._session_check_token_in_flight is not None:
+            return
+
+        auth_token = self.state.auth_token
+        self._session_check_token_in_flight = auth_token
+
+        def check_session() -> None:
+            invalid_session = False
+            try:
+                api_get_settings(auth_token, timeout=3.0)
+            except urllib.error.HTTPError as exc:
+                invalid_session = exc.code in {401, 403}
+            except Exception:
+                pass
+            self.session_check_finished.emit(invalid_session, auth_token)
+
+        threading.Thread(
+            target=check_session,
+            name="ezymailer-session-check",
+            daemon=True,
+        ).start()
+
+    def _on_active_login_session_checked(self, invalid_session: bool, auth_token: str) -> None:
+        if self._session_check_token_in_flight == auth_token:
+            self._session_check_token_in_flight = None
+        if invalid_session and self.state.logged_in and self.state.auth_token == auth_token:
+            self._perform_logout(confirm=False, reason="This account was signed in on another device.")
+
+    def _defer_until_campaign_workers_stop(self, transition: str, reason: str = "") -> None:
+        self._pending_app_transition = transition
+        self._pending_logout_reason = reason
+        self._session_check_timer.stop()
+        self.dashboard_page._request_campaign_workers_stop()
+        # Closing the controlled browser endpoints interrupts any Playwright
+        # navigation/upload wait, allowing each worker to unwind promptly.
+        self.dashboard_page._terminate_browser_sessions()
+        self.show_launch_loader(
+            "Stopping campaign safely",
+            "Waiting for active sending tabs to finish before closing.",
+        )
+        if not self._campaign_stop_timer.isActive():
+            self._campaign_stop_timer.start()
+
+    def _complete_pending_app_transition(self) -> None:
+        if self.dashboard_page._campaign_workers_are_running():
+            return
+        self._campaign_stop_timer.stop()
+        transition = self._pending_app_transition
+        reason = self._pending_logout_reason
+        self._pending_app_transition = None
+        self._pending_logout_reason = ""
+        if transition == "close":
+            self.close()
+        elif transition == "logout":
+            self._perform_logout(confirm=False, reason=reason)
 
     def _perform_logout(self, *, confirm: bool, reason: str = "") -> None:
         if confirm and self.state.logged_in and self.state.username:
@@ -10551,7 +11613,11 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
+        if self.dashboard_page._campaign_workers_are_running():
+            self._defer_until_campaign_workers_stop("logout", reason)
+            return
         self._session_check_timer.stop()
+        self._session_check_token_in_flight = None
         self._last_login_username = self.state.username
         if self.state.logged_in and self.state.username:
             self.dashboard_page._log_action("User signed out")
@@ -10575,12 +11641,18 @@ class MainWindow(QMainWindow):
         self._perform_logout(confirm=True)
 
     def closeEvent(self, event) -> None:
+        dashboard = getattr(self, "dashboard_page", None)
+        if dashboard is not None and dashboard._campaign_workers_are_running():
+            self._defer_until_campaign_workers_stop("close")
+            event.ignore()
+            return
         try:
             if hasattr(self, "dashboard_page"):
-                self.dashboard_page._handle_campaign_cancel()
+                self.dashboard_page._request_campaign_workers_stop()
                 self.dashboard_page._persist_subject_body_state()
                 self.dashboard_page._persist_attachment_state()
                 self.dashboard_page._persist_sending_settings_state()
+                self.dashboard_page._terminate_browser_sessions()
         except Exception:
             pass
         super().closeEvent(event)
@@ -10592,8 +11664,9 @@ def main() -> int:
     except Exception as exc:
         print(f"Local login API failed to start: {exc}")
 
-    app = QApplication(sys.argv)
+    app = EzyMailerApplication(sys.argv)
     window = MainWindow()
+    app.main_window = window
     window.show()
     return app.exec()
 
