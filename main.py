@@ -8185,6 +8185,11 @@ class DashboardPage(QWidget):
         dialog = page.locator('[role="dialog"]').last
         dialog.wait_for(state="visible", timeout=8000)
 
+        # With several small tiled windows Gmail often opens Compose collapsed
+        # to the bottom bar, or a previous send left a minimized draft. Restore
+        # it so the recipient, subject and body fields are actually reachable.
+        self._restore_minimized_gmail_compose(page)
+
         recipient_input = self._gmail_recipient_input(page)
         self._fill_gmail_field(recipient_input, recipient, "recipient")
         # Commit the address to a chip so Gmail treats it as a real recipient.
@@ -8208,6 +8213,68 @@ class DashboardPage(QWidget):
 
         if log_steps:
             self._log_action("Gmail inline compose opened")
+
+    def _restore_minimized_gmail_compose(self, page) -> None:
+        """Un-minimize a collapsed inline Compose so its fields are usable.
+
+        Gmail toggles a compose window between minimized and restored when its
+        header strip is clicked. This never pops the compose out into its own
+        browser window, so it is safe for fast compose which must stay on the
+        single controlled tab.
+        """
+        recipient_selectors = (
+            'input[aria-label="To recipients"]',
+            'input[aria-label^="To"]',
+            '[role="combobox"][aria-label*="To"]',
+            'input[name="to"]',
+        )
+
+        def recipient_visible() -> bool:
+            for selector in recipient_selectors:
+                try:
+                    locator = page.locator(selector)
+                    if any(locator.nth(i).is_visible() for i in range(locator.count())):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        if recipient_visible():
+            return
+
+        header_selectors = (
+            '[role="dialog"] [role="heading"]',
+            '[role="dialog"] .aYF',
+            '[role="dialog"] .aoT',
+            '[role="dialog"] .Hp',
+        )
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            for selector in header_selectors:
+                try:
+                    control = page.locator(selector).last
+                    if control.is_visible():
+                        control.click(timeout=1500)
+                        page.wait_for_timeout(400)
+                        if recipient_visible():
+                            return
+                except Exception:
+                    continue
+            # The minimized bar is usually titled "New Message" until a
+            # subject is typed; clicking that title restores the window.
+            for label in ("New Message", "New message"):
+                try:
+                    title = page.get_by_text(label, exact=True).last
+                    if title.is_visible():
+                        title.click(timeout=1500)
+                        page.wait_for_timeout(400)
+                        if recipient_visible():
+                            return
+                except Exception:
+                    continue
+            page.wait_for_timeout(200)
+
+        raise RuntimeError("Gmail inline Compose stayed minimized")
 
     def _fill_gmail_field(self, locator, value: str, label: str) -> None:
         locator.wait_for(state="visible", timeout=10000)
