@@ -161,6 +161,13 @@ BROWSER_RESOURCE_FLAGS = (
     "--blink-settings=imagesEnabled=false",
     "--js-flags=--max-old-space-size=512",
 )
+# "Fast compose" reuses one warm Gmail tab and opens the inline Compose
+# popup for every email instead of navigating the whole Gmail app to the
+# ?view=cm compose URL each time. That avoids re-parsing Gmail's JavaScript
+# bundle per message, which is the dominant per-email CPU cost on low-core
+# machines. Gmail's single-page app leaks memory over long runs, so the tab
+# is fully reloaded once every FAST_COMPOSE_RELOAD_EVERY sends.
+FAST_COMPOSE_RELOAD_EVERY = 60
 
 
 def _runtime_root() -> Path:
@@ -1338,6 +1345,7 @@ class AppState:
     delay_type: str = "Auto (system-oriented)"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
+    fast_compose: bool = False
     ai_available_models: list[str] = field(default_factory=list)
 
 
@@ -1396,6 +1404,7 @@ class BrowserSessionHandle:
     send_completed: int = 0
     send_total: int = 0
     health_check_failures: int = 0
+    fast_compose_sends: int = 0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
 
@@ -1414,6 +1423,7 @@ class BrowserTabHandle:
     browser_name: str
     debug_port: int
     tab_index: int
+    fast_compose_sends: int = 0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
 
@@ -4106,6 +4116,7 @@ class DashboardPage(QWidget):
         self.retry_count = QSpinBox()
         self.retry_enable_checkbox = QCheckBox("Enable")
         self.automatic_send_checkbox = QCheckBox("Automatic (no delay)")
+        self.fast_compose_checkbox = QCheckBox("Reuse one warm Gmail tab (faster, lower CPU)")
         self._campaign_threads: list[QThread] = []
         self._campaign_workers: dict[str, CampaignSendWorker] = {}
         self._campaign_running_workers: set[str] = set()
@@ -4680,6 +4691,14 @@ class DashboardPage(QWidget):
             "Send the next assigned email immediately; configured delays are ignored"
         )
         form.addRow("Fast sending", self.automatic_send_checkbox)
+        self.fast_compose_checkbox.setChecked(False)
+        self.fast_compose_checkbox.setToolTip(
+            "Open Gmail's inline Compose popup on an already-loaded tab instead of "
+            "reloading the whole Gmail page for every email. Much less CPU and memory "
+            "on low-core machines. Falls back to URL compose automatically if the "
+            "inline Compose form cannot be driven."
+        )
+        form.addRow("Fast compose", self.fast_compose_checkbox)
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("Delay between emails"))
         delay_row.addWidget(self.delay_from)
@@ -4796,6 +4815,7 @@ class DashboardPage(QWidget):
         self.delay_to.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.retry_count.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.retry_enable_checkbox.toggled.connect(lambda _value: self._schedule_sending_settings_save())
+        self.fast_compose_checkbox.toggled.connect(self._on_fast_compose_toggled)
         self.automatic_send_checkbox.toggled.connect(self._on_automatic_sending_toggled)
         self.delay_type_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
         self.send_order_group.buttonToggled.connect(lambda *_args: self._schedule_sending_settings_save())
@@ -4812,6 +4832,10 @@ class DashboardPage(QWidget):
 
     def _on_automatic_sending_toggled(self, _checked: bool) -> None:
         self._sync_automatic_sending_ui()
+        self._schedule_sending_settings_save()
+
+    def _on_fast_compose_toggled(self, checked: bool) -> None:
+        self.state.fast_compose = bool(checked)
         self._schedule_sending_settings_save()
 
     def _sync_automatic_sending_ui(self) -> None:
@@ -4884,6 +4908,7 @@ class DashboardPage(QWidget):
             "delay_type": delay_type,
             "email_send_order": email_send_order,
             "window_send_mode": window_send_mode,
+            "fast_compose": bool(self.fast_compose_checkbox.isChecked()),
             "ai_provider": self.ai_provider_combo.currentText().strip() or "ChatGPT",
             "ai_api_key": self.ai_api_key_input.text(),
             "ai_model": self.ai_model_combo.currentText().strip(),
@@ -4942,6 +4967,7 @@ class DashboardPage(QWidget):
             delay_type = "Auto (system-oriented)"
         email_send_order = str(payload.get("email_send_order") or "Sequential")
         window_send_mode = str(payload.get("window_send_mode") or "Parallel")
+        fast_compose = _as_bool(payload.get("fast_compose"), False)
         ai_provider = str(payload.get("ai_provider") or "ChatGPT")
         ai_api_key = str(payload.get("ai_api_key") or "")
         ai_model = str(payload.get("ai_model") or "")
@@ -4955,6 +4981,7 @@ class DashboardPage(QWidget):
         _block(self.retry_count, lambda: self.retry_count.setValue(retry_count))
         _block(self.retry_enable_checkbox, lambda: self.retry_enable_checkbox.setChecked(retry_enabled))
         _block(self.automatic_send_checkbox, lambda: self.automatic_send_checkbox.setChecked(automatic_no_delay))
+        _block(self.fast_compose_checkbox, lambda: self.fast_compose_checkbox.setChecked(fast_compose))
 
         _block(self.delay_fixed_radio, lambda: self.delay_fixed_radio.setChecked(delay_type == "Fixed"))
         _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Auto (system-oriented)"))
@@ -4980,6 +5007,7 @@ class DashboardPage(QWidget):
         self.state.delay_type = delay_type
         self.state.email_send_order = email_send_order
         self.state.window_send_mode = window_send_mode
+        self.state.fast_compose = fast_compose
         self.state.ai_provider = ai_provider
         self.state.ai_api_key = ai_api_key
         self.state.ai_model = ai_model
@@ -8113,6 +8141,74 @@ class DashboardPage(QWidget):
             page.wait_for_timeout(250)
         raise RuntimeError("Gmail Compose button was not available. Confirm that this browser window is signed in.")
 
+    def _open_inline_gmail_compose(
+        self,
+        page,
+        session: BrowserSessionHandle | BrowserTabHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        *,
+        log_steps: bool = True,
+    ) -> None:
+        """Drive Gmail's inline Compose popup on an already-loaded inbox tab.
+
+        This is the fast path: the Gmail single-page app stays resident, so
+        only a small compose dialog is created per email instead of reloading
+        the whole app through the ?view=cm URL. Raises on any problem; the
+        caller then falls back to URL compose.
+        """
+        current_url = str(page.url or "")
+        if "mail.google.com" not in current_url:
+            raise RuntimeError("Gmail tab is not on a usable page for inline compose")
+
+        sends_done = int(getattr(session, "fast_compose_sends", 0))
+        needs_reload = (
+            "view=cm" in current_url
+            or "#inbox" not in current_url
+            or (sends_done > 0 and sends_done % FAST_COMPOSE_RELOAD_EVERY == 0)
+        )
+        if needs_reload:
+            page.goto(
+                "https://mail.google.com/mail/u/0/#inbox",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            if "mail.google.com" not in str(page.url or ""):
+                raise RuntimeError("Gmail did not return to the inbox for inline compose")
+            page.wait_for_timeout(500)
+
+        self._dismiss_gmail_confidential_mode(page)
+        self._close_stale_gmail_compose(page)
+        self._open_fresh_gmail_compose(page)
+
+        dialog = page.locator('[role="dialog"]').last
+        dialog.wait_for(state="visible", timeout=8000)
+
+        recipient_input = self._gmail_recipient_input(page)
+        self._fill_gmail_field(recipient_input, recipient, "recipient")
+        # Commit the address to a chip so Gmail treats it as a real recipient.
+        recipient_input.press("Tab")
+        page.wait_for_timeout(200)
+        if not self._gmail_recipient_is_selected(page, recipient):
+            try:
+                recipient_input.press("Enter")
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+
+        subject_box = self._gmail_subject_input(page)
+        self._fill_gmail_field(subject_box, subject, "subject")
+
+        body_box = page.locator(
+            'div[role="textbox"][aria-label*="Message Body"], '
+            'div[contenteditable="true"][aria-label*="Message Body"]'
+        ).first
+        self._verify_gmail_body(body_box, body_text)
+
+        if log_steps:
+            self._log_action("Gmail inline compose opened")
+
     def _fill_gmail_field(self, locator, value: str, label: str) -> None:
         locator.wait_for(state="visible", timeout=10000)
         locator.click()
@@ -8399,25 +8495,46 @@ class DashboardPage(QWidget):
                 if log_steps:
                     self._log_action("Gmail page ready")
 
-                # Compose exclusively through the Gmail URL. Recipient,
-                # subject, and body are encoded into the navigation itself;
-                # no Compose button or field is clicked to create the draft.
-                page.goto(
-                    self._gmail_compose_url(recipient, subject, body_text),
-                    wait_until="domcontentloaded",
-                    timeout=15000,
-                )
-                current_url = str(page.url or "")
-                if "mail.google.com" not in current_url:
-                    if "accounts.google.com" in current_url or "workspace.google.com" in current_url:
-                        raise RuntimeError(
-                            f"{session.title} is not signed in to Gmail. Sign in in that browser window, then start again."
+                # Fast compose keeps this one Gmail tab loaded and opens the
+                # inline Compose popup for every email. That skips a full Gmail
+                # app reload per message, which is the dominant per-email CPU
+                # cost. It falls back to URL compose on any failure so the
+                # proven path still covers Gmail UI edge cases.
+                composed_inline = False
+                if bool(getattr(self.state, "fast_compose", False)):
+                    try:
+                        self._open_inline_gmail_compose(
+                            page, session, recipient, subject, body_text, log_steps=log_steps
                         )
-                    raise RuntimeError(
-                        f"{session.title} did not open Gmail. Check the browser session, then start again."
+                        composed_inline = True
+                    except Exception as exc:
+                        if log_steps:
+                            self._log_action(f"Fast compose fell back to URL compose: {exc}")
+                        try:
+                            self._close_stale_gmail_compose(page)
+                        except Exception:
+                            pass
+
+                if not composed_inline:
+                    # Compose exclusively through the Gmail URL. Recipient,
+                    # subject, and body are encoded into the navigation itself;
+                    # no Compose button or field is clicked to create the draft.
+                    page.goto(
+                        self._gmail_compose_url(recipient, subject, body_text),
+                        wait_until="domcontentloaded",
+                        timeout=15000,
                     )
-                if log_steps:
-                    self._log_action("Gmail compose opened from URL")
+                    current_url = str(page.url or "")
+                    if "mail.google.com" not in current_url:
+                        if "accounts.google.com" in current_url or "workspace.google.com" in current_url:
+                            raise RuntimeError(
+                                f"{session.title} is not signed in to Gmail. Sign in in that browser window, then start again."
+                            )
+                        raise RuntimeError(
+                            f"{session.title} did not open Gmail. Check the browser session, then start again."
+                        )
+                    if log_steps:
+                        self._log_action("Gmail compose opened from URL")
 
                 # Gmail may restore this dialog asynchronously from draft
                 # state even though EzyMailer never enables the feature.
@@ -8425,7 +8542,10 @@ class DashboardPage(QWidget):
 
                 self._verify_url_composed_email(page, recipient, subject, body_text)
                 if log_steps:
-                    self._log_action("Recipient, subject, and body loaded from URL")
+                    self._log_action(
+                        "Recipient, subject, and body loaded"
+                        + (" inline" if composed_inline else " from URL")
+                    )
 
                 send_selectors = (
                     'div.dC > div[role="button"][data-tooltip^="Send"]',
@@ -8503,6 +8623,8 @@ class DashboardPage(QWidget):
                     raise RuntimeError("Gmail did not finish sending the message.")
                 if not page.is_closed():
                     page.wait_for_timeout(300)
+                if composed_inline:
+                    session.fast_compose_sends = int(getattr(session, "fast_compose_sends", 0)) + 1
                 if log_steps:
                     self._log_action(f"Gmail send completed for {recipient}")
         except PlaywrightTimeoutError as exc:
@@ -10534,6 +10656,9 @@ class DashboardPage(QWidget):
             bool(getattr(self.state, "automatic_no_delay", True))
         )
         self.automatic_send_checkbox.blockSignals(False)
+        self.fast_compose_checkbox.blockSignals(True)
+        self.fast_compose_checkbox.setChecked(bool(getattr(self.state, "fast_compose", False)))
+        self.fast_compose_checkbox.blockSignals(False)
         self._sync_automatic_sending_ui()
         self.delay_fixed_radio.blockSignals(True)
         self.delay_random_radio.blockSignals(True)
