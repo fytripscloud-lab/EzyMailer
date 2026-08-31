@@ -26,20 +26,20 @@ if not defined CHROMIUM_EXE (
     exit /b 1
 )
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name EzyMailer --icon packaging\assets\EzyMailer.ico --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport --add-data "%BROWSER_RUNTIME_DIR%;playwright-browsers" main.py || exit /b 1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport --add-data "%BROWSER_RUNTIME_DIR%;playwright-browsers" main.py || exit /b 1
 
-if not exist "dist\EzyMailer.exe" (
-    echo ERROR: dist\EzyMailer.exe was not generated.
+if not exist "dist\EazyMailer.exe" (
+    echo ERROR: dist\EazyMailer.exe was not generated.
     exit /b 1
 )
 
-pyi-archive_viewer -l "dist\EzyMailer.exe" > "dist\EzyMailer-archive.txt" || exit /b 1
-findstr /i /c:"playwright-browsers" "dist\EzyMailer-archive.txt" >nul || (
-    echo ERROR: Bundled Chromium is missing from dist\EzyMailer.exe.
+pyi-archive_viewer -l "dist\EazyMailer.exe" > "dist\EazyMailer-archive.txt" || exit /b 1
+findstr /i /c:"playwright-browsers" "dist\EazyMailer-archive.txt" >nul || (
+    echo ERROR: Bundled Chromium is missing from dist\EazyMailer.exe.
     exit /b 1
 )
-del "dist\EzyMailer-archive.txt"
-powershell -NoProfile -Command "$hash=(Get-FileHash 'dist\EzyMailer.exe' -Algorithm SHA256).Hash.ToLower(); Set-Content -Encoding ascii 'dist\EzyMailer.exe.sha256' ($hash + '  EzyMailer.exe')" || exit /b 1
+del "dist\EazyMailer-archive.txt"
+powershell -NoProfile -Command "$hash=(Get-FileHash 'dist\EazyMailer.exe' -Algorithm SHA256).Hash.ToLower(); Set-Content -Encoding ascii 'dist\EazyMailer.exe.sha256' ($hash + '  EazyMailer.exe')" || exit /b 1
 
 echo.
-echo Build complete. Check dist for EzyMailer.exe and EzyMailer.exe.sha256.
+echo Build complete. Check dist for EazyMailer.exe and EazyMailer.exe.sha256.
