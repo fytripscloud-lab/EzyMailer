@@ -138,7 +138,7 @@ ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
 DEFAULT_BROWSER_DOWNLOAD_HOST = "https://cdn.playwright.dev"
-DEPENDENCY_RELEASE_TAG = "dependencies-v4"
+DEPENDENCY_RELEASE_TAG = "dependencies-v5"
 DEPENDENCY_RELEASE_BASE = (
     "https://github.com/fytripscloud-lab/EzyMailer/releases/download/"
     f"{DEPENDENCY_RELEASE_TAG}"

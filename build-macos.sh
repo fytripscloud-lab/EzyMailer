@@ -7,7 +7,6 @@ APP_NAME="EzyMailer"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 STAGING_DIR="$ROOT_DIR/packaging/macos-dmg"
-BROWSER_RUNTIME_DIR="$ROOT_DIR/packaging/browser-runtime-macos"
 DMG_NAME="$APP_NAME-macOS.dmg"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
 
@@ -16,7 +15,7 @@ export EZYM_MAILER_BOOTSTRAP_API="${EZYM_MAILER_BOOTSTRAP_API:-0}"
 export PYINSTALLER_CONFIG_DIR="$ROOT_DIR/.pyinstaller"
 
 cleanup_paths() {
-  export BROWSER_RUNTIME_DIR DIST_DIR ROOT_DIR STAGING_DIR
+  export DIST_DIR ROOT_DIR STAGING_DIR
 python3 - <<'PY'
 import os
 from pathlib import Path
@@ -28,7 +27,6 @@ paths = [
     Path(os.environ["DIST_DIR"]) / "EzyMailer.app",
     Path(os.environ["DIST_DIR"]) / "EzyMailer-macOS.dmg",
     Path(os.environ["STAGING_DIR"]),
-    Path(os.environ["BROWSER_RUNTIME_DIR"]),
 ]
 for path in paths:
     if path.exists():
@@ -50,13 +48,6 @@ pip install pyinstaller
 
 cleanup_paths
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
-mkdir -p "$BROWSER_RUNTIME_DIR"
-PLAYWRIGHT_BROWSERS_PATH="$BROWSER_RUNTIME_DIR" python -m playwright install --no-shell chromium
-
-if ! find "$BROWSER_RUNTIME_DIR" -type f -path '*chromium-*/*Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' -perm +111 -print -quit | grep -q .; then
-  echo "ERROR: Playwright Chromium was not prepared for the macOS package."
-  exit 1
-fi
 
 pyinstaller \
   --noconfirm \
@@ -74,16 +65,11 @@ pyinstaller \
   --collect-all playwright \
   "$ROOT_DIR/main.py"
 
-mkdir -p "$APP_BUNDLE/Contents/Resources/playwright-browsers"
-ditto "$BROWSER_RUNTIME_DIR" "$APP_BUNDLE/Contents/Resources/playwright-browsers"
-
-if ! find "$APP_BUNDLE/Contents" -type f -path '*playwright-browsers/chromium-*/*Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' -perm +111 -print -quit | grep -q .; then
-  echo "ERROR: Bundled Chromium is missing from $APP_BUNDLE."
-  exit 1
-fi
-
-# Chromium is a nested signed app. Copy it after PyInstaller collection, then
-# seal the complete EzyMailer bundle so Gatekeeper sees a consistent package.
+# Chromium is no longer bundled in the app -- it downloads on first login as
+# part of the app's runtime-dependency archive (see
+# .github/workflows/publish-dependencies.yml) and is cached under
+# ~/Library/Application Support/EzyMailer instead. Seal the bundle so
+# Gatekeeper sees a consistent package.
 codesign --force --deep --sign - "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 

@@ -49,6 +49,25 @@ jobs:
             "openpyxl>=3.1.5" \
             "reportlab>=4.4.3" \
             "Pillow>=3.3.2"
+
+          # Install the Playwright driver (not just the --target copy above,
+          # which has no CLI entry point) so we can fetch Chromium into the
+          # same folder that ships in this archive. This lets the desktop
+          # app's existing first-login dependency download deliver the
+          # browser too, instead of a second download from Playwright's CDN.
+          python -m pip install "playwright>=1.51.0"
+          mkdir -p runtime-dependencies/playwright-browsers
+          PLAYWRIGHT_BROWSERS_PATH="$PWD/runtime-dependencies/playwright-browsers" \
+            python -m playwright install --no-shell chromium
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # ditto, not zip: Chromium ships as a nested signed .app with
+            # symlinked framework versions, and a naive zipfile walk (as used
+            # below for Windows) silently drops/duplicates those symlinks and
+            # strips exec bits. ditto is Apple's own tool for round-tripping
+            # signed bundles through a zip archive without corrupting them.
+            ditto -c -k --sequesterRsrc --zlibCompressionLevel 9 runtime-dependencies "$ASSET_NAME"
+          else
           python - <<'PY'
           import os
           from pathlib import Path
@@ -61,6 +80,7 @@ jobs:
                   if path.is_file():
                       archive.write(path, path.relative_to(root).as_posix())
           PY
+          fi
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
