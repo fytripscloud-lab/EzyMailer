@@ -16,6 +16,7 @@ import subprocess
 import shutil
 import ssl
 import sqlite3
+import stat
 import socket
 import select
 import string
@@ -234,6 +235,33 @@ def _configure_external_dll_search(root: Path) -> None:
             pass
 
 
+def _extract_zip_member(archive, member, extraction_dir: Path) -> None:
+    """Extract one zip entry, restoring Unix symlinks and exec bits.
+
+    zipfile.extract() writes symlink entries as plain files containing the
+    link-target text and ignores permission bits, which corrupts a macOS
+    .app bundle (e.g. a Chromium framework's Versions/Current symlink, or
+    the main executable losing +x) and breaks its code signature. Archives
+    built with ditto store real Unix mode bits in external_attr, so recreate
+    symlinks and restore permissions from there instead.
+    """
+    unix_mode = member.external_attr >> 16
+    dest = extraction_dir / member.filename
+    if not IS_WINDOWS and stat.S_ISLNK(unix_mode):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        link_target = archive.read(member).decode("utf-8")
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+        dest.symlink_to(link_target)
+        return
+    archive.extract(member, extraction_dir)
+    if not IS_WINDOWS and unix_mode:
+        try:
+            dest.chmod(unix_mode & 0o777)
+        except OSError:
+            pass
+
+
 def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] | None = None) -> Path:
     """Download and extract the versioned GitHub dependency pack once."""
     # Normal builds now bundle every library used by campaign automation.
@@ -319,7 +347,7 @@ def ensure_external_dependencies(progress: Callable[[str, str, int, int], None] 
         members = archive.infolist()
         total_members = max(1, len(members))
         for index, member in enumerate(members, start=1):
-            archive.extract(member, extraction_dir)
+            _extract_zip_member(archive, member, extraction_dir)
             if progress and (index == 1 or index == total_members or index % 25 == 0):
                 progress(
                     "Extracting app dependencies",
