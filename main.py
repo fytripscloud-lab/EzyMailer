@@ -1373,7 +1373,7 @@ class AppState:
     delay_type: str = "Auto (system-oriented)"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
-    fast_compose: bool = False
+    fast_compose: bool = True
     ai_available_models: list[str] = field(default_factory=list)
 
 
@@ -4719,7 +4719,7 @@ class DashboardPage(QWidget):
             "Send the next assigned email immediately; configured delays are ignored"
         )
         form.addRow("Fast sending", self.automatic_send_checkbox)
-        self.fast_compose_checkbox.setChecked(False)
+        self.fast_compose_checkbox.setChecked(True)
         self.fast_compose_checkbox.setToolTip(
             "Open Gmail's inline Compose popup on an already-loaded tab instead of "
             "reloading the whole Gmail page for every email. Much less CPU and memory "
@@ -4995,7 +4995,7 @@ class DashboardPage(QWidget):
             delay_type = "Auto (system-oriented)"
         email_send_order = str(payload.get("email_send_order") or "Sequential")
         window_send_mode = str(payload.get("window_send_mode") or "Parallel")
-        fast_compose = _as_bool(payload.get("fast_compose"), False)
+        fast_compose = _as_bool(payload.get("fast_compose"), True)
         ai_provider = str(payload.get("ai_provider") or "ChatGPT")
         ai_api_key = str(payload.get("ai_api_key") or "")
         ai_model = str(payload.get("ai_model") or "")
@@ -8596,7 +8596,7 @@ class DashboardPage(QWidget):
                 # cost. It falls back to URL compose on any failure so the
                 # proven path still covers Gmail UI edge cases.
                 composed_inline = False
-                if bool(getattr(self.state, "fast_compose", False)):
+                if bool(getattr(self.state, "fast_compose", True)):
                     try:
                         self._open_inline_gmail_compose(
                             page, session, recipient, subject, body_text, log_steps=log_steps
@@ -10752,7 +10752,7 @@ class DashboardPage(QWidget):
         )
         self.automatic_send_checkbox.blockSignals(False)
         self.fast_compose_checkbox.blockSignals(True)
-        self.fast_compose_checkbox.setChecked(bool(getattr(self.state, "fast_compose", False)))
+        self.fast_compose_checkbox.setChecked(bool(getattr(self.state, "fast_compose", True)))
         self.fast_compose_checkbox.blockSignals(False)
         self._sync_automatic_sending_ui()
         self.delay_fixed_radio.blockSignals(True)
