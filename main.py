@@ -4,6 +4,7 @@ import sys
 import html
 import base64
 import csv
+import functools
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import socket
 import select
 import string
 import threading
+import concurrent.futures
 import uuid
 import certifi
 import xml.etree.ElementTree
@@ -29,14 +31,15 @@ from datetime import datetime
 from io import BytesIO
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
 import errno
-from typing import Callable
+from typing import Callable, Sequence
 
+from backend import gmail_oauth
 from backend.local_api import (
     API_BASE_URL,
     ensure_api_server,
@@ -107,7 +110,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QVBoxLayout,
-    QTextBrowser,
     QWidget,
     QHeaderView,
 )
@@ -116,6 +118,22 @@ DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin"
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
+
+# Native macOS WebKit (same engine as Safari/Mail), embedded directly into
+# a Qt widget for the HTML preview dialog — real, standards-compliant HTML
+# rendering (flexbox/grid/gradients/tables) without bundling a second copy
+# of Chromium into the app (see NativeWebPreviewWidget). WebKit.framework
+# ships with every Mac, so this adds no install size, unlike QWebEngineView.
+try:
+    if IS_MAC:
+        import objc
+        from Cocoa import NSViewWidthSizable, NSViewHeightSizable
+        from WebKit import WKWebView
+        _NATIVE_WEBVIEW_AVAILABLE = True
+    else:
+        _NATIVE_WEBVIEW_AVAILABLE = False
+except Exception:
+    _NATIVE_WEBVIEW_AVAILABLE = False
 MAX_BODY_TABS = 50
 MAX_ATTACHMENT_TABS = 50
 MAX_SUBJECTS = 100
@@ -135,6 +153,27 @@ LOCAL_TAG_STATE_KEY = "tag_state"
 LOCAL_CUSTOMER_VARIABLES_TABLE = "customer_variables"
 LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
+GOOGLE_API_ACCOUNTS_DIR = LOCAL_CACHE_DIR / "api_accounts"
+
+
+def _set_hidden_file_attribute(path: Path) -> None:
+    """Best-effort: mark a credential file hidden from normal file browsing.
+
+    A dot-prefixed name already hides it in Finder/most Linux file managers.
+    On macOS this also sets the UF_HIDDEN flag for extra concealment in
+    dialogs that show dotfiles; on Windows it sets the FILE_ATTRIBUTE_HIDDEN
+    bit. Neither is a security boundary — just keeps these out of casual
+    browsing, same as the rest of the app's local credential storage.
+    """
+    try:
+        if IS_MAC:
+            os.chflags(str(path), stat.UF_HIDDEN)
+        elif IS_WINDOWS:
+            import ctypes
+
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
+    except Exception:
+        pass
 ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
@@ -1345,6 +1384,8 @@ class AppState:
     logged_in: bool = False
     auth_token: str = ""
     browser_mode: str = "Incognito"
+    sending_mode: str = "Manual"
+    api_json_paths: list[str] = field(default_factory=list)
     window_count: int = 1
     tab_count: int = 1
     launch_preset: str = "Default"
@@ -1454,6 +1495,242 @@ class BrowserTabHandle:
     fast_compose_sends: int = 0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
+
+
+class _BrowserLaunchRequest:
+    """Carries one cross-thread request to open a browser window on the GUI thread.
+
+    Plain threading.Event, not a Qt wait primitive: the requesting thread
+    blocks on this while the GUI thread's queued slot runs
+    _launch_browser_process and fills in result/error.
+    """
+
+    __slots__ = ("index", "total_override", "event", "result", "error")
+
+    def __init__(self, index: int, *, total_override: int | None = None):
+        self.index = index
+        self.total_override = total_override
+        self.event = threading.Event()
+        self.result: "BrowserSessionHandle | None" = None
+        self.error: Exception | None = None
+
+
+@dataclass
+class ApiAccountHandle:
+    """One Gmail account authorized for API-based sending (no browser tab)."""
+
+    session_id: str
+    title: str
+    account_email: str
+    credential_path: Path
+    display_name: str = ""
+    mode: str = "API JSON"
+    browser_name: str = "Gmail API"
+    status: str = "Ready"
+    tab_count: int = 1
+    send_completed: int = 0
+    send_total: int = 0
+    fast_compose_sends: int = 0
+    access_token: str = field(default="", repr=False)
+    access_token_expires_at: float = field(default=0.0, repr=False)
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # The visible "active session" browser window opened for this account's
+    # sign-in confirmation (Start Browser). Sending itself never uses this —
+    # only the Gmail API does — but Logout closes it too if still open.
+    browser_session: "BrowserSessionHandle | None" = field(default=None, repr=False)
+
+    def is_alive(self) -> bool:
+        return True
+
+
+class ApiAccountPrepWorker(QObject):
+    """Loads uploaded Gmail API JSON credentials and opens a signed-in window for each.
+
+    Runs off the GUI thread because it opens real browser windows and blocks
+    on each one reaching a signed-in Gmail inbox. Only `log`/`finished` cross
+    back to the GUI thread, via Qt's queued-signal marshalling, matching the
+    CampaignSendWorker pattern. Generating a credential from scratch is not
+    this worker's job any more — every path here must already be an
+    uploaded, ready-to-use account JSON (see the Gmail API Automation tool
+    for creating one).
+    """
+
+    log = Signal(str)
+    finished = Signal(bool, str, list)
+
+    def __init__(self, controller: "DashboardPage", uploaded_paths: list[str], window_count: int):
+        super().__init__()
+        self.controller = controller
+        self.uploaded_paths = list(uploaded_paths)
+        self.window_count = max(1, int(window_count))
+
+    def run(self) -> None:
+        accounts: list[ApiAccountHandle] = []
+        try:
+            paths = self.uploaded_paths[: self.window_count]
+            if len(paths) < self.window_count:
+                raise RuntimeError(
+                    f"Only {len(paths)} JSON credential(s) uploaded for {self.window_count} window(s). "
+                    f"Upload more JSON files, or create some with the Gmail API Automation tool."
+                )
+            for index, path_str in enumerate(paths, start=1):
+                self.log.emit(f"Loading Gmail API credential {index}: {Path(path_str).name}")
+                account = self.controller._prepare_api_account(path_str, index, log=self.log.emit)
+                accounts.append(account)
+                self.log.emit(f"Signed in for {account.account_email or account.title}")
+        except Exception as exc:
+            self.finished.emit(False, str(exc), accounts)
+            return
+        self.finished.emit(True, "", accounts)
+
+
+class GmailApiAutomationWorker(QObject):
+    """Bulk-generates Gmail API JSON credentials from a sheet of accounts.
+
+    Runs entirely off the GUI thread: opens one browser window per row,
+    types in the given email/password, waits out any 2FA/verification
+    challenge (which cannot be automated — the window stays open for the
+    person to finish it by hand if they're watching), then runs the same
+    Cloud Console + consent automation used elsewhere in the app to produce
+    a ready-to-use JSON, saved to the chosen folder. Up to max_parallel rows
+    run at once via a thread pool — each still opens its own real browser
+    window, so results stay in whatever order they finish, not sheet order.
+
+    Each row also carries its own sheet row number and status-column index
+    (see `DashboardPage._read_credentials_sheet`); after a row finishes, its
+    "Completed"/"Failed" outcome is written back into that exact cell of the
+    source sheet, so the sheet itself is a resumable ledger — a future run
+    against the same file only reads rows whose status cell is still blank.
+    """
+
+    log = Signal(str)
+    row_finished = Signal(int, bool, str)
+    account_ready = Signal(object)
+    finished = Signal(int, int, str)
+
+    def __init__(
+        self,
+        controller: "DashboardPage",
+        rows: list[tuple[int, str, str, int]],
+        output_dir: Path,
+        max_parallel: int = 1,
+        sheet_path: Path | None = None,
+    ):
+        super().__init__()
+        self.controller = controller
+        self.rows = list(rows)
+        self.output_dir = output_dir
+        self.max_parallel = max(1, min(10, int(max_parallel)))
+        self.sheet_path = sheet_path
+        self._cancelled = threading.Event()
+        self._sheet_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def _write_sheet_status(self, row_number: int, status_col: int, status: str) -> None:
+        if self.sheet_path is None:
+            return
+        with self._sheet_lock:
+            try:
+                suffix = self.sheet_path.suffix.lower()
+                if suffix in {".xlsx", ".xlsm"}:
+                    from openpyxl import load_workbook
+
+                    workbook = load_workbook(self.sheet_path)
+                    try:
+                        sheet = workbook.active
+                        sheet.cell(row=row_number, column=status_col + 1).value = status
+                        workbook.save(self.sheet_path)
+                    finally:
+                        workbook.close()
+                else:
+                    with self.sheet_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                        all_rows = [list(row) for row in csv.reader(handle)]
+                    row_idx = row_number - 1
+                    while len(all_rows) <= row_idx:
+                        all_rows.append([])
+                    row = all_rows[row_idx]
+                    while len(row) <= status_col:
+                        row.append("")
+                    row[status_col] = status
+                    with self.sheet_path.open("w", newline="", encoding="utf-8") as handle:
+                        csv.writer(handle).writerows(all_rows)
+            except Exception as exc:
+                self.log.emit(f"Could not update the sheet status for row {row_number}: {exc}")
+
+    def _process_row(
+        self, index: int, total: int, slot: int, row_number: int, email: str, password: str, status_col: int
+    ) -> tuple[str, bool, str]:
+        if self._cancelled.is_set():
+            return (email, False, "Cancelled before starting")
+        self.log.emit(f"[{index}/{total}] Start: {email}")
+        try:
+            # The Console automation reports many internal step messages
+            # (project creation, consent screen wizard, retry attempts) via
+            # this callback — those are useful while live-debugging but too
+            # noisy for normal use, so they're discarded here. Only this
+            # row's own start/completion lines reach the visible log.
+            account = self.controller._generate_api_json_from_credentials(
+                index,
+                email,
+                password,
+                self.output_dir,
+                slot=slot,
+                max_parallel=self.max_parallel,
+                log=lambda message: None,
+            )
+            self.log.emit(f"[{index}/{total}] Completed: {email}")
+            self.row_finished.emit(index, True, email)
+            self.account_ready.emit(account)
+            self._write_sheet_status(row_number, status_col, "Completed")
+            return (email, True, account.credential_path.name)
+        except Exception as exc:
+            self.log.emit(f"[{index}/{total}] Failed for {email}: {exc}")
+            self.row_finished.emit(index, False, email)
+            self._write_sheet_status(row_number, status_col, "Failed")
+            return (email, False, str(exc))
+
+    def _write_status_sheet(self, results: list[tuple[str, bool, str]]) -> Path | None:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            path = self.output_dir / "status.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Email", "Status", "Detail"])
+                for email, ok, detail in results:
+                    writer.writerow([email, "Created" if ok else "Failed", detail])
+            return path
+        except Exception as exc:
+            self.log.emit(f"Could not write the status sheet: {exc}")
+            return None
+
+    def run(self) -> None:
+        total = len(self.rows)
+        results: list[tuple[str, bool, str]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
+            futures = [
+                executor.submit(
+                    self._process_row,
+                    index,
+                    total,
+                    ((index - 1) % self.max_parallel) + 1,
+                    row_number,
+                    email,
+                    password,
+                    status_col,
+                )
+                for index, (row_number, email, password, status_col) in enumerate(self.rows, start=1)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+        succeeded = sum(1 for _, ok, _ in results if ok)
+        if self._cancelled.is_set():
+            self.log.emit("Cancelled.")
+        status_path = self._write_status_sheet(results)
+        if status_path:
+            self.log.emit(f"Status sheet saved to {status_path}")
+        self.finished.emit(succeeded, total, str(status_path) if status_path else "")
 
 
 class AIValidationWorker(QObject):
@@ -1874,10 +2151,10 @@ class TitleBar(QWidget):
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
         layout.setContentsMargins(
-            _scaled_int(8, self._scale),
-            _scaled_int(1, self._scale),
-            _scaled_int(8, self._scale),
-            _scaled_int(1, self._scale),
+            _scaled_int(10, self._scale),
+            _scaled_int(7, self._scale),
+            _scaled_int(10, self._scale),
+            _scaled_int(7, self._scale),
         )
         layout.setSpacing(_scaled_int(4, self._scale))
 
@@ -1908,6 +2185,13 @@ class TitleBar(QWidget):
         version_badge.setObjectName("versionBadge")
         self.status_badge = QLabel("LOCKED")
         self.status_badge.setObjectName("statusBadge")
+        self.gmail_api_tool_button = QPushButton("Gmail API Automation")
+        self.gmail_api_tool_button.setObjectName("secondaryButton")
+        self.gmail_api_tool_button.setCursor(Qt.PointingHandCursor)
+        self.gmail_api_tool_button.setToolTip(
+            "Bulk-generate Gmail API JSON credentials from a sheet of account emails and passwords"
+        )
+        self.gmail_api_tool_button.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
         self.theme_badge = QPushButton()
         self.theme_badge.setObjectName("themeButton")
         self.theme_badge.setCursor(Qt.PointingHandCursor)
@@ -1938,6 +2222,7 @@ class TitleBar(QWidget):
         layout.addWidget(spacer)
         layout.addWidget(version_badge)
         layout.addWidget(self.status_badge)
+        layout.addWidget(self.gmail_api_tool_button)
         layout.addWidget(self.theme_badge)
         layout.addWidget(self.user_id_label)
         layout.addWidget(self.logout_button)
@@ -1946,6 +2231,7 @@ class TitleBar(QWidget):
         self.status_badge.setText("READY" if logged_in else "LOCKED")
         self.user_id_label.setText(username if logged_in else "")
         self._window._update_theme_button()
+        self.gmail_api_tool_button.setVisible(logged_in)
         self.theme_badge.setVisible(logged_in)
         self.user_id_label.setVisible(logged_in)
         self.logout_button.setVisible(logged_in)
@@ -2270,6 +2556,212 @@ class ConfirmDialog(QDialog):
         card_layout.addWidget(message_label)
         card_layout.addWidget(buttons)
         layout.addWidget(card)
+
+
+class GmailApiAutomationDialog(QDialog):
+    """Bulk Gmail API JSON credential generator from an uploaded sheet.
+
+    Upload once here; the resulting JSON files land in a plain folder for
+    the person to review and upload individually via the main Upload JSON
+    button — this dialog never touches the app's own session state.
+    """
+
+    def __init__(self, controller: "DashboardPage", scale: float = 1.0):
+        super().__init__(controller.window())
+        self.controller = controller
+        self._scale = scale
+        self._sheet_path: Path | None = None
+        self._output_dir = Path.home() / "Downloads" / "EzyMailer Gmail API JSON"
+        self._thread: QThread | None = None
+        self._worker: GmailApiAutomationWorker | None = None
+        self._close_pending = False
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setObjectName("confirmDialog")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            _scaled_int(16, self._scale), _scaled_int(16, self._scale),
+            _scaled_int(16, self._scale), _scaled_int(16, self._scale),
+        )
+
+        card = QFrame()
+        card.setObjectName("confirmCard")
+        card.setMinimumWidth(_scaled_int(480, self._scale))
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(
+            _scaled_int(18, self._scale), _scaled_int(18, self._scale),
+            _scaled_int(18, self._scale), _scaled_int(18, self._scale),
+        )
+        card_layout.setSpacing(_scaled_int(10, self._scale))
+
+        title_label = QLabel("Gmail API Automation")
+        title_label.setObjectName("confirmTitle")
+        subtitle = QLabel(
+            "Upload a sheet (.csv or .xlsx) listing each Gmail account's email and password. "
+            "EzyMailer signs in to each one, creates its Gmail API JSON credential, and saves it "
+            "to the folder below. Upload the resulting files with the Upload JSON button afterward."
+        )
+        subtitle.setObjectName("confirmText")
+        subtitle.setWordWrap(True)
+
+        sheet_row = QHBoxLayout()
+        self.sheet_label = QLabel("No sheet selected")
+        self.sheet_label.setWordWrap(True)
+        choose_sheet_button = QPushButton("Choose Sheet")
+        choose_sheet_button.setObjectName("secondaryButton")
+        choose_sheet_button.clicked.connect(self._choose_sheet)
+        sheet_row.addWidget(self.sheet_label, 1)
+        sheet_row.addWidget(choose_sheet_button)
+
+        folder_row = QHBoxLayout()
+        self.folder_label = QLabel(str(self._output_dir))
+        self.folder_label.setWordWrap(True)
+        choose_folder_button = QPushButton("Change Folder")
+        choose_folder_button.setObjectName("secondaryButton")
+        choose_folder_button.clicked.connect(self._choose_folder)
+        folder_row.addWidget(self.folder_label, 1)
+        folder_row.addWidget(choose_folder_button)
+
+        parallel_row = QHBoxLayout()
+        parallel_label = QLabel("Windows to process in parallel")
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 10)
+        self.parallel_spin.setValue(1)
+        self.parallel_spin.setToolTip(
+            "How many accounts to sign in and process at the same time (max 10). "
+            "The rest of the sheet is processed automatically as each window finishes."
+        )
+        parallel_row.addWidget(parallel_label)
+        parallel_row.addStretch()
+        parallel_row.addWidget(self.parallel_spin)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)
+        self.log_view.setMinimumHeight(_scaled_int(180, self._scale))
+        self.log_view.setPlaceholderText("Progress will appear here once you click Start.")
+
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.clicked.connect(self._start)
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("secondaryButton")
+        self.close_button.clicked.connect(self._handle_close)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(self.start_button)
+        button_row.addWidget(self.close_button)
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(subtitle)
+        card_layout.addLayout(sheet_row)
+        card_layout.addLayout(folder_row)
+        card_layout.addLayout(parallel_row)
+        card_layout.addWidget(self.log_view)
+        card_layout.addLayout(button_row)
+        layout.addWidget(card)
+
+    def _choose_sheet(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a sheet of Gmail accounts", "", "Spreadsheets (*.csv *.xlsx *.xlsm);;All files (*)"
+        )
+        if not file_path:
+            return
+        self._sheet_path = Path(file_path)
+        self.sheet_label.setText(self._sheet_path.name)
+
+    def _choose_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", str(self._output_dir))
+        if not folder:
+            return
+        self._output_dir = Path(folder)
+        self.folder_label.setText(str(self._output_dir))
+
+    def _append_log(self, message: str) -> None:
+        self.log_view.appendPlainText(message)
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _start(self) -> None:
+        if self._thread is not None:
+            self.controller.notify("Already running")
+            return
+        if self._sheet_path is None:
+            self.controller.notify("Choose a sheet first")
+            return
+        try:
+            rows = self.controller._read_credentials_sheet(self._sheet_path)
+        except Exception as exc:
+            self.controller.notify(f"Could not read the sheet: {exc}")
+            return
+        if not rows:
+            self.controller.notify(
+                "No pending rows found — every row in that sheet is already marked Completed or Failed"
+            )
+            return
+
+        max_parallel = self.parallel_spin.value()
+        self.start_button.setEnabled(False)
+        self.parallel_spin.setEnabled(False)
+        self._append_log(f"Found {len(rows)} pending account(s). Processing up to {max_parallel} at a time...")
+
+        thread = QThread(self)
+        worker = GmailApiAutomationWorker(
+            self.controller, rows, self._output_dir, max_parallel, sheet_path=self._sheet_path
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run, Qt.DirectConnection)
+        worker.log.connect(self._append_log)
+        worker.account_ready.connect(self.controller._register_bulk_api_account)
+        worker.finished.connect(self._on_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
+
+    def _on_thread_finished(self) -> None:
+        self._thread = None
+        self._worker = None
+        if self._close_pending:
+            self.accept()
+
+    def _on_finished(self, succeeded: int, total: int, status_path: str) -> None:
+        self.start_button.setEnabled(True)
+        self.parallel_spin.setEnabled(True)
+        self._append_log(f"Done: {succeeded}/{total} account(s) created in {self._output_dir}")
+        self.controller.notify(f"Gmail API Automation finished: {succeeded}/{total} succeeded")
+
+    def _handle_close(self) -> None:
+        if self._worker is not None:
+            # Destroying a QThread while it's still running is a fatal error
+            # in Qt (it calls qFatal/abort, taking the whole app down) — the
+            # row already in flight keeps running even after cancel() sets
+            # the flag, so the dialog must wait for thread.finished before
+            # actually closing, not close immediately.
+            self._close_pending = True
+            self._worker.cancel()
+            self.close_button.setEnabled(False)
+            self.start_button.setEnabled(False)
+            self._append_log("Cancelling — waiting for the in-progress window to finish...")
+            return
+        self.accept()
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None:
+            self._close_pending = True
+            self._worker.cancel()
+            self.close_button.setEnabled(False)
+            self.start_button.setEnabled(False)
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class BodyDraftEditor(QWidget):
@@ -3618,6 +4110,72 @@ class FileFormatDialog(QDialog):
         return default_base
 
 
+class NativeWebPreviewWidget(QWidget):
+    """Embeds macOS's native WebKit engine (same engine as Safari/Mail)
+    directly inside a Qt widget for the HTML preview dialog — real,
+    standards-compliant rendering (flexbox/grid/gradients/tables), without
+    bundling a second copy of Chromium into the app just for this (see
+    QWebEngineView, reverted for doubling the app's install size) and
+    without opening it as a separate OS window (see the subprocess
+    approach, reverted for not looking like part of the app).
+
+    Embedding a native NSView inside a Qt-hosted NSView on macOS needs the
+    three non-default widget attributes set in __init__ below — without
+    them, Qt's own compositing paints over the embedded WKWebView every
+    frame, leaving it blank. Confirmed by live testing, not documentation.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._web_view = None
+        self._pending_html: str | None = None
+        if _NATIVE_WEBVIEW_AVAILABLE:
+            self.setAttribute(Qt.WA_NativeWindow, True)
+            self.setAttribute(Qt.WA_PaintOnScreen, True)
+            self.setAttribute(Qt.WA_NoSystemBackground, True)
+            self.setAutoFillBackground(False)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if _NATIVE_WEBVIEW_AVAILABLE and self._web_view is None:
+            self._embed_web_view()
+
+    def _embed_web_view(self) -> None:
+        try:
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            web_view = WKWebView.alloc().initWithFrame_(ns_view.bounds())
+            web_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            ns_view.addSubview_(web_view)
+            self._web_view = web_view
+            if self._pending_html is not None:
+                web_view.loadHTMLString_baseURL_(self._pending_html, None)
+                self._pending_html = None
+        except Exception:
+            self._web_view = None
+
+    def load_html(self, html: str) -> None:
+        if self._web_view is not None:
+            self._web_view.loadHTMLString_baseURL_(html or "", None)
+        else:
+            self._pending_html = html
+
+    def set_zoom(self, factor: float) -> None:
+        if self._web_view is not None:
+            try:
+                self._web_view.setPageZoom_(factor)
+            except Exception:
+                pass
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._web_view is not None:
+            try:
+                ns_view = objc.objc_object(c_void_p=int(self.winId()))
+                self._web_view.setFrame_(ns_view.bounds())
+            except Exception:
+                pass
+
+
 class HtmlPreviewDialog(QDialog):
     def __init__(self, parent: QWidget, title: str, html: str, source_label: str = "", scale: float = 1.0):
         super().__init__(parent)
@@ -3627,6 +4185,7 @@ class HtmlPreviewDialog(QDialog):
         self.setObjectName("previewDialog")
         self._source_html = html
         self._source_visible = False
+        self._zoom_factor = 1.0
         self._build_ui(title, source_label, html)
 
     def _build_ui(self, title: str, source_label: str, html: str) -> None:
@@ -3693,12 +4252,9 @@ class HtmlPreviewDialog(QDialog):
             meta_label.setWordWrap(True)
             card_layout.addWidget(meta_label)
 
-        self.preview_browser = QTextBrowser()
+        self.preview_browser = NativeWebPreviewWidget()
         self.preview_browser.setObjectName("previewBrowser")
-        self.preview_browser.setOpenExternalLinks(True)
-        self.preview_browser.setHtml(html)
-        self._base_font = self.preview_browser.font()
-        self.preview_browser.document().setDefaultFont(self._base_font)
+        self.preview_browser.load_html(html)
         card_layout.addWidget(self.preview_browser, 1)
 
         self.source_view = QTextEdit()
@@ -3713,7 +4269,7 @@ class HtmlPreviewDialog(QDialog):
         self.resize(_scaled_int(920, self._scale), _scaled_int(680, self._scale))
 
     def _reload_preview(self) -> None:
-        self.preview_browser.setHtml(self._source_html)
+        self.preview_browser.load_html(self._source_html)
         self.source_view.setPlainText(self._source_html)
 
     def _toggle_source_view(self, checked: bool) -> None:
@@ -3721,27 +4277,28 @@ class HtmlPreviewDialog(QDialog):
         self.source_view.setVisible(checked)
 
     def _zoom_preview(self, step: int) -> None:
-        if step > 0:
-            self.preview_browser.zoomIn(step)
-        elif step < 0:
-            self.preview_browser.zoomOut(abs(step))
+        self._zoom_factor = min(3.0, max(0.25, self._zoom_factor + step * 0.1))
+        self.preview_browser.set_zoom(self._zoom_factor)
 
     def _reset_zoom(self) -> None:
-        self.preview_browser.setFont(self._base_font)
-        self.preview_browser.document().setDefaultFont(self._base_font)
-        self.preview_browser.setHtml(self._source_html)
-        self.source_view.setPlainText(self._source_html)
+        self._zoom_factor = 1.0
+        self.preview_browser.set_zoom(1.0)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         parent = self.parentWidget()
         if parent is not None:
-            self.adjustSize()
+            # No adjustSize() here: NativeWebPreviewWidget has no
+            # meaningful sizeHint of its own (it's a native NSView, not a
+            # normal Qt widget), so adjustSize() would shrink the whole
+            # dialog down to just its header — the explicit resize() in
+            # _build_ui is the real size we want; only centering happens here.
             parent_center = parent.frameGeometry().center()
             self.move(
                 parent_center.x() - self.width() // 2,
                 parent_center.y() - self.height() // 2,
             )
+
 
 class LoginPage(QWidget):
     def __init__(self, on_login, scale: float = 1.0):
@@ -3756,23 +4313,20 @@ class LoginPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(_scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale), _scaled_int(18, self._scale))
+        root.setContentsMargins(_scaled_int(10, self._scale), _scaled_int(10, self._scale), _scaled_int(10, self._scale), _scaled_int(10, self._scale))
         root.setSpacing(0)
-
-        root.addStretch()
 
         shell = QFrame()
         shell.setObjectName("loginShell")
-        shell.setMinimumWidth(_scaled_int(500, self._scale))
-        shell.setMaximumWidth(_scaled_int(560, self._scale))
+        shell.setFixedWidth(_scaled_int(380, self._scale))
         shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(_scaled_int(26, self._scale), _scaled_int(26, self._scale), _scaled_int(26, self._scale), _scaled_int(26, self._scale))
-        shell_layout.setSpacing(_scaled_int(14, self._scale))
+        shell_layout.setContentsMargins(_scaled_int(20, self._scale), _scaled_int(20, self._scale), _scaled_int(20, self._scale), _scaled_int(20, self._scale))
+        shell_layout.setSpacing(_scaled_int(10, self._scale))
 
         header = QHBoxLayout()
-        header.setSpacing(_scaled_int(10, self._scale))
+        header.setSpacing(_scaled_int(8, self._scale))
         logo = AnimatedLogoBadge(scale=self._scale)
-        logo.setFixedSize(_scaled_int(56, self._scale), _scaled_int(56, self._scale))
+        logo.setFixedSize(_scaled_int(42, self._scale), _scaled_int(42, self._scale))
 
         title_block = QVBoxLayout()
         title_block.setSpacing(0)
@@ -3783,6 +4337,7 @@ class LoginPage(QWidget):
         title_block.addWidget(brand)
         title_block.addWidget(kicker)
 
+        header.addStretch()
         header.addWidget(logo)
         header.addLayout(title_block)
         header.addStretch()
@@ -3799,8 +4354,8 @@ class LoginPage(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
         form.setFormAlignment(Qt.AlignTop)
-        form.setHorizontalSpacing(_scaled_int(14, self._scale))
-        form.setVerticalSpacing(_scaled_int(12, self._scale))
+        form.setHorizontalSpacing(_scaled_int(10, self._scale))
+        form.setVerticalSpacing(_scaled_int(8, self._scale))
 
         self.username_input.setPlaceholderText("Username")
         self.username_input.setText("")
@@ -3810,8 +4365,8 @@ class LoginPage(QWidget):
         self.password_input.setText("")
         self.password_input.setToolTip("Enter your login password")
         for field in (self.username_input, self.password_input):
-            field.setMinimumHeight(_scaled_int(40, self._scale))
-            field.setMinimumWidth(_scaled_int(300, self._scale))
+            field.setMinimumHeight(_scaled_int(32, self._scale))
+            field.setMinimumWidth(_scaled_int(220, self._scale))
 
         form.addRow("Username", self.username_input)
         form.addRow("Password", self.password_input)
@@ -3821,7 +4376,7 @@ class LoginPage(QWidget):
         self.error_label.setAlignment(Qt.AlignCenter)
 
         self.login_button.setObjectName("primaryButton")
-        self.login_button.setMinimumHeight(_scaled_int(44, self._scale))
+        self.login_button.setMinimumHeight(_scaled_int(36, self._scale))
         self.login_button.clicked.connect(lambda: self._attempt_login())
         self.login_button.setToolTip("Authenticate and open the workspace")
 
@@ -3833,7 +4388,6 @@ class LoginPage(QWidget):
         shell_layout.addWidget(self.login_button)
 
         root.addWidget(shell, alignment=Qt.AlignHCenter)
-        root.addStretch()
 
         self.username_input.returnPressed.connect(self._attempt_login)
         self.password_input.returnPressed.connect(self._attempt_login)
@@ -4052,16 +4606,232 @@ class LineNumberPlainTextEdit(QPlainTextEdit):
             block_number += 1
 
 
+# Fixed wordlist for the $word12 / $word24 dynamic tags. Words are chosen
+# from this list with `secrets.choice` (CSPRNG), never `random`.
+_DYNAMIC_TAG_WORDLIST: tuple[str, ...] = (
+    "orbit", "maple", "quiet", "amber", "cobalt", "delta", "ember", "frost",
+    "grove", "haven", "ionic", "juniper", "kestrel", "lumen", "meadow", "nectar",
+    "onyx", "prairie", "quartz", "raven", "summit", "tundra", "umbra", "velvet",
+    "willow", "xenon", "yarrow", "zephyr", "anchor", "birch", "cedar", "dune",
+    "echo", "falcon", "granite", "harbor", "indigo", "jasper", "karst", "lagoon",
+    "marsh", "nimbus", "opal", "pebble", "quill", "ridge", "slate", "thicket",
+    "urban", "valley", "wharf", "yonder", "zenith", "alder", "basalt", "canyon",
+    "drift", "estuary", "fjord", "glacier", "hollow", "islet", "jungle", "knoll",
+    "ledge", "moor", "north", "outcrop", "plateau", "quay", "reef", "shoal",
+    "trail", "upland", "vista", "wetland", "aspen", "bluff", "coast", "eddy",
+    "elm", "field", "gorge", "highland", "inlet", "jetty", "knot", "lake",
+    "mesa", "notch", "oasis", "peak", "quarry", "ravine", "sound", "timber",
+    "vale", "wood", "yard", "zone", "arch", "bay", "cliff", "dale",
+)
+
+# Base tokens eligible for a "$L<name>" (forced lowercase) / "$U<name>"
+# (forced uppercase) variant — see _generate_random_tag_value.
+_CASE_VARIANT_BASE_TOKENS = frozenset(
+    {"$hex8", "$hex16", "$token16", "$token32", "$uuid", "$word12", "$word24"}
+)
+
+# Small curated label/name pools with no OS-provided equivalent — shared
+# constants so _generate_random_tag_value (single-sample preview) and the
+# per-campaign _UniquePicker pool (see _campaign_task_factory) draw from
+# exactly the same values.
+_TAG_LAST_NAMES: tuple[str, ...] = ("Johnson", "Patel", "Smith", "Brown", "Lee", "Walker", "Garcia", "Kim")
+_TAG_ORDER_LABELS: tuple[str, ...] = ("Order No", "Receipt No", "Invoice No", "Reference No", "Confirmation No", "Ticket No")
+_TAG_PRODUCT_LABELS: tuple[str, ...] = ("Service", "Product", "Plan", "Subscription", "Package", "Membership")
+_TAG_DURATION_LABELS: tuple[str, ...] = ("Duration", "Validity", "Term", "Coverage", "Tenure", "Period")
+_TAG_RESPTIME_LABELS: tuple[str, ...] = (
+    "Up to 24 hours", "Within 1 business day", "Up to 48 hours",
+    "Within 2 hours", "Same day", "Up to 72 hours",
+)
+_TAG_TOTAL_LABELS: tuple[str, ...] = ("Total", "Amount Due", "Balance", "Value", "Grand Total", "Sum")
+
+# Real, well-known global companies across tech, finance, retail, auto,
+# airlines, energy, pharma, media and more — for the $company sample tag.
+# There's no OS-provided company database (unlike names/cities/words), so
+# this is a hand-curated list, kept wide-ranging on purpose for variety.
+_TAG_COMPANY_NAMES: tuple[str, ...] = (
+    "Google", "Apple", "Microsoft", "Amazon", "Meta", "Netflix", "Tesla", "IBM",
+    "Oracle", "Intel", "Nvidia", "Samsung", "Sony", "LG Electronics", "Adobe",
+    "Salesforce", "SAP", "Cisco", "Dell", "HP", "Lenovo", "Xiaomi", "Huawei",
+    "ByteDance", "Tencent", "Alibaba", "Baidu", "Spotify", "Uber", "Airbnb",
+    "Snap", "PayPal", "Block", "Shopify", "Zoom", "Slack", "Dropbox",
+    "Atlassian", "Palantir", "ServiceNow", "Workday", "Twilio", "Stripe",
+    "JPMorgan Chase", "Goldman Sachs", "Morgan Stanley", "Bank of America",
+    "Citigroup", "Wells Fargo", "HSBC", "Barclays", "Deutsche Bank", "UBS",
+    "Visa", "Mastercard", "American Express", "BlackRock", "Vanguard", "Fidelity",
+    "Walmart", "Target", "Costco", "The Home Depot", "IKEA", "Zara", "H&M",
+    "Nike", "Adidas", "Puma", "Under Armour", "Starbucks", "McDonald's", "KFC",
+    "Subway", "Coca-Cola", "PepsiCo", "Nestle", "Unilever", "Procter & Gamble",
+    "Colgate-Palmolive", "L'Oreal", "Johnson & Johnson",
+    "Toyota", "Honda", "Ford", "General Motors", "Volkswagen", "BMW",
+    "Mercedes-Benz", "Audi", "Hyundai", "Kia", "Nissan", "Ferrari", "Porsche",
+    "Volvo", "Tata Motors",
+    "Delta Air Lines", "United Airlines", "American Airlines", "Emirates",
+    "Qatar Airways", "Lufthansa", "British Airways", "Singapore Airlines",
+    "Air France",
+    "AT&T", "Verizon", "T-Mobile", "Vodafone", "Orange", "Deutsche Telekom",
+    "China Mobile",
+    "ExxonMobil", "Chevron", "Shell", "BP", "TotalEnergies",
+    "General Electric", "Siemens", "Honeywell", "3M", "Boeing", "Airbus",
+    "Lockheed Martin",
+    "Pfizer", "Moderna", "Roche", "Novartis", "AstraZeneca", "Merck",
+    "GlaxoSmithKline", "Sanofi",
+    "Disney", "Warner Bros. Discovery", "Comcast", "Paramount", "Sony Pictures",
+)
+
+
+# There's no database bundled with this app, but stock macOS already ships
+# a large English dictionary and a proper-names list (BSD heritage, present
+# on every Mac — nothing to install), so these read straight from disk
+# instead of relying on small hand-picked lists. `secrets.choice` still
+# does the actual (CSPRNG) picking; these just widen the pool it picks
+# from. Each is read once per process and cached — @lru_cache also makes
+# the fallback-on-missing-file behavior safe to call from any thread.
+@functools.lru_cache(maxsize=1)
+def _os_word_pool() -> tuple[str, ...]:
+    try:
+        raw = Path("/usr/share/dict/words").read_text(encoding="utf-8", errors="ignore")
+        words = [w.strip().lower() for w in raw.splitlines() if w.strip().isalpha() and 3 <= len(w.strip()) <= 10]
+        if len(words) >= 1000:
+            return tuple(words)
+    except Exception:
+        pass
+    return _DYNAMIC_TAG_WORDLIST
+
+
+@functools.lru_cache(maxsize=1)
+def _os_first_name_pool() -> tuple[str, ...]:
+    try:
+        raw = Path("/usr/share/dict/propernames").read_text(encoding="utf-8", errors="ignore")
+        names = [n.strip() for n in raw.splitlines() if n.strip().isalpha()]
+        if len(names) >= 50:
+            return tuple(names)
+    except Exception:
+        pass
+    return ("Alice", "Maya", "Jordan", "Sam", "Taylor", "Riley", "Angel", "Noah")
+
+
+@functools.lru_cache(maxsize=1)
+def _os_city_pool() -> tuple[str, ...]:
+    # The IANA timezone database ("Region/City") is bundled with Python's
+    # own zoneinfo support and ships on every Mac — its city segments
+    # double nicely as a large list of real, well-known city names.
+    try:
+        import zoneinfo
+
+        cities: set[str] = set()
+        for zone in zoneinfo.available_timezones():
+            if "/" not in zone or zone.startswith(("Etc/", "SystemV/")):
+                continue
+            city = zone.rsplit("/", 1)[-1].replace("_", " ")
+            if re.fullmatch(r"[A-Z][a-z]+(?:[ '-][A-Z][a-z]+)*", city) and len(city) >= 4:
+                cities.add(city)
+        if len(cities) >= 50:
+            return tuple(sorted(cities))
+    except Exception:
+        pass
+    return ("Seattle", "Austin", "Denver", "Miami", "Chennai", "Berlin")
+
+
+class _ElidingLabel(QLabel):
+    """A QLabel that elides its text with "…" to whatever width the layout
+    actually gives it, instead of imposing the full text's width as a
+    minimum. Used by the dynamic-tag cards so one long sample value or
+    description can never force its grid column wider than the other two —
+    the tag grid stays a fixed 3 columns and adjusts to the window's actual
+    width, like a spreadsheet column, with no horizontal scrolling.
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setFullText(text)
+
+    def setFullText(self, text: str) -> None:
+        self._full_text = str(text or "")
+        self._apply_elide()
+
+    def fullText(self) -> str:
+        return self._full_text
+
+    def _apply_elide(self) -> None:
+        metrics = self.fontMetrics()
+        elided = metrics.elidedText(self._full_text, Qt.ElideRight, max(self.width(), 1))
+        QLabel.setText(self, elided)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(20, self.fontMetrics().height())
+
+    def sizeHint(self) -> QSize:
+        metrics = self.fontMetrics()
+        return QSize(metrics.averageCharWidth() * 12, metrics.height())
+
+
+class _UniquePicker:
+    """Hands out values from a fixed pool via `secrets` (CSPRNG) without
+    repeating one until every other value in the pool has been used —
+    so a bulk campaign send doesn't show two different recipients the same
+    random name/city/label. One instance is built per campaign send (see
+    DashboardPage._campaign_task_factory) and shared across all recipients,
+    so it's locked for thread-safety since multiple browser-window workers
+    pull from it concurrently.
+
+    A pool only has so many distinct values, so once a campaign has more
+    recipients than the pool size, values necessarily start repeating again
+    — there's no way around that without inventing more values — but every
+    value is still guaranteed to appear once before any value repeats.
+    """
+
+    def __init__(self, pool: Sequence[str]):
+        self._pool = [str(item) for item in pool if str(item).strip()]
+        self._remaining: list[str] = []
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        if not self._pool:
+            return ""
+        with self._lock:
+            if not self._remaining:
+                self._remaining = list(self._pool)
+                secrets.SystemRandom().shuffle(self._remaining)
+            return self._remaining.pop()
+
+
 class DashboardPage(QWidget):
+    # Cocoa/AppKit windowing calls (screen geometry, window placement) and
+    # widget reads are main-thread-only on macOS. The API JSON account-prep
+    # worker runs on a background QThread but still needs to open real
+    # browser windows, so it marshals that one call onto the GUI thread
+    # through this signal instead of calling _launch_browser_process directly.
+    #
+    # This uses a plain (non-blocking) queued connection plus a
+    # threading.Event on the request object, not Qt.BlockingQueuedConnection:
+    # PySide6's blocking queued connections wait on a Qt-internal semaphore
+    # without reliably releasing the GIL, so the receiving thread's Python
+    # slot can never run and the two threads deadlock. threading.Event.wait()
+    # releases the GIL correctly while blocked, which avoids that deadlock.
+    _launch_browser_process_requested = Signal(object)
+
     def __init__(self, state: AppState, on_logout, notify, scale: float = 1.0):
         super().__init__()
         self.state = state
         self.on_logout = on_logout
         self.notify = notify
         self._scale = scale
+        self._launch_browser_process_requested.connect(self._handle_launch_browser_process_request)
         self.session_list = QListWidget()
         self.window_spin = QSpinBox()
         self.tab_spin = QSpinBox()
+        self.sending_mode_manual_button = QPushButton("Manual")
+        self.sending_mode_api_button = QPushButton("API JSON")
+        self.api_json_section = QWidget()
+        self.api_json_upload_button = QPushButton("Upload JSON")
+        self.api_json_status_label = QLabel("")
         self.incognito_button = QPushButton("Incognito")
         self.normal_button = QPushButton("Normal Mode")
         self.normal_message_button = QPushButton("Plain Text")
@@ -4095,12 +4865,10 @@ class DashboardPage(QWidget):
         # more stable than rebuilding QTextDocument rich-text layouts while
         # multiple campaign signals arrive.
         self.send_log_view = QPlainTextEdit()
-        self.activity_log_view = QPlainTextEdit()
         self.progress_bar = QProgressBar()
         self.active_windows_value = QLabel("0")
         self.campaign_progress_text = QLabel("0 / 0 sent")
         self.start_campaign_button = QPushButton("Start Campaign")
-        self.sidebar_start_campaign_button = QPushButton("Start Campaign")
         self.campaign_pause_button = QPushButton("Pause Campaign")
         self.campaign_cancel_button = QPushButton("Cancel Campaign")
         self.campaign_pause_button.setVisible(False)
@@ -4146,6 +4914,9 @@ class DashboardPage(QWidget):
         self.automatic_send_checkbox = QCheckBox("Automatic (no delay)")
         self.fast_compose_checkbox = QCheckBox("Reuse one warm Gmail tab (faster, lower CPU)")
         self._campaign_threads: list[QThread] = []
+        self._api_accounts: list[ApiAccountHandle] = []
+        self._api_account_prep_thread: QThread | None = None
+        self._api_account_prep_worker: ApiAccountPrepWorker | None = None
         self._campaign_workers: dict[str, CampaignSendWorker] = {}
         self._campaign_running_workers: set[str] = set()
         self._campaign_worker_queue: list[dict[str, object]] = []
@@ -4302,11 +5073,45 @@ class DashboardPage(QWidget):
         layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
         layout.setSpacing(_scaled_int(10, self._scale))
 
+        sending_mode_card, sending_mode_layout = self._card("Sending Mode", "Choose how campaign emails are sent.")
+        self._configure_segmented_button(self.sending_mode_manual_button, checked=self.state.sending_mode != "API JSON")
+        self._configure_segmented_button(self.sending_mode_api_button, checked=self.state.sending_mode == "API JSON")
+        sending_mode_group = QButtonGroup(self)
+        sending_mode_group.setExclusive(True)
+        sending_mode_group.addButton(self.sending_mode_manual_button)
+        sending_mode_group.addButton(self.sending_mode_api_button)
+        self.sending_mode_manual_button.clicked.connect(lambda: self._set_sending_mode("Manual"))
+        self.sending_mode_api_button.clicked.connect(lambda: self._set_sending_mode("API JSON"))
+        self.sending_mode_manual_button.setToolTip("Send by driving the Gmail compose UI in a browser window")
+        self.sending_mode_api_button.setToolTip("Send through the Gmail API using uploaded account JSON credentials")
+        sending_mode_row = QHBoxLayout()
+        sending_mode_row.addWidget(self.sending_mode_manual_button)
+        sending_mode_row.addWidget(self.sending_mode_api_button)
+        sending_mode_layout.addLayout(sending_mode_row)
+
+        api_json_layout = QVBoxLayout(self.api_json_section)
+        api_json_layout.setContentsMargins(0, _scaled_int(8, self._scale), 0, 0)
+        api_json_layout.setSpacing(_scaled_int(6, self._scale))
+        self.api_json_status_label.setObjectName("windowPill")
+        api_json_layout.addWidget(self.api_json_status_label)
+        self.api_json_upload_button.setObjectName("secondaryButton")
+        self.api_json_upload_button.setToolTip("Upload one Google account JSON credential per browser window")
+        self.api_json_upload_button.clicked.connect(lambda: self._upload_api_json_credentials())
+        self._apply_button_icon(self.api_json_upload_button, QStyle.SP_DialogOpenButton)
+        api_json_layout.addWidget(self.api_json_upload_button)
+        api_json_hint = QLabel("Uploaded accounts appear below in Active Sessions — click Login to sign one in, or Start Browser to sign in all of them.")
+        api_json_hint.setObjectName("sectionHint")
+        api_json_hint.setWordWrap(True)
+        api_json_layout.addWidget(api_json_hint)
+        self.api_json_section.setVisible(self.state.sending_mode == "API JSON")
+        sending_mode_layout.addWidget(self.api_json_section)
+
         launch_card, launch_layout = self._card("Browser Session Controls")
         self.window_spin.setRange(1, 99)
         self.window_spin.setValue(self.state.window_count)
         self.window_spin.setObjectName("windowSpin")
         self.window_spin.valueChanged.connect(self._window_count_changed)
+        self._refresh_api_json_section()
         self.tab_spin.setRange(1, 50)
         self.tab_spin.setValue(self.state.tab_count)
         self.tab_spin.setObjectName("tabSpin")
@@ -4333,8 +5138,14 @@ class DashboardPage(QWidget):
         self._apply_button_icon(pause_button, QStyle.SP_MediaPause)
         self._apply_button_icon(reset_button, QStyle.SP_BrowserReload)
 
-        launch_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
-        launch_layout.addWidget(self._labeled_value_row("Tabs", self.tab_spin))
+        self.windows_tabs_section = QWidget()
+        windows_tabs_layout = QVBoxLayout(self.windows_tabs_section)
+        windows_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        windows_tabs_layout.setSpacing(_scaled_int(6, self._scale))
+        windows_tabs_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
+        windows_tabs_layout.addWidget(self._labeled_value_row("Tabs", self.tab_spin))
+        self.windows_tabs_section.setVisible(self.state.sending_mode != "API JSON")
+        launch_layout.addWidget(self.windows_tabs_section)
         launch_row.addWidget(launch_button)
         launch_row.addWidget(pause_button)
         launch_row.addWidget(reset_button)
@@ -4390,24 +5201,10 @@ class DashboardPage(QWidget):
         self.session_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         sessions_layout.addWidget(self.session_list)
 
-        activity_card, activity_layout = self._card("Activity Log", "Recent actions and workflow updates.")
-        self.activity_log_view.setObjectName("activityList")
-        self.activity_log_view.setReadOnly(True)
-        self.activity_log_view.setMaximumBlockCount(30)
-        self.activity_log_view.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-        self.activity_log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        activity_layout.addWidget(self.activity_log_view)
-
-        self.sidebar_start_campaign_button.setObjectName("blastButton")
-        self.sidebar_start_campaign_button.clicked.connect(lambda: self._handle_campaign_primary_action())
-        self.sidebar_start_campaign_button.setToolTip("Start the main send workflow")
-        self._apply_button_icon(self.sidebar_start_campaign_button, QStyle.SP_MediaPlay)
-
+        layout.addWidget(sending_mode_card)
         layout.addWidget(launch_card)
         layout.addWidget(mode_card)
         layout.addWidget(sessions_card, 2)
-        layout.addWidget(activity_card, 2)
-        layout.addWidget(self.sidebar_start_campaign_button)
 
         return sidebar
 
@@ -5699,6 +6496,12 @@ class DashboardPage(QWidget):
         tag_host_layout = QGridLayout(tag_host)
         tag_host_layout.setContentsMargins(0, 0, 0, 0)
         tag_host_layout.setSpacing(_scaled_int(8, self._scale))
+        # Always exactly 3 equal-width columns regardless of screen width or
+        # how long any one card's sample text is — long values are elided
+        # with "…" inside the card (see _ElidingLabel) rather than widening
+        # their column, so the grid never needs horizontal scrolling.
+        for column in range(3):
+            tag_host_layout.setColumnStretch(column, 1)
         self._tag_value_labels.clear()
         values = self._tag_sample_values()
         for index, definition in enumerate(self._tag_definitions):
@@ -5746,7 +6549,9 @@ class DashboardPage(QWidget):
         layout.addWidget(manual_card)
         self._load_tags_state()
         layout.addStretch()
-        return self._tab_scroll(page)
+        tab_scroll = self._tab_scroll(page)
+        tab_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return tab_scroll
 
     def _default_tag_definitions(self) -> list[dict[str, str]]:
         return [
@@ -5774,6 +6579,43 @@ class DashboardPage(QWidget):
             {"title": "Alice Johnson", "token": "$name", "description": "Full name sample", "default_value": "Alice Johnson"},
             {"title": "Seattle", "token": "$city", "description": "City sample", "default_value": "Seattle"},
             {"title": "hello-world", "token": "$slug", "description": "Slug sample", "default_value": "hello-world"},
+            {"title": "9f3a2b7c", "token": "$hex8", "description": "8-char secure hex token (CSPRNG)", "default_value": "9f3a2b7c"},
+            {"title": "9f3a2b7c4d8e1a6b", "token": "$hex16", "description": "16-char secure hex token (CSPRNG)", "default_value": "9f3a2b7c4d8e1a6b"},
+            {"title": "aZ3kLq9pVh2xTf7R", "token": "$token16", "description": "16-byte URL-safe secure token (CSPRNG)", "default_value": "aZ3kLq9pVh2xTf7R"},
+            {"title": "aZ3kLq9pVh2xTf7RmN8sQd5wYc1uJb0oKiHg", "token": "$token32", "description": "32-byte URL-safe secure token (CSPRNG)", "default_value": "aZ3kLq9pVh2xTf7RmN8sQd5wYc1uJb0oKiHg"},
+            {"title": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "token": "$uuid", "description": "Random UUID v4 (CSPRNG)", "default_value": "3fa85f64-5717-4562-b3fc-2c963f66afa6"},
+            {"title": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper", "token": "$word12", "description": "12 secure words from a fixed wordlist", "default_value": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper"},
+            {"title": "24 secure words from a fixed wordlist", "token": "$word24", "description": "24 secure words from a fixed wordlist", "default_value": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper kestrel lumen meadow nectar onyx prairie quartz raven summit tundra umbra velvet"},
+            {"title": "482913", "token": "$secureNum6", "description": "6-digit CSPRNG number, never leading zero", "default_value": "482913"},
+            {"title": "9f3a2b7c", "token": "$Lhex8", "description": "Lowercase $hex8", "default_value": "9f3a2b7c"},
+            {"title": "9F3A2B7C", "token": "$Uhex8", "description": "Uppercase $hex8", "default_value": "9F3A2B7C"},
+            {"title": "9f3a2b7c4d8e1a6b", "token": "$Lhex16", "description": "Lowercase $hex16", "default_value": "9f3a2b7c4d8e1a6b"},
+            {"title": "9F3A2B7C4D8E1A6B", "token": "$Uhex16", "description": "Uppercase $hex16", "default_value": "9F3A2B7C4D8E1A6B"},
+            {"title": "az3klq9pvh2xtf7r", "token": "$Ltoken16", "description": "Lowercase $token16", "default_value": "az3klq9pvh2xtf7r"},
+            {"title": "AZ3KLQ9PVH2XTF7R", "token": "$Utoken16", "description": "Uppercase $token16", "default_value": "AZ3KLQ9PVH2XTF7R"},
+            {"title": "az3klq9pvh2xtf7rmn8sqd5wyc1ujb0okihg", "token": "$Ltoken32", "description": "Lowercase $token32", "default_value": "az3klq9pvh2xtf7rmn8sqd5wyc1ujb0okihg"},
+            {"title": "AZ3KLQ9PVH2XTF7RMN8SQD5WYC1UJB0OKIHG", "token": "$Utoken32", "description": "Uppercase $token32", "default_value": "AZ3KLQ9PVH2XTF7RMN8SQD5WYC1UJB0OKIHG"},
+            {"title": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "token": "$Luuid", "description": "Lowercase $uuid", "default_value": "3fa85f64-5717-4562-b3fc-2c963f66afa6"},
+            {"title": "3FA85F64-5717-4562-B3FC-2C963F66AFA6", "token": "$Uuuid", "description": "Uppercase $uuid", "default_value": "3FA85F64-5717-4562-B3FC-2C963F66AFA6"},
+            {"title": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper", "token": "$Lword12", "description": "Lowercase $word12", "default_value": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper"},
+            {"title": "ORBIT MAPLE QUIET AMBER COBALT DELTA EMBER FROST GROVE HAVEN IONIC JUNIPER", "token": "$Uword12", "description": "Uppercase $word12", "default_value": "ORBIT MAPLE QUIET AMBER COBALT DELTA EMBER FROST GROVE HAVEN IONIC JUNIPER"},
+            {"title": "24 lowercase secure words", "token": "$Lword24", "description": "Lowercase $word24", "default_value": "orbit maple quiet amber cobalt delta ember frost grove haven ionic juniper kestrel lumen meadow nectar onyx prairie quartz raven summit tundra umbra velvet"},
+            {"title": "24 UPPERCASE secure words", "token": "$Uword24", "description": "Uppercase $word24", "default_value": "ORBIT MAPLE QUIET AMBER COBALT DELTA EMBER FROST GROVE HAVEN IONIC JUNIPER KESTREL LUMEN MEADOW NECTAR ONYX PRAIRIE QUARTZ RAVEN SUMMIT TUNDRA UMBRA VELVET"},
+            {"title": "FKEROASYSYDDZ29V", "token": "$alphanum", "description": "Random 16-character alphanumeric uppercase", "default_value": "FKEROASYSYDDZ29V"},
+            {"title": "FT-611496", "token": "$code", "description": "2 random letters + hyphen + 6 random digits", "default_value": "FT-611496"},
+            {"title": "UVMKGKE", "token": "$alpha", "description": "Random 7-character alphabetical uppercase", "default_value": "UVMKGKE"},
+            {"title": "Receipt No", "token": "$order", "description": "Random order/invoice header word", "default_value": "Receipt No"},
+            {"title": "Service", "token": "$product", "description": "Random product/service label", "default_value": "Service"},
+            {"title": "Duration", "token": "$duration", "description": "Random duration/tenure/validity label", "default_value": "Duration"},
+            {"title": "Up to 24 hours", "token": "$resptime", "description": "Random customer support SLA response time", "default_value": "Up to 24 hours"},
+            {"title": "Total", "token": "$total", "description": "Random billing total label", "default_value": "Total"},
+            {"title": "Angel Lee", "token": "$fullname", "description": "Random First Name + Last Name", "default_value": "Angel Lee"},
+            {"title": "09/17/2026", "token": "$date", "description": "Current date MM/DD/YYYY", "default_value": "09/17/2026"},
+            {"title": "03:10 PM", "token": "$time", "description": "Current time HH:MM AM/PM", "default_value": "03:10 PM"},
+            {"title": "Microsoft", "token": "$company", "description": "Random real global company name", "default_value": "Microsoft"},
+            {"title": "$299.99", "token": "$amount", "description": "Random dollar amount ($149.99 - $499.99), CSPRNG", "default_value": "$299.99"},
+            {"title": "preview", "token": "$emailname", "description": "The name part of the recipient's email (before @)", "default_value": "preview"},
+            {"title": "3471027", "token": "$invoice", "description": "Random 7-digit order/invoice ID number (CSPRNG)", "default_value": "3471027"},
         ]
 
     def _configure_segmented_button(self, button: QPushButton, checked: bool = False) -> None:
@@ -5810,7 +6652,6 @@ class DashboardPage(QWidget):
             self._apply_tab_icon(self.admin_tabs, 1, QStyle.SP_FileDialogListView)
             self._apply_tab_icon(self.admin_tabs, 2, QStyle.SP_MessageBoxInformation)
         for button, icon in (
-            (getattr(self, "sidebar_start_campaign_button", None), QStyle.SP_MediaPlay),
             (getattr(self, "start_campaign_button", None), QStyle.SP_MediaPlay),
             (getattr(self, "campaign_pause_button", None), QStyle.SP_MediaPause),
             (getattr(self, "campaign_cancel_button", None), QStyle.SP_DialogCancelButton),
@@ -5899,6 +6740,35 @@ class DashboardPage(QWidget):
 
     def _generate_random_tag_value(self, token: str, default_value: str) -> str:
         token = token.strip()
+        # These new tags are matched before the older, looser "$word"/"$num"
+        # prefix checks below so e.g. "$word12" doesn't fall into the
+        # generic "$word" branch. All values come from `secrets` (the OS
+        # CSPRNG), never `random`.
+        if token == "$hex8":
+            return secrets.token_hex(4)
+        if token == "$hex16":
+            return secrets.token_hex(8)
+        if token == "$token16":
+            return secrets.token_urlsafe(16)
+        if token == "$token32":
+            return secrets.token_urlsafe(32)
+        if token == "$uuid":
+            return str(uuid.uuid4())
+        if token == "$word12":
+            # sample() (no replacement) instead of repeated choice() so the
+            # 12 words in one value are never a duplicate of each other.
+            return " ".join(secrets.SystemRandom().sample(_os_word_pool(), 12))
+        if token == "$word24":
+            return " ".join(secrets.SystemRandom().sample(_os_word_pool(), 24))
+        if token == "$secureNum6":
+            return str(secrets.randbelow(900000) + 100000)
+        # Forced-case variants of the tags above: "$L..."/"$U..." reuse the
+        # same CSPRNG generation and just lower()/upper() the result — no
+        # separate randomness source, so they're exactly as secure as the
+        # base tag.
+        if token[1:2] in ("L", "U") and f"${token[2:]}" in _CASE_VARIANT_BASE_TOKENS:
+            base_value = self._generate_random_tag_value(f"${token[2:]}", default_value)
+            return base_value.lower() if token[1] == "L" else base_value.upper()
         if token.startswith("$random"):
             length_text = token.removeprefix("$random")
             try:
@@ -5944,16 +6814,90 @@ class DashboardPage(QWidget):
         if token == "$url":
             return f"https://ezymailer-{secrets.randbelow(9000) + 1000}.app"
         if token == "$name":
-            first_names = ["Alice", "Maya", "Jordan", "Sam", "Taylor", "Riley"]
-            last_names = ["Johnson", "Patel", "Smith", "Brown", "Lee", "Walker"]
-            return f"{secrets.choice(first_names)} {secrets.choice(last_names)}"
+            # First names come from macOS's own /usr/share/dict/propernames
+            # (over 1,300 real names) instead of a short hand-picked list —
+            # there's no equivalent OS-provided surname list, so last names
+            # still come from a small built-in set.
+            return f"{secrets.choice(_os_first_name_pool())} {secrets.choice(_TAG_LAST_NAMES)}"
         if token == "$city":
-            cities = ["Seattle", "Austin", "Denver", "Miami", "Chennai", "Berlin"]
-            return secrets.choice(cities)
+            return secrets.choice(_os_city_pool())
         if token == "$slug":
             words = ["hello", "launch", "email", "campaign", "update", "ready"]
-            return f"{secrets.choice(words)}-{secrets.choice(words)}"
+            first, second = secrets.SystemRandom().sample(words, 2)
+            return f"{first}-{second}"
+        if token == "$alphanum":
+            alphabet = string.ascii_uppercase + string.digits
+            return "".join(secrets.choice(alphabet) for _ in range(16))
+        if token == "$code":
+            letters = "".join(secrets.choice(string.ascii_uppercase) for _ in range(2))
+            digits = "".join(secrets.choice(string.digits) for _ in range(6))
+            return f"{letters}-{digits}"
+        if token == "$alpha":
+            return "".join(secrets.choice(string.ascii_uppercase) for _ in range(7))
+        if token == "$order":
+            return secrets.choice(_TAG_ORDER_LABELS)
+        if token == "$product":
+            return secrets.choice(_TAG_PRODUCT_LABELS)
+        if token == "$duration":
+            return secrets.choice(_TAG_DURATION_LABELS)
+        if token == "$resptime":
+            return secrets.choice(_TAG_RESPTIME_LABELS)
+        if token == "$total":
+            return secrets.choice(_TAG_TOTAL_LABELS)
+        if token == "$fullname":
+            return f"{secrets.choice(_os_first_name_pool())} {secrets.choice(_TAG_LAST_NAMES)}"
+        if token == "$date":
+            today = QDateTime.currentDateTime().date()
+            return f"{today.month():02d}/{today.day():02d}/{today.year()}"
+        if token == "$time":
+            now = QDateTime.currentDateTime().time()
+            hour24 = now.hour()
+            period = "AM" if hour24 < 12 else "PM"
+            hour12 = hour24 % 12 or 12
+            return f"{hour12:02d}:{now.minute():02d} {period}"
+        if token == "$company":
+            return secrets.choice(_TAG_COMPANY_NAMES)
+        if token == "$amount":
+            dollars = secrets.randbelow(499 - 149 + 1) + 149
+            return f"${dollars}.99"
+        if token == "$invoice":
+            return str(secrets.randbelow(9000000) + 1000000)
         return default_value
+
+    def _build_campaign_unique_pickers(self) -> dict[str, "_UniquePicker"]:
+        """One _UniquePicker per name/city/label tag, built fresh for each
+        campaign send and shared by every recipient in it — see
+        _UniquePicker for why. $name and $fullname share one first-name
+        picker since they draw from the same pool.
+        """
+        first_name_picker = _UniquePicker(_os_first_name_pool())
+        return {
+            "$name": first_name_picker,
+            "$fullname": first_name_picker,
+            "$city": _UniquePicker(_os_city_pool()),
+            "$company": _UniquePicker(_TAG_COMPANY_NAMES),
+            "$order": _UniquePicker(_TAG_ORDER_LABELS),
+            "$product": _UniquePicker(_TAG_PRODUCT_LABELS),
+            "$duration": _UniquePicker(_TAG_DURATION_LABELS),
+            "$resptime": _UniquePicker(_TAG_RESPTIME_LABELS),
+            "$total": _UniquePicker(_TAG_TOTAL_LABELS),
+        }
+
+    def _generate_campaign_tag_value(
+        self, token: str, default_value: str, pickers: dict[str, "_UniquePicker"]
+    ) -> str:
+        """Campaign-send version of _generate_random_tag_value: for the
+        tokens in `pickers`, draws a value that won't repeat until every
+        other value in its pool has been used once across this campaign.
+        Everything else falls back to the plain (independent-per-call)
+        generator, which is already effectively unique on its own (hex/
+        token/uuid CSPRNG collisions are astronomically unlikely).
+        """
+        if token in ("$name", "$fullname"):
+            return f"{pickers[token].next()} {secrets.choice(_TAG_LAST_NAMES)}"
+        if token in pickers:
+            return pickers[token].next()
+        return self._generate_random_tag_value(token, default_value)
 
     def _current_tag_state(self) -> dict[str, object]:
         samples = self._tag_sample_values()
@@ -5988,7 +6932,9 @@ class DashboardPage(QWidget):
         merged_samples.update(samples)
         self.state.tag_samples = merged_samples
         for token, label in self._tag_value_labels.items():
-            label.setText(merged_samples.get(token, label.text()))
+            full_value = merged_samples.get(token, label.toolTip() or label.fullText())
+            label.setFullText(full_value)
+            label.setToolTip(full_value)
 
     def _schedule_tags_save(self) -> None:
         if self._workspace_loading:
@@ -6085,6 +7031,7 @@ class DashboardPage(QWidget):
             "$recipient_email": recipient,
             "$recipient_local_part": local_part,
             "$username": local_part,
+            "$emailname": local_part,
             "$first_name": first_name,
             "$last_name": last_name,
             "$full_name": full_name,
@@ -6524,41 +7471,191 @@ class DashboardPage(QWidget):
     def _tag_card(self, title: str, token: str, description: str, value: str) -> QWidget:
         card = QFrame()
         card.setObjectName("panelCard")
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card.setMinimumWidth(0)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
-        layout.setSpacing(_scaled_int(6, self._scale))
+        layout.setContentsMargins(_scaled_int(10, self._scale), _scaled_int(9, self._scale), _scaled_int(10, self._scale), _scaled_int(9, self._scale))
+        layout.setSpacing(_scaled_int(4, self._scale))
 
         header = QHBoxLayout()
-        title_label = QLabel(title)
+        header.setSpacing(_scaled_int(6, self._scale))
+        title_label = _ElidingLabel(title)
         title_label.setObjectName("sectionTitle")
+        title_label.setToolTip(title)
         token_label = QLabel(token)
         token_label.setObjectName("windowPill")
-        header.addWidget(title_label)
-        header.addStretch()
-        header.addWidget(token_label)
+        header.addWidget(title_label, 1)
+        header.addWidget(token_label, 0)
         layout.addLayout(header)
 
         row = QHBoxLayout()
-        token_value = QLabel(value or token)
+        row.setSpacing(_scaled_int(6, self._scale))
+        token_value = _ElidingLabel(value or token)
         token_value.setObjectName("sectionSubtitle")
+        token_value.setToolTip(value or token)
         copy_button = QPushButton("Copy")
         copy_button.setObjectName("secondaryButton")
         copy_button.clicked.connect(lambda _checked=False, token=token: self._copy_to_clipboard(token, "tag"))
-        token_value.setToolTip(f"Token value for {token}")
         copy_button.setToolTip(f"Copy {token} to clipboard")
-        row.addWidget(token_value)
-        row.addStretch()
-        row.addWidget(copy_button)
+        row.addWidget(token_value, 1)
+        row.addWidget(copy_button, 0)
         layout.addLayout(row)
 
-        desc = QLabel(description)
+        desc = _ElidingLabel(description)
         desc.setObjectName("sectionHint")
-        desc.setWordWrap(True)
+        desc.setToolTip(description)
         layout.addWidget(desc)
 
         self._tag_value_labels[token] = token_value
 
         return card
+
+    def _has_active_session(self) -> bool:
+        return bool(self._browser_sessions) or bool(self._api_accounts)
+
+    def _update_sending_mode_lock(self) -> None:
+        locked = self._has_active_session()
+        self.sending_mode_manual_button.setEnabled(not locked)
+        self.sending_mode_api_button.setEnabled(not locked)
+        lock_tip = "End the active session (close browser windows / logout accounts) before switching sending mode"
+        self.sending_mode_manual_button.setToolTip(
+            lock_tip if locked else "Send by driving the Gmail compose UI in a browser window"
+        )
+        self.sending_mode_api_button.setToolTip(
+            lock_tip if locked else "Send through the Gmail API using uploaded account JSON credentials"
+        )
+
+    def _set_sending_mode(self, mode: str) -> None:
+        if mode != self.state.sending_mode and self._has_active_session():
+            # Revert the segmented buttons — the click already toggled them
+            # before this handler ran.
+            self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
+            self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
+            self.notify("End the active session before switching sending mode")
+            return
+        self.state.sending_mode = mode
+        self.sending_mode_manual_button.setChecked(mode != "API JSON")
+        self.sending_mode_api_button.setChecked(mode == "API JSON")
+        self.api_json_section.setVisible(mode == "API JSON")
+        self._refresh_api_json_section()
+        self._persist_browser_state()
+        self._log_action(f"Sending mode set to {mode}")
+        self.notify(f"Sending mode changed to {mode}")
+
+    def _pending_api_json_row(self, path_str: str) -> QWidget:
+        """An uploaded JSON credential that hasn't been signed in yet."""
+        row = QFrame()
+        row.setObjectName("sessionRow")
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(7, self._scale), _scaled_int(8, self._scale), _scaled_int(7, self._scale))
+        row_layout.setSpacing(_scaled_int(4, self._scale))
+        row.setMinimumHeight(_scaled_int(52, self._scale))
+
+        dot = QLabel("●")
+        dot.setObjectName("sessionDot")
+        label = QLabel(Path(path_str).name)
+        label.setObjectName("sessionTitleSmall")
+        label.setToolTip(path_str)
+        state = QLabel("API JSON - Pending sign-in")
+        state.setObjectName("sessionState")
+        label.setMinimumWidth(_scaled_int(72, self._scale))
+        state.setMinimumWidth(_scaled_int(80, self._scale))
+        state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+
+        login_button = QPushButton("Login")
+        login_button.setObjectName("secondaryButton")
+        login_button.setToolTip("Open a browser window and sign in to this account")
+        login_button.clicked.connect(lambda _, p=path_str: self._handle_login_single_api_json(p))
+        remove_button = QPushButton("✕")
+        remove_button.setObjectName("dangerButton")
+        remove_button.setFixedWidth(_scaled_int(28, self._scale))
+        remove_button.setToolTip("Remove this JSON credential")
+        remove_button.clicked.connect(lambda _, p=path_str: self._remove_api_json_credential(p))
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(_scaled_int(6, self._scale))
+        top_row.addWidget(dot)
+        top_row.addWidget(label)
+        top_row.addStretch()
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(_scaled_int(6, self._scale))
+        bottom_row.addWidget(state)
+        bottom_row.addStretch()
+        bottom_row.addWidget(login_button)
+        bottom_row.addWidget(remove_button)
+
+        row_layout.addLayout(top_row)
+        row_layout.addLayout(bottom_row)
+        return row
+
+    def _apply_window_spin_limit(self) -> None:
+        json_count = len(self.state.api_json_paths)
+        if self.state.sending_mode == "API JSON" and json_count:
+            # Windows/Tabs are hidden in this mode — Start Browser is meant
+            # to sign in every uploaded account, so keep this in lockstep
+            # with the upload count rather than requiring the user to touch
+            # a control they can no longer see.
+            self.window_spin.setRange(1, json_count)
+            self.window_spin.setValue(json_count)
+        else:
+            self.window_spin.setRange(1, 99)
+
+    def _refresh_api_json_section(self) -> None:
+        count = len(self.state.api_json_paths)
+        if count:
+            noun = "account" if count == 1 else "accounts"
+            self.api_json_status_label.setText(f"{count} {noun} uploaded")
+        else:
+            self.api_json_status_label.setText("No JSON uploaded yet")
+        self._apply_window_spin_limit()
+        if hasattr(self, "windows_tabs_section"):
+            self.windows_tabs_section.setVisible(self.state.sending_mode != "API JSON")
+        self._refresh_sessions()
+
+    def _upload_api_json_credentials(self) -> None:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload Google account JSON credentials",
+            "",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_paths:
+            return
+
+        added = 0
+        for file_name in file_paths:
+            path = Path(file_name)
+            try:
+                resolved = str(path.resolve())
+            except Exception:
+                resolved = str(path)
+            if resolved in self.state.api_json_paths:
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    json.load(handle)
+            except Exception as exc:
+                self._log_action(f"Skipped invalid JSON credential {path.name}: {exc}")
+                continue
+            self.state.api_json_paths.append(resolved)
+            added += 1
+
+        if added:
+            self._refresh_api_json_section()
+            self._persist_browser_state()
+            self._log_action(f"Uploaded {added} account JSON credential(s)")
+            self.notify(f"Uploaded {added} JSON credential(s)")
+        else:
+            self.notify("No new valid JSON credentials were added")
+
+    def _remove_api_json_credential(self, path_str: str) -> None:
+        if path_str not in self.state.api_json_paths:
+            return
+        self.state.api_json_paths.remove(path_str)
+        self._refresh_api_json_section()
+        self._persist_browser_state()
+        self._log_action(f"Removed account JSON credential: {Path(path_str).name}")
 
     def _set_browser_mode(self, mode: str) -> None:
         self.state.browser_mode = mode
@@ -6605,6 +7702,8 @@ class DashboardPage(QWidget):
     def _current_browser_state_payload(self) -> dict[str, object]:
         return {
             "browser_mode": self.state.browser_mode,
+            "sending_mode": self.state.sending_mode,
+            "api_json_paths": list(self.state.api_json_paths),
             "launch_preset": self.state.launch_preset,
             "window_count": int(self.state.window_count),
             "tab_count": int(self.state.tab_count),
@@ -6612,6 +7711,11 @@ class DashboardPage(QWidget):
 
     def _apply_browser_state_payload(self, payload: dict[str, object]) -> None:
         browser_mode = str(payload.get("browser_mode") or "Incognito")
+        sending_mode = str(payload.get("sending_mode") or "Manual")
+        raw_json_paths = payload.get("api_json_paths") or []
+        api_json_paths = [
+            str(item) for item in raw_json_paths if isinstance(item, str) and Path(item).exists()
+        ] if isinstance(raw_json_paths, list) else []
         launch_preset = str(payload.get("launch_preset") or "Default")
         try:
             window_count = max(1, int(payload.get("window_count") or 1))
@@ -6623,9 +7727,15 @@ class DashboardPage(QWidget):
             tab_count = 1
 
         self.state.browser_mode = browser_mode if browser_mode in {"Incognito", "Normal"} else "Incognito"
+        self.state.sending_mode = sending_mode if sending_mode in {"Manual", "API JSON"} else "Manual"
+        self.state.api_json_paths = self._discover_saved_api_accounts(api_json_paths)
         self.state.launch_preset = launch_preset
         self.state.window_count = window_count
         self.state.tab_count = tab_count
+        self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
+        self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
+        self.api_json_section.setVisible(self.state.sending_mode == "API JSON")
+        self._refresh_api_json_section()
         for spin, value in ((self.window_spin, window_count), (self.tab_spin, tab_count)):
             spin.blockSignals(True)
             spin.setValue(value)
@@ -6737,7 +7847,34 @@ class DashboardPage(QWidget):
         except Exception:
             pass
 
-    def _launch_browser_process(self, index: int) -> BrowserSessionHandle:
+    def _handle_launch_browser_process_request(self, request: "_BrowserLaunchRequest") -> None:
+        try:
+            request.result = self._launch_browser_process(request.index, total_override=request.total_override)
+        except Exception as exc:
+            request.error = exc
+        finally:
+            request.event.set()
+
+    def _launch_browser_process_threadsafe(
+        self, index: int, *, total_override: int | None = None
+    ) -> BrowserSessionHandle:
+        """Open a browser window safely regardless of the calling thread.
+
+        _launch_browser_process reads self.window_spin and calls
+        self.window().screen() for window placement — both main-thread-only
+        on macOS. Off the GUI thread, hand the request to the GUI thread via
+        a queued signal and wait on a threading.Event for the result.
+        """
+        if QThread.currentThread() is self.thread():
+            return self._launch_browser_process(index, total_override=total_override)
+        request = _BrowserLaunchRequest(index, total_override=total_override)
+        self._launch_browser_process_requested.emit(request)
+        request.event.wait()
+        if request.error is not None:
+            raise request.error
+        return request.result
+
+    def _launch_browser_process(self, index: int, *, total_override: int | None = None) -> BrowserSessionHandle:
         binary = self._browser_binary()
         if binary is None:
             raise RuntimeError("No supported Edge, Chrome, or Chromium browser was found for this app.")
@@ -6770,7 +7907,8 @@ class DashboardPage(QWidget):
         args.extend(BROWSER_RESOURCE_FLAGS)
         if incognito:
             args.append(_browser_private_flag(browser_name))
-        x, y, width, height = self._browser_launch_rect(index, max(1, self.window_spin.value()))
+        tile_total = total_override if total_override is not None else self.window_spin.value()
+        x, y, width, height = self._browser_launch_rect(index, max(1, tile_total))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
         # Open one Gmail page for every configured sending tab. Chrome accepts
@@ -6922,6 +8060,9 @@ class DashboardPage(QWidget):
         self._browser_watch_timer.stop()
 
     def _handle_launch(self) -> None:
+        if self.state.sending_mode == "API JSON":
+            self._handle_launch_api_json()
+            return
         title = "Confirm Launch"
         tab_count = max(1, self.tab_spin.value())
         prompt = (
@@ -6951,6 +8092,70 @@ class DashboardPage(QWidget):
             "Applying browser mode and launch preset.",
         )
         QTimer.singleShot(900, lambda t=target: self._complete_launch(t))
+
+    def _api_json_accounts_ready(self) -> bool:
+        return len(self._api_accounts) >= max(1, self.window_spin.value())
+
+    def _handle_launch_api_json(self) -> None:
+        """Start Browser, for API JSON mode: open one signed-in window per
+        uploaded JSON credential that isn't already signed in. Every
+        account must already have a ready-to-use JSON uploaded — nothing is
+        generated here (use the Gmail API Automation tool for that).
+        Sending itself never touches these windows; they only confirm the
+        account is signed in before Start Campaign is allowed.
+        """
+        self._launch_api_json_accounts(list(self.state.api_json_paths))
+
+    def _handle_login_single_api_json(self, path_str: str) -> None:
+        """Login button on one pending account's row — same as Start
+        Browser, but for just that one account."""
+        self._launch_api_json_accounts([path_str])
+
+    def _launch_api_json_accounts(self, requested_paths: list[str]) -> None:
+        if self._api_account_prep_thread is not None:
+            self.notify("Already preparing Gmail API account(s) — please wait")
+            return
+        active_paths = {str(account.credential_path) for account in self._api_accounts}
+        pending = [p for p in requested_paths if p not in active_paths]
+        if not pending:
+            self.notify(
+                "Already signed in" if requested_paths else "Upload a JSON credential first"
+            )
+            return
+        title = "Confirm Launch"
+        prompt = (
+            f"EzyMailer will open {len(pending)} browser window(s), one per uploaded JSON credential. "
+            f"Sign in to Gmail in each one, then Start Campaign will be available."
+        )
+        confirm = ConfirmDialog(self.window(), title, prompt, scale=self._scale)
+        if confirm.exec() != QDialog.Accepted:
+            self.notify("Launch cancelled")
+            return
+
+        self._log_action(f"Preparing {len(pending)} Gmail API account(s)")
+        self.notify("Preparing Gmail API accounts")
+        self._show_launch_loader(
+            "Preparing Gmail API accounts",
+            "Sign in to Gmail in each window that opens.",
+        )
+        thread = QThread(self)
+        worker = ApiAccountPrepWorker(self, pending, len(pending))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run, Qt.DirectConnection)
+        worker.log.connect(self._log_action)
+        worker.finished.connect(self._on_api_accounts_ready)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        # Drop our Python references only once the QThread itself has fully
+        # finished, not from the worker.finished handler above. worker.finished
+        # is also what schedules worker.deleteLater(); clearing the last
+        # Python reference to the worker at that same moment races Qt's own
+        # deferred deletion and can double-free the QObject.
+        thread.finished.connect(self._on_api_account_prep_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._api_account_prep_thread = thread
+        self._api_account_prep_worker = worker
+        thread.start()
 
     def _resume_pending_launch(self) -> None:
         target = self._pending_launch_target
@@ -7195,17 +8400,35 @@ class DashboardPage(QWidget):
 
     @staticmethod
     def _is_campaign_sent_log(message: str) -> bool:
-        return bool(re.match(r"^\[[^\]]+\]\s+.+?\s+sent\s+\S+", str(message or "").strip()))
+        # This used to show ONLY "... sent ..." lines, silently dropping
+        # every failure/cancellation/setup-error message from the visible
+        # log — a real send failure looked identical to "nothing is
+        # happening" (0% progress, empty log), with the actual reason
+        # never shown anywhere. Now only the noisy per-attempt retry lines
+        # ("attempt 1/3 failed for x: ...") are hidden; every definitive
+        # per-recipient outcome and setup error is shown.
+        return not re.search(r"attempt\s+\d+/\d+\s+failed", str(message or ""))
 
     def _update_campaign_action_state(self) -> None:
         runtime_busy = self._campaign_active or bool(self._campaign_threads)
-        can_start = self.state.logged_in and not runtime_busy and not self._campaign_missing_fields()
+        missing_fields = self._campaign_missing_fields()
+        can_start = self.state.logged_in and not runtime_busy and not missing_fields
         primary_label = "Start Campaign"
         if self._campaign_active:
             primary_label = "Resume Campaign" if self._campaign_paused else "Pause Campaign"
-        for button in (self.start_campaign_button, self.sidebar_start_campaign_button):
-            button.setText(primary_label)
-            button.setEnabled(can_start if not self._campaign_active else True)
+        self.start_campaign_button.setText(primary_label)
+        self.start_campaign_button.setEnabled(can_start if not self._campaign_active else True)
+        # A disabled button gives zero feedback on click — the tooltip is
+        # the only way to learn why, so it must say what's actually missing
+        # instead of a static "Start the email sending workflow" caption.
+        if not self._campaign_active and missing_fields:
+            self.start_campaign_button.setToolTip(
+                "Add " + ", ".join(missing_fields) + " before starting the campaign"
+            )
+        elif not self._campaign_active and not self.state.logged_in:
+            self.start_campaign_button.setToolTip("Sign in first to start a campaign")
+        else:
+            self.start_campaign_button.setToolTip("Start the email sending workflow")
         self.campaign_pause_button.setVisible(self._campaign_active)
         self.campaign_pause_button.setEnabled(self._campaign_active)
         self.campaign_pause_button.setText("Resume Campaign" if self._campaign_paused else "Pause Campaign")
@@ -7275,6 +8498,10 @@ class DashboardPage(QWidget):
         custom2 = self.custom2_input.text().strip()
         tag_definitions = [dict(item) for item in self._tag_definitions]
         default_attachment_format = attachment_formats[0] if attachment_formats else self.attach_format_value
+        # Fresh per campaign send, shared by every recipient below, so
+        # $name/$fullname/$city/$company/$order/... don't repeat a value
+        # until every other value in that tag's pool has been used once.
+        unique_pickers = self._build_campaign_unique_pickers()
         customer_records: dict[str, dict[str, object]] | None = None
         customer_records_lock = threading.Lock()
 
@@ -7321,7 +8548,7 @@ class DashboardPage(QWidget):
 
         def build_task(recipient: str) -> dict[str, str]:
             dynamic_values = {
-                item["token"]: self._generate_random_tag_value(item["token"], item["default_value"])
+                item["token"]: self._generate_campaign_tag_value(item["token"], item["default_value"], unique_pickers)
                 for item in tag_definitions
             }
             replacements = {"$custom1": custom1, "$custom2": custom2, "$subject": ""}
@@ -7397,7 +8624,7 @@ class DashboardPage(QWidget):
 
     def _queue_campaign_job(self, job: dict[str, object]) -> None:
         session = job["session"]
-        if isinstance(session, BrowserSessionHandle):
+        if isinstance(session, (BrowserSessionHandle, ApiAccountHandle)):
             session.send_completed = 0
             session.send_total = int(job["task_total"])
         lane_id = str(session.session_id)
@@ -7406,12 +8633,15 @@ class DashboardPage(QWidget):
         self._refresh_window_campaign_counts(refresh_ui=False)
         self._schedule_campaign_runtime_ui_refresh()
         thread = QThread(self)
+        send_callback = (
+            self._send_via_gmail_api if isinstance(session, ApiAccountHandle) else self._send_compose_with_playwright
+        )
         worker = CampaignSendWorker(
             session,
             None,
             self._campaign_pause_event,
             self._campaign_cancel_event,
-            self._send_compose_with_playwright,
+            send_callback,
             recipient_queue_path=job["recipient_queue_path"],
             task_factory=job["task_factory"],
             task_total=int(job["task_total"]),
@@ -7463,7 +8693,7 @@ class DashboardPage(QWidget):
         self._update_campaign_action_state()
 
     def _refresh_window_campaign_counts(self, *, refresh_ui: bool = True) -> None:
-        for session in self._browser_sessions:
+        for session in (*self._browser_sessions, *self._api_accounts):
             lane_ids = [
                 lane_id
                 for lane_id, parent_id in self._campaign_lane_parents.items()
@@ -7775,6 +9005,15 @@ class DashboardPage(QWidget):
             self._refresh_campaign_action_state()
             return
 
+        if self.state.sending_mode == "API JSON":
+            if not self._api_json_accounts_ready():
+                self._log_action("Campaign requested: preparing Gmail API accounts first")
+                self._pending_campaign_payload = payload
+                self._handle_launch()
+                return
+            self._execute_api_json_campaign_send(payload, self._api_accounts)
+            return
+
         # The Start Campaign button is the user's explicit confirmation.
         # Begin immediately after validation so a native modal cannot block
         # or delay parallel workers.
@@ -7785,6 +9024,144 @@ class DashboardPage(QWidget):
             return
 
         self._execute_campaign_send(payload)
+
+    def _on_api_account_prep_thread_finished(self) -> None:
+        self._api_account_prep_thread = None
+        self._api_account_prep_worker = None
+
+    def _on_api_accounts_ready(self, ok: bool, error_message: str, accounts: list[ApiAccountHandle]) -> None:
+        self.window().hide_launch_loader()
+        pending_payload = self._pending_campaign_payload
+        self._pending_campaign_payload = None
+        if not ok:
+            self._log_action(f"Gmail API account setup failed: {error_message}")
+            self.notify("Could not prepare Gmail API account(s) — see the dialog for details")
+            QMessageBox.warning(self, "Gmail API account setup failed", error_message)
+            return
+
+        self._api_accounts.extend(accounts)
+        self._refresh_sessions()
+        self._log_action(f"{len(accounts)} Gmail API account(s) ready")
+        if pending_payload is not None:
+            self._execute_api_json_campaign_send(pending_payload, self._api_accounts)
+        else:
+            self.notify(f"{len(accounts)} Gmail API account(s) ready to send")
+
+    def _register_bulk_api_account(self, account: ApiAccountHandle) -> None:
+        """Bring one Gmail API Automation result online immediately.
+
+        Called per-account as the bulk tool finishes each row, rather than
+        waiting for the whole batch — the account's browser window is
+        already open and signed in (left open on purpose), so it should
+        show as an active session right away instead of only after
+        manually uploading its JSON afterward.
+        """
+        self._api_accounts.append(account)
+        path_str = str(account.credential_path)
+        if path_str not in self.state.api_json_paths:
+            self.state.api_json_paths.append(path_str)
+        self._refresh_sessions()
+        self._persist_browser_state()
+        self._log_action(f"{account.account_email or account.title} is online")
+
+    def _execute_api_json_campaign_send(self, payload: dict[str, object], accounts: list[ApiAccountHandle]) -> None:
+        if self._campaign_active:
+            self.notify("Campaign is already running")
+            return
+
+        self.state.automatic_no_delay = self.automatic_send_checkbox.isChecked()
+        self._cleanup_campaign_temp_files_async()
+        if self._temp_storage_available() < 256 * 1024 * 1024:
+            self.notify("Please free some storage space before starting")
+            self._log_action("Campaign blocked: not enough free storage space")
+            return
+
+        recipients_raw = payload.get("recipients") or []
+        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
+        if not recipients:
+            self.notify("Add customer emails before starting the campaign")
+            self._log_action("Campaign blocked: no recipients available")
+            return
+
+        subject_values = payload.get("subjects")
+        subject_template: str | list[str]
+        if isinstance(subject_values, list):
+            subject_template = [str(item).strip() for item in subject_values if str(item).strip()]
+        else:
+            subject_template = str(payload.get("subject") or "").strip()
+        if not subject_template:
+            subject_template = str(payload.get("subject") or "").strip()
+        body_template = self._campaign_body_text(str(payload.get("body_text") or ""), str(payload.get("body_html") or ""))
+        if not body_template:
+            self.notify("Add body content before starting the campaign")
+            self._log_action("Campaign blocked: no body content available")
+            return
+
+        attachment_html = str(payload.get("attachment_html") or "").strip()
+        attachment_formats = self._normalize_attachment_format_values(
+            payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document"
+        )
+        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
+        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
+
+        if not accounts:
+            self.notify("No Gmail API accounts are ready")
+            self._log_action("Campaign blocked: no Gmail API accounts available")
+            return
+
+        ordered_recipients = list(recipients)
+        if self.state.email_send_order == "Random shuffle":
+            random.shuffle(ordered_recipients)
+
+        total = len(ordered_recipients)
+        lane_count = min(len(accounts), total)
+        # _queue_campaign_job reads attachment settings off this attribute —
+        # must be the real payload here, not None (that was a copy-paste
+        # mismatch from the Manual-mode version of this function, and left
+        # every API JSON send silently crashing with AttributeError before
+        # any worker thread started).
+        self._pending_campaign_payload = payload
+        self._campaign_send_log_entries.clear()
+        self._campaign_pause_event.set()
+        self._campaign_cancel_event.clear()
+        self._campaign_active = True
+        session_timer = getattr(self.window(), "_session_check_timer", None)
+        if session_timer is not None:
+            session_timer.stop()
+        self._campaign_paused = False
+        self._campaign_total = total
+        self._campaign_completed = 0
+        self._campaign_worker_queue = []
+        self._campaign_running_workers.clear()
+        self._campaign_worker_progress.clear()
+        self._campaign_worker_totals.clear()
+        self._campaign_lane_parents.clear()
+        self.progress_bar.setValue(0)
+        self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
+        self._update_campaign_action_state()
+
+        jobs = self._build_campaign_jobs(
+            accounts[:lane_count],
+            ordered_recipients,
+            subject_template,
+            body_template,
+            attachment_html,
+            attachment_formats,
+            file_name_mode,
+            file_name_value,
+        )
+        self._campaign_worker_queue = list(jobs)
+        self._log_action(f"Campaign ready for {total} recipient(s) across {lane_count} Gmail API account(s)")
+        self.notify("Sending campaign")
+        self.window().hide_launch_loader()
+
+        if self.state.window_send_mode == "Sequential":
+            self._start_next_campaign_worker()
+        else:
+            queue = list(self._campaign_worker_queue)
+            self._campaign_worker_queue.clear()
+            for job in queue:
+                self._queue_campaign_job(job)
 
     def _html_to_plain_text(self, value: str) -> str:
         cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", value or "")
@@ -8438,6 +9815,1214 @@ class DashboardPage(QWidget):
             pass
         page.wait_for_timeout(300)
 
+    # ------------------------------------------------------------------
+    # API JSON sending: Gmail API + OAuth, no compose UI involved.
+    # ------------------------------------------------------------------
+
+    def _discover_saved_api_accounts(self, existing: list[str]) -> list[str]:
+        """Pick up previously generated account credentials automatically.
+
+        Credentials are saved under GOOGLE_API_ACCOUNTS_DIR the moment
+        they're created, independent of this workspace's own saved state.
+        Merging the directory back in means a credential stays reusable
+        even if the app's local state was reset or this is a fresh profile
+        pointed at the same Application Support folder.
+        """
+        merged = list(existing)
+        try:
+            if not GOOGLE_API_ACCOUNTS_DIR.exists():
+                return merged
+            existing_set = set(merged)
+            for candidate in sorted(GOOGLE_API_ACCOUNTS_DIR.glob("*.json")):
+                resolved = str(candidate.resolve())
+                if resolved in existing_set:
+                    continue
+                try:
+                    json.loads(candidate.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                merged.append(resolved)
+                existing_set.add(resolved)
+        except Exception:
+            pass
+        return merged
+
+    def _read_api_client_payload(self, path: Path) -> dict[str, str]:
+        """Read a client ID/secret out of whatever JSON shape was uploaded.
+
+        Accepts three shapes: this app's own combined credential (flat
+        client_id/client_secret/refresh_token/account_email), Google's raw
+        OAuth-client download (nested under "installed" or "web", client ID
+        and secret only), or anything else with those two fields at the top
+        level. Only client_id/client_secret are required — refresh_token and
+        account_email are filled in later by signing in if not already
+        present.
+        """
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Could not read {path.name}: {exc}") from exc
+        installed = payload.get("installed") or payload.get("web") or {}
+        client_id = str(installed.get("client_id") or payload.get("client_id") or "")
+        client_secret = str(installed.get("client_secret") or payload.get("client_secret") or "")
+        if not client_id or not client_secret:
+            raise RuntimeError(
+                f"{path.name} does not contain a Google OAuth client ID and secret. "
+                f"Generate one with the Gmail API Automation tool, or upload a Google Cloud Console "
+                f"OAuth client JSON."
+            )
+        return {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "project_id": str(payload.get("project_id") or installed.get("project_id") or ""),
+            "refresh_token": str(payload.get("refresh_token") or ""),
+            "account_email": str(payload.get("account_email") or ""),
+            "display_name": str(payload.get("display_name") or ""),
+        }
+
+    def _prepare_api_account(
+        self, path_str: str, index: int, *, log: Callable[[str], None] | None = None
+    ) -> ApiAccountHandle:
+        """Open a browser window for one uploaded JSON and bring it online.
+
+        A file that already carries a refresh token (this app's own combined
+        credential) only needs its sign-in confirmed. A file with just a
+        client ID/secret (Google's raw OAuth-client download, or a manual
+        upload) drives the full sign-in-and-approve flow instead — the
+        person signs in and clicks Allow themselves in the window that
+        opens — and the resulting refresh token is written back into the
+        same file so it's a ready credential from then on. Either way the
+        browser window is left open (not closed) for the person to watch
+        while sending runs later.
+        """
+        emit = log or (lambda message: None)
+        path = Path(path_str)
+        client = self._read_api_client_payload(path)
+        session = self._launch_browser_process_threadsafe(index)
+        try:
+            if client["refresh_token"] and client["account_email"]:
+                account_email = client["account_email"]
+                display_name = client.get("display_name", "")
+                emit(f"Opening browser window {index} for {account_email}")
+                self._wait_for_browser_session_signed_in(session, log=emit)
+                refresh_token = client["refresh_token"]
+            else:
+                emit(f"Opening browser window {index} — sign in and approve access when prompted")
+                token = self._run_gmail_consent_flow(session, client, log=emit, assume_signed_in=False)
+                account_email = token["account_email"]
+                display_name = token.get("display_name", "")
+                refresh_token = token["refresh_token"]
+                # Rename to the account's own email once it's known, so
+                # the file is identifiable at a glance — matching what the
+                # Gmail API Automation tool already does for its own
+                # output. The uploaded name (a raw client download's name,
+                # or whatever the person called it) is only a placeholder
+                # until this point.
+                if account_email:
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.@-]", "_", account_email)
+                    new_path = path.with_name(f"{safe_name}.json")
+                    if new_path != path:
+                        old_path_str = str(path)
+                        try:
+                            path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        path = new_path
+                        if old_path_str in self.state.api_json_paths:
+                            self.state.api_json_paths[self.state.api_json_paths.index(old_path_str)] = str(path)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "account_email": account_email,
+                            "display_name": display_name,
+                            "client_id": client["client_id"],
+                            "client_secret": client["client_secret"],
+                            "refresh_token": refresh_token,
+                            "project_id": client.get("project_id", ""),
+                            "scope": gmail_oauth.GMAIL_SEND_AND_PROFILE_SCOPE,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+        except Exception:
+            self._terminate_transient_session(session)
+            raise
+        account = ApiAccountHandle(
+            session_id=f"api-account-{index}-{QDateTime.currentMSecsSinceEpoch()}",
+            title=f"API Window {index}" + (f" ({account_email})" if account_email else ""),
+            account_email=account_email,
+            display_name=display_name,
+            credential_path=path,
+        )
+        account.browser_session = session
+        return account
+
+    def _terminate_transient_session(self, session: BrowserSessionHandle) -> None:
+        process = session.process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        self._cleanup_browser_profile_dir(session.profile_dir, session.profile_is_temporary)
+
+    # ------------------------------------------------------------------
+    # Gmail API Automation tool: bulk credential generation from a sheet
+    # of email/password rows. Fully separate from the campaign-sending
+    # flow above — its output is a plain JSON file the person reviews and
+    # uploads through the normal Upload JSON button themselves.
+    # ------------------------------------------------------------------
+
+    def open_gmail_api_automation_dialog(self) -> None:
+        dialog = GmailApiAutomationDialog(self, scale=self._scale)
+        dialog.exec()
+
+    def _extract_email_password_pair(self, cells: list[str]) -> tuple[str, str, int]:
+        """First "@"-containing cell is the email; the next non-empty cell
+        after it is the password. A header row ("Email, Password") has no
+        "@" in either cell, so it's naturally skipped without special-casing.
+
+        Also returns the password cell's column index, so the caller can
+        derive a "status" column (the cell right after it) for the
+        resumable-sheet feature below.
+        """
+        email = ""
+        password = ""
+        password_idx = -1
+        for idx, raw_cell in enumerate(cells):
+            cell = (raw_cell or "").strip()
+            if not cell:
+                continue
+            if not email and "@" in cell:
+                email = cell
+            elif email and not password:
+                password = cell
+                password_idx = idx
+        return email, password, password_idx
+
+    def _read_credentials_sheet(self, path: Path) -> list[tuple[int, str, str, int]]:
+        """Read pending (email, password) rows from a sheet, skipping any
+        row whose status column already reads "Completed" or "Failed".
+
+        The status column is the cell immediately after the password cell.
+        Returns (sheet_row_number, email, password, status_column_index) so
+        `GmailApiAutomationWorker` can write "Completed"/"Failed" back into
+        that exact cell once each row is attempted — turning the sheet
+        itself into a resumable ledger across multiple runs.
+        """
+        suffix = path.suffix.lower()
+        rows: list[tuple[int, str, str, int]] = []
+        if suffix in {".xlsx", ".xlsm"}:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(path, read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                for row_number, raw_row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                    cells = [str(cell) if cell is not None else "" for cell in raw_row]
+                    email, password, password_idx = self._extract_email_password_pair(cells)
+                    if not email or not password:
+                        continue
+                    status_col = password_idx + 1
+                    status = cells[status_col].strip() if status_col < len(cells) else ""
+                    if status:
+                        continue
+                    rows.append((row_number, email, password, status_col))
+            finally:
+                workbook.close()
+        else:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row_number, cells in enumerate(csv.reader(handle), start=1):
+                    email, password, password_idx = self._extract_email_password_pair(cells)
+                    if not email or not password:
+                        continue
+                    status_col = password_idx + 1
+                    status = cells[status_col].strip() if status_col < len(cells) else ""
+                    if status:
+                        continue
+                    rows.append((row_number, email, password, status_col))
+        return rows
+
+    def _automated_google_sign_in(
+        self,
+        session: BrowserSessionHandle,
+        email: str,
+        password: str,
+        *,
+        log: Callable[[str], None] | None = None,
+        timeout: float = 180.0,
+    ) -> None:
+        """Best-effort automated Gmail sign-in for the Gmail API Automation tool.
+
+        Google's classic sign-in form (identifierId / Passwd fields) has
+        been stable for years, but — unlike the rest of this app's Console
+        automation — this exact step has not been exercised against a live
+        account from this environment. Any 2FA or "verify it's you"
+        challenge Google shows cannot be automated; the window stays open
+        so a person watching can finish it by hand, and this simply times
+        out (leaving that one row to retry) if nobody does.
+        """
+        emit = log or (lambda message: None)
+        ensure_external_dependencies()
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            deadline = time.monotonic() + 30
+            browser = None
+            while time.monotonic() < deadline:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            if browser is None:
+                raise RuntimeError("Could not connect to the sign-in browser window.")
+            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            page.set_default_timeout(20000)
+
+            page.goto(
+                "https://accounts.google.com/ServiceLogin?service=mail&continue=https://mail.google.com/mail/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            emit(f"Entering email for {email}")
+            email_field = self._console_control(page, ('input#identifierId', 'input[type="email"]'), timeout=15000)
+            email_field.fill(email)
+            next_button = self._console_control(page, ('#identifierNext button', 'button:has-text("Next")'), timeout=8000)
+            next_button.click(timeout=5000)
+            page.wait_for_timeout(2000)
+
+            emit("Entering password")
+            password_field = self._console_control(
+                page, ('input[type="password"][name="Passwd"]', 'input[type="password"]'), timeout=15000
+            )
+            password_field.fill(password)
+            password_next = self._console_control(
+                page, ('#passwordNext button', 'button:has-text("Next")'), timeout=8000
+            )
+            password_next.click(timeout=5000)
+
+            emit("Waiting for sign-in to complete (finish any verification step in the window if one appears)")
+            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout)
+
+    def _generate_api_json_from_credentials(
+        self,
+        index: int,
+        email: str,
+        password: str,
+        output_dir: Path,
+        *,
+        slot: int = 1,
+        max_parallel: int = 1,
+        log: Callable[[str], None] | None = None,
+    ) -> ApiAccountHandle:
+        emit = log or (lambda message: None)
+        session = self._launch_browser_process_threadsafe(slot, total_override=max_parallel)
+        try:
+            self._automated_google_sign_in(session, email, password, log=emit)
+            # Each account gets its own Cloud project rather than sharing
+            # one: adding a test user (or resolving the active project)
+            # requires owner-level access, which only the account that
+            # created the project has. A shared project reused across
+            # different Gmail accounts hits "You need additional access"
+            # for every account but the one that created it.
+            client = self._run_cloud_console_oauth_client_setup(session, log=emit)
+            token = self._run_gmail_consent_flow(session, client, log=emit)
+        except Exception:
+            self._terminate_transient_session(session)
+            raise
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        account_email = token["account_email"] or email
+        display_name = token.get("display_name", "")
+        safe_name = re.sub(r"[^a-zA-Z0-9_.@-]", "_", account_email) or "account"
+        path = output_dir / f"{safe_name}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "account_email": token["account_email"],
+                    "display_name": display_name,
+                    "client_id": client["client_id"],
+                    "client_secret": client["client_secret"],
+                    "refresh_token": token["refresh_token"],
+                    "project_id": client.get("project_id", ""),
+                    "scope": gmail_oauth.GMAIL_SEND_AND_PROFILE_SCOPE,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        # Leave the window open on the account's Sent folder instead of
+        # closing it, the same as the manual "Login" flow — the person can
+        # watch it while a campaign sends later.
+        try:
+            ensure_external_dependencies()
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                page = next((p for c in browser.contexts for p in c.pages), None)
+                if page is not None:
+                    page.goto("https://mail.google.com/mail/u/0/#sent", wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        account = ApiAccountHandle(
+            session_id=f"api-account-{index}-{QDateTime.currentMSecsSinceEpoch()}",
+            title=f"API Window {index}" + (f" ({account_email})" if account_email else ""),
+            account_email=account_email,
+            display_name=display_name,
+            credential_path=path,
+        )
+        account.browser_session = session
+        return account
+
+    def _console_control(self, page, selectors: tuple[str, ...], *, timeout: int = 20000):
+        return self._gmail_visible_control(page, selectors, timeout=timeout)
+
+    def _retry_console_step(
+        self,
+        description: str,
+        action: Callable[[], object],
+        *,
+        emit: Callable[[str], None],
+        timeout: float = 60.0,
+        interval: float = 2.5,
+    ) -> object:
+        """Retry one Cloud Console action until it succeeds or timeout runs out.
+
+        Every attempt (not just the first) is logged, so a step that is
+        legitimately still waiting on a slow-to-provision Cloud project reads
+        as "still working" in the activity log instead of going silent. This
+        also means a person manually clicking a button Google's UI moved is
+        picked up on the next attempt rather than only on the first.
+
+        Returns whatever `action` returns, for the few steps (like resolving
+        the active project id) that need a value out, not just a side effect.
+        """
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        last_exc: Exception | None = None
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                return action()
+            except Exception as exc:
+                last_exc = exc
+                emit(f"{description}: still waiting (attempt {attempt}) — {exc}")
+                time.sleep(interval)
+        raise RuntimeError(f"{description} did not complete within {timeout:.0f}s ({last_exc})")
+
+    def _run_cloud_console_oauth_client_setup(
+        self,
+        session: BrowserSessionHandle,
+        *,
+        log: Callable[[str], None] | None = None,
+    ) -> dict[str, str]:
+        """Drive Google Cloud Console once to create this account's OAuth client.
+
+        This is the one fragile, best-effort part of API JSON sending: Cloud
+        Console is a large, frequently-changing Angular application, and
+        every step below is written defensively (multiple text/role
+        fallbacks, generous timeouts) but has not been exercised against a
+        live account from this environment. If a step's selector no longer
+        matches Google's current UI, this raises a RuntimeError naming
+        exactly which step failed, in the same window the person is already
+        looking at, so it can be finished by hand once and reported back.
+        """
+        emit = log or (lambda message: None)
+        ensure_external_dependencies()
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            deadline = time.monotonic() + 30
+            browser = None
+            while time.monotonic() < deadline:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            if browser is None:
+                raise RuntimeError("Could not connect to the sign-in browser window.")
+            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            page.set_default_timeout(20000)
+
+            emit("Waiting for Gmail sign-in in the browser window")
+            self._wait_for_gmail_inbox_signed_in(session, page)
+            emit("Signed in; opening Google Cloud Console")
+
+            # Named after the account's own email (the part before @) so
+            # it's identifiable at a glance in Console — with a random
+            # suffix so it's still guaranteed unique even for the same
+            # account across repeated runs.
+            signed_in_email = self._current_gmail_account_email(page)
+            email_prefix = re.sub(r"[^A-Za-z0-9\-]", "", signed_in_email.split("@")[0])[:20] if signed_in_email else ""
+            project_name = f"{email_prefix or 'account'}-{secrets.token_hex(3)}"
+
+            self._retry_console_step(
+                "Opening Google Cloud Console",
+                lambda: page.goto("https://console.cloud.google.com/projectcreate", wait_until="domcontentloaded", timeout=30000),
+                emit=emit,
+                timeout=60,
+            )
+
+            try:
+                # A brand-new Google account's first Console visit shows a
+                # "Welcome" modal (country pre-filled from IP — verified
+                # live, no selection needed) whose "Agree and continue"
+                # button stays disabled until this checkbox is checked.
+                # Clicking the button alone (the old behavior) silently did
+                # nothing on a fresh account.
+                terms_checkbox = page.locator('mat-checkbox[formcontrolname="umbrella"] input[type="checkbox"]')
+                if terms_checkbox.count() and terms_checkbox.first.is_visible():
+                    terms_checkbox.first.check(force=True, timeout=3000)
+                    page.wait_for_timeout(300)
+                terms_button = self._console_control(
+                    page,
+                    ('button:has-text("Agree and continue")', 'button:has-text("I agree")'),
+                    timeout=6000,
+                )
+                terms_button.click(timeout=3000)
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            def create_project() -> None:
+                name_field = self._console_control(
+                    page,
+                    ('#p6ntest-name-input', 'input[name="name"]', 'input[aria-label*="Project name" i]'),
+                    timeout=10000,
+                )
+                name_field.fill(project_name)
+                create_button = self._console_control(
+                    page,
+                    ('button.projtest-create-form-submit', 'button[type="submit"]:has-text("Create")', 'button:has-text("Create")'),
+                    timeout=8000,
+                )
+                create_button.click(timeout=3000)
+
+            def select_created_project() -> None:
+                # Console does not automatically switch the active project
+                # after creating one via /projectcreate — it can silently
+                # stay on whichever project was previously active (verified
+                # live: creating a project left an older project selected).
+                # Explicitly select the project just created so every step
+                # after this actually targets it.
+                #
+                # Verified live: a just-created project shows up in the
+                # picker's default "Recent" tab immediately, but typing it
+                # into the picker's search box finds nothing — the search
+                # index lags behind creation by some time. So don't search;
+                # just click the project's link straight out of "Recent".
+                #
+                # This step is wrapped in a retry loop, and a failed attempt
+                # can leave the project-switcher dropdown open. Escape first
+                # so a retry never re-clicks the switcher while its own
+                # overlay backdrop is still up — that backdrop otherwise
+                # intercepts every click for the rest of the attempt
+                # (verified live).
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                switcher = self._console_control(
+                    page,
+                    ('button[data-prober="cloud-console-core-functions-project-switcher"]',),
+                    timeout=10000,
+                )
+                switcher.click(timeout=3000)
+                result_link = self._console_control(
+                    page,
+                    (f'a[data-prober="cloud-console-core-functions-project-name"]:has-text("{project_name}")',),
+                    timeout=8000,
+                )
+                # A just-created project appears in "Recent" immediately but
+                # stays aria-disabled (with its own tooltip overlay blocking
+                # clicks) for a few seconds while it finishes provisioning.
+                # Poll this same link in place rather than re-opening the
+                # switcher — reopening it is what triggered the overlay
+                # backdrop intercepting every click on a prior attempt.
+                disabled_deadline = time.monotonic() + 20
+                while (
+                    result_link.get_attribute("aria-disabled") == "true"
+                    and time.monotonic() < disabled_deadline
+                ):
+                    page.wait_for_timeout(500)
+                result_link.click(timeout=3000)
+                page.wait_for_timeout(2000)
+
+            emit(f"Creating Google Cloud project {project_name}")
+            try:
+                self._retry_console_step("Creating the Cloud project", create_project, emit=emit, timeout=45)
+                self._retry_console_step("Selecting the new Cloud project", select_created_project, emit=emit, timeout=30)
+            except Exception as exc:
+                # Not fatal: the remaining steps below only need *some*
+                # project to be active, not specifically one this automation
+                # created. If a person creates or selects one by hand in this
+                # window while the messages above are showing, the retry
+                # loops in every step from here on pick that up naturally.
+                emit(
+                    f"Could not create the Cloud project automatically ({exc}). "
+                    f"If you have a project selected already, or create/select one by hand in this window now, "
+                    f"the remaining steps will continue automatically."
+                )
+
+            # A freshly created (or freshly selected) GCP project can take a
+            # while before it is usable on other Console pages. Kept short
+            # since resolve_active_project_id() and enable_gmail_api() right
+            # after this both already retry on their own (30s/90s budgets),
+            # so a long fixed wait here only adds latency on the common case
+            # where the project is already ready.
+            page.wait_for_timeout(3000)
+
+            def resolve_active_project_id() -> str:
+                # Verified live: Console does not reliably keep the active
+                # project selected when navigating straight to a
+                # project-scoped URL (e.g. apis/library/...) without an
+                # explicit ?project= parameter — the page can come back
+                # completely blank instead. /home/dashboard is the one URL
+                # that reliably redirects to include ?project=<id> for
+                # whichever project is actually active, however it became
+                # active (created, selected, or already active from before),
+                # so every later navigation can carry that id explicitly.
+                page.goto("https://console.cloud.google.com/home/dashboard", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                query = urlparse(page.url).query
+                return parse_qs(query).get("project", [""])[0]
+
+            project_id = ""
+            try:
+                project_id = str(
+                    self._retry_console_step(
+                        "Resolving the active Cloud project", resolve_active_project_id, emit=emit, timeout=30
+                    )
+                    or ""
+                )
+            except Exception:
+                project_id = ""
+            if not project_id:
+                raise RuntimeError(
+                    "No Google Cloud project is active in this window. Create or select one by hand, then retry."
+                )
+            emit(f"Using Cloud project {project_id}")
+
+            self._ensure_gmail_api_enabled(page, project_id, log=emit)
+
+            def configure_consent_screen() -> None:
+                # Google replaced the old single-page OAuth consent screen
+                # with a new "Google Auth Platform" multi-step wizard
+                # (verified live: apis/credentials/consent now redirects to
+                # auth/overview). Every selector below was captured from
+                # that real flow, not guessed.
+                page.goto(
+                    f"https://console.cloud.google.com/auth/overview?project={project_id}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                # "Get started" not being there yet could mean the wizard is
+                # already configured (nothing to do) — or it could just mean
+                # this freshly-selected project's page hasn't finished
+                # loading. Those two look identical after a short fixed
+                # wait, and treating "not loaded yet" as "already done" was
+                # silently skipping the whole consent-screen setup. Poll for
+                # up to 15s before concluding it's genuinely already done.
+                get_started = page.locator('text="Get started"')
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if get_started.count() and get_started.first.is_visible():
+                        break
+                    page.wait_for_timeout(500)
+                else:
+                    return
+                get_started.first.click(timeout=5000)
+                page.wait_for_timeout(1500)
+
+                app_name_field = self._console_control(
+                    page, ('input[formcontrolname="displayName"]',), timeout=10000
+                )
+                app_name_field.fill(email_prefix or "Mail Client")
+
+                email_dropdown = self._console_control(
+                    page, ('cfc-select[formcontrolname="userSupportEmail"]',), timeout=8000
+                )
+                email_dropdown.click(timeout=3000)
+                page.wait_for_timeout(600)
+                options = page.locator('mat-option, [role="option"]')
+                email_option = None
+                for i in range(options.count()):
+                    if options.nth(i).is_visible() and "@" in options.nth(i).inner_text():
+                        email_option = options.nth(i)
+                        break
+                if email_option is None:
+                    raise RuntimeError("No support email option was available to select.")
+                # Reuse the selected support email as the developer contact
+                # email a few steps later instead of leaving it empty.
+                support_email = (email_option.inner_text() or "").strip()
+                email_option.click(timeout=3000)
+                page.wait_for_timeout(300)
+
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(800)
+
+                # "Internal" is disabled for non-Workspace accounts; External
+                # is the only usable choice for a personal Gmail account.
+                self._console_control(page, ('text="External"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(300)
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(800)
+
+                contact_email_field = self._console_control(
+                    page, ('input[aria-label="Text field for emails"]',), timeout=8000
+                )
+                contact_email_field.fill(support_email)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(800)
+
+                # The agreement is a Material checkbox; clicking its label or
+                # host element can land on the adjacent policy link instead,
+                # so check the native input directly (verified live).
+                terms_checkbox = self._console_control(
+                    page,
+                    ('mat-checkbox[formcontrolname="termsAgreement"] input[type="checkbox"]',),
+                    timeout=8000,
+                )
+                terms_checkbox.check(force=True, timeout=3000)
+                page.wait_for_timeout(300)
+
+                self._console_control(page, ('text="Create"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(4000)
+
+            emit("Configuring the OAuth consent screen")
+            try:
+                self._retry_console_step("Configuring the OAuth consent screen", configure_consent_screen, emit=emit, timeout=90)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cloud Console setup stopped configuring the OAuth consent screen ({exc}). "
+                    f"Finish the consent screen setup by hand in this window (any App name, "
+                    f"any support/contact email), then retry."
+                ) from exc
+
+            def create_oauth_client() -> None:
+                # Credentials moved: OAuth clients are now created from the
+                # "Clients" tab (auth/clients), not the old apis/credentials
+                # page. The created-client dialog has both a "Download JSON"
+                # button and the ID/secret shown as plain text — extraction
+                # below prefers the download (a real Google-formatted file,
+                # verified live) and falls back to reading the text.
+                page.goto(
+                    f"https://console.cloud.google.com/auth/clients?project={project_id}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                self._console_control(page, ('text="Create client"',), timeout=15000).click(timeout=3000)
+                page.wait_for_timeout(1500)
+
+                type_dropdown = self._console_control(
+                    page, ('cfc-select[formcontrolname="typeControl"]',), timeout=10000
+                )
+                type_dropdown.click(timeout=3000)
+                page.wait_for_timeout(600)
+                options = page.locator('mat-option, [role="option"]')
+                desktop_option = None
+                for i in range(options.count()):
+                    if options.nth(i).is_visible() and options.nth(i).inner_text().strip() == "Desktop app":
+                        desktop_option = options.nth(i)
+                        break
+                if desktop_option is None:
+                    raise RuntimeError("The 'Desktop app' application type option was not available.")
+                desktop_option.click(timeout=3000)
+                page.wait_for_timeout(500)
+
+                name_field = self._console_control(page, ('input[formcontrolname="displayName"]',), timeout=8000)
+                name_field.fill(f"{email_prefix or 'account'} Desktop Client")
+
+                self._console_control(page, ('text="Create"',), timeout=8000).click(timeout=3000)
+                page.wait_for_timeout(3000)
+
+            emit("Creating the OAuth client credentials")
+            try:
+                self._retry_console_step("Creating the OAuth client", create_oauth_client, emit=emit, timeout=60)
+
+                client_id = ""
+                client_secret = ""
+                download_button = page.locator('button:has-text("Download JSON")')
+                if download_button.count() and download_button.first.is_visible():
+                    tmp_dir = tempfile.mkdtemp(prefix="ezymailer_oauth_dl_")
+                    try:
+                        # Force the download straight to a folder we control
+                        # via CDP, rather than trusting Playwright's default
+                        # interception — a real, previously-used browser
+                        # profile can have "Ask where to save each file"
+                        # turned on, which otherwise pops a native OS save
+                        # dialog the person has to click through by hand.
+                        cdp_session = page.context.new_cdp_session(page)
+                        cdp_session.send("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": tmp_dir})
+                        with page.expect_download(timeout=8000) as download_info:
+                            download_button.first.click(timeout=3000)
+                        download = download_info.value
+                        saved_path = Path(tmp_dir) / "client_secret.json"
+                        download.save_as(str(saved_path))
+                        # save_as() can return slightly before the file is
+                        # fully flushed to disk — reading immediately
+                        # sometimes hit an empty file (verified live). A
+                        # short settle-and-retry is cheap insurance; the
+                        # dt/dd fallback below still covers a real failure.
+                        raw_text = saved_path.read_text(encoding="utf-8")
+                        if not raw_text.strip():
+                            page.wait_for_timeout(500)
+                            raw_text = saved_path.read_text(encoding="utf-8")
+                        payload = json.loads(raw_text)
+                        installed = payload.get("installed") or payload.get("web") or payload
+                        client_id = str(installed.get("client_id") or "")
+                        client_secret = str(installed.get("client_secret") or "")
+                    except Exception:
+                        pass
+                    finally:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                if not client_id or not client_secret:
+                    client_id_dd = page.locator("dt", has_text="Client ID").locator("xpath=following-sibling::dd[1]")
+                    client_secret_dd = page.locator("dt", has_text="Client secret").locator("xpath=following-sibling::dd[1]")
+                    if client_id_dd.count() == 0 or client_secret_dd.count() == 0:
+                        raise RuntimeError("The Client ID/Secret dialog did not appear after creating the client.")
+                    client_id = client_id_dd.first.inner_text().strip()
+                    client_secret = client_secret_dd.first.inner_text().strip()
+
+                ok_button = page.locator('text="OK"')
+                if ok_button.count() and ok_button.first.is_visible():
+                    ok_button.first.click(timeout=3000)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cloud Console setup stopped creating the OAuth client ({exc}). "
+                    f"Create a Desktop app OAuth client by hand in this window (Clients tab) and note its "
+                    f"Client ID and Client Secret, then retry."
+                ) from exc
+
+            emit("Gmail API client created")
+            return {"client_id": client_id, "client_secret": client_secret, "project_id": project_id}
+
+    def _current_gmail_account_email(self, page) -> str:
+        """Read the signed-in address off Gmail's own account-switcher avatar.
+
+        Verified live: the avatar link's aria-label reads
+        'Google Account: NAME  \\n(email@gmail.com)'.
+        """
+        try:
+            avatar = page.locator('a[aria-label*="Google Account" i]')
+            if avatar.count() == 0:
+                return ""
+            label = avatar.first.get_attribute("aria-label") or ""
+            match = re.search(r"\(([^()]+@[^()]+)\)", label)
+            return match.group(1).strip() if match else ""
+        except Exception:
+            return ""
+
+    def _ensure_gmail_api_enabled(self, page, project_id: str, *, log: Callable[[str], None] | None = None) -> None:
+        """Make sure the Gmail API is turned on for a project before using it.
+
+        Shared by both the bulk Cloud Console setup and the manual "Login"
+        consent flow — a project a person uploaded a raw client for (rather
+        than one this app created itself) may never have had the Gmail API
+        enabled at all, which otherwise only surfaces as a 403 at actual
+        send time with no earlier warning (verified live).
+        """
+        emit = log or (lambda message: None)
+        if not project_id:
+            emit("Could not verify the Gmail API is enabled automatically (missing project id)")
+            return
+
+        def enable_gmail_api() -> None:
+            page.goto(
+                f"https://console.cloud.google.com/apis/library/gmail.googleapis.com?project={project_id}",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            page.wait_for_timeout(1000)
+            # Already enabled shows "Manage" and an "API Enabled" badge
+            # instead of an "Enable" button — there is nothing to click, so
+            # looking for "Enable" would never succeed and just burn the
+            # whole retry budget.
+            already_enabled = page.locator('button:has-text("Manage")')
+            if already_enabled.count() and already_enabled.first.is_visible():
+                return
+            enable_button = self._console_control(page, ('button:has-text("Enable")',), timeout=15000)
+            enable_button.click(timeout=3000)
+            page.wait_for_timeout(3000)
+
+        emit("Searching for the Gmail API and enabling it")
+        try:
+            self._retry_console_step("Enabling the Gmail API", enable_gmail_api, emit=emit, timeout=90)
+        except Exception as exc:
+            # Not necessarily fatal here — sending will fail later with a
+            # clear Gmail API error if it genuinely never gets enabled, but
+            # this step is still worth attempting rather than skipping.
+            emit(f"Gmail API enable step did not confirm success ({exc}); continuing — it may already be enabled")
+
+    def _ensure_test_user(
+        self,
+        page,
+        project_id: str,
+        email: str,
+        *,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        """Add an account as a Testing-mode test user on the shared OAuth client.
+
+        A Testing-mode app's OAuth consent is only granted to accounts
+        explicitly listed here (verified live: consent otherwise fails with
+        "Access blocked ... Error 403: access_denied", even for the app's
+        own developer). The new "Google Auth Platform" consent-screen wizard
+        does not add anyone automatically, so every account needs this step,
+        not just the one-time client setup.
+        """
+        emit = log or (lambda message: None)
+        if not project_id or not email:
+            emit("Could not verify test-user access automatically (missing project or account email)")
+            return
+        try:
+            page.goto(
+                f"https://console.cloud.google.com/auth/audience?project={project_id}",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            page.wait_for_timeout(1500)
+            existing = page.get_by_text(email, exact=False)
+            if existing.count() and existing.first.is_visible():
+                return
+            # page.mouse.wheel() scrolls whatever's under the cursor, which
+            # isn't reliably the main content pane here — it silently failed
+            # to bring "Add users" into view on a live run. Scroll the
+            # button itself into view instead.
+            add_button = page.locator("button", has_text="Add users").first
+            add_button.scroll_into_view_if_needed(timeout=8000)
+            page.wait_for_timeout(300)
+            if not add_button.is_visible():
+                emit(f"Could not find the test-user control to add {email} automatically")
+                return
+            add_button.click(timeout=5000)
+            page.wait_for_timeout(1000)
+            email_field = self._console_control(page, ('input[aria-label="Text field for emails"]',), timeout=8000)
+            email_field.fill(email)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(500)
+
+            # Saving here can take several seconds, and the first click
+            # doesn't always register — verified live. Poll for the dialog
+            # to close (success) and reissue the click once if it's still
+            # sitting there partway through the wait.
+            save_button = page.get_by_role("button", name="Save", exact=True)
+            save_button.first.click(timeout=5000)
+            deadline = time.monotonic() + 12
+            retried = False
+            while time.monotonic() < deadline and save_button.count() > 0:
+                page.wait_for_timeout(500)
+                if not retried and time.monotonic() > deadline - 7:
+                    if save_button.count() and save_button.first.is_visible():
+                        save_button.first.click(timeout=3000)
+                    retried = True
+            if save_button.count() > 0:
+                emit(f"Could not confirm {email} was added as a test user; consent may fail until added by hand")
+            else:
+                emit(f"Added {email} as a test user")
+        except Exception as exc:
+            emit(f"Could not add {email} as a test user automatically ({exc}); consent may fail until added by hand")
+
+    def _wait_for_browser_session_signed_in(
+        self,
+        session: BrowserSessionHandle,
+        *,
+        log: Callable[[str], None] | None = None,
+        timeout: float = 600.0,
+    ) -> None:
+        """Connect to a just-opened window and block until Gmail sign-in completes.
+
+        This is the plain "Start Browser" confirmation step for API JSON
+        mode — no consent screen, no OAuth, just waiting for a normal Gmail
+        sign-in so the window shows as an active, signed-in session before
+        Start Campaign is allowed.
+        """
+        emit = log or (lambda message: None)
+        ensure_external_dependencies()
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            deadline = time.monotonic() + 30
+            browser = None
+            while time.monotonic() < deadline:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            if browser is None:
+                raise RuntimeError("Could not connect to the sign-in browser window.")
+            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            emit("Waiting for Gmail sign-in in the browser window")
+            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout)
+
+    def _wait_for_gmail_inbox_signed_in(self, session: BrowserSessionHandle, page, timeout: float = 600.0) -> None:
+        """Block until the window's Gmail tab reaches a signed-in inbox URL.
+
+        The window opens on mail.google.com already (Start Browser's normal
+        launch args); this just waits for the person to finish signing in
+        there before the consent flow reuses the same authenticated session.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if session.process is not None and session.process.poll() is not None:
+                raise RuntimeError("The browser window was closed before signing in to Gmail.")
+            try:
+                current_url = str(page.url or "")
+                # Google's own sign-in/password pages carry the eventual
+                # destination in a "continue=https://mail.google.com/mail/..."
+                # query parameter. A substring check on the raw URL matches
+                # that while the person is still on accounts.google.com typing
+                # their password, so check the actual host instead.
+                host = urlparse(current_url).netloc
+            except Exception:
+                host = ""
+            if host == "mail.google.com":
+                return
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                # A transient CDP hiccup during Google's multi-page sign-in
+                # (identifier -> password -> 2FA) must not abort the wait —
+                # that would fall through to the caller's cleanup and close
+                # the window out from under someone still typing.
+                time.sleep(1)
+        raise RuntimeError("Timed out waiting for Gmail sign-in in the browser window.")
+
+    def _run_gmail_consent_flow(
+        self,
+        session: BrowserSessionHandle,
+        client: dict[str, str],
+        *,
+        log: Callable[[str], None] | None = None,
+        assume_signed_in: bool = True,
+    ) -> dict[str, str]:
+        """Navigate the already-open window to Google's consent screen.
+
+        Everything here is automatic except the two actions Google requires
+        a real human gesture for: signing in, and clicking Allow (plus, for
+        an app still in Testing publishing status, confirming the
+        "Google hasn't verified this app" warning). The redirect back is
+        captured by a local loopback server rather than parsed from the
+        page, so this keeps working even if Google changes the consent
+        screen's own DOM.
+
+        `assume_signed_in` controls how the sign-in wait behaves: True (the
+        automated bulk-generation path) means sign-in already happened
+        before Cloud Console setup ran, so this just navigates back to
+        Gmail and briefly confirms it. False (a manual "Login" on an
+        uploaded client-only JSON) means nobody has signed in yet — the
+        window already opens on Gmail's own sign-in page, so this just
+        waits, at human pace, for the person to do it themselves.
+        """
+        emit = log or (lambda message: None)
+        ensure_external_dependencies()
+        from playwright.sync_api import sync_playwright
+
+        loopback = gmail_oauth.OAuthLoopbackServer().start()
+        try:
+            with sync_playwright() as playwright:
+                deadline = time.monotonic() + 30
+                browser = None
+                while time.monotonic() < deadline:
+                    try:
+                        browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                        break
+                    except Exception:
+                        time.sleep(0.25)
+                if browser is None:
+                    raise RuntimeError("Could not connect to the sign-in browser window.")
+                page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+
+                if assume_signed_in:
+                    # Sign-in already happened before Cloud Console setup
+                    # ran; this page is just left sitting on a Console URL
+                    # from creating the OAuth client. Navigate back to
+                    # Gmail instead of re-waiting for a sign-in that
+                    # already completed — that wait polled this same
+                    # page's URL forever since nothing here ever pointed
+                    # it back at mail.google.com (verified live: it would
+                    # hang indefinitely on the Console page).
+                    page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=30000)
+                    self._wait_for_gmail_inbox_signed_in(session, page, timeout=30)
+                else:
+                    emit("Waiting for you to sign in to Gmail in the browser window")
+                    self._wait_for_gmail_inbox_signed_in(session, page)
+                emit("Signed in; starting Gmail API authorization")
+
+                # Read the account's email while the page is still on Gmail
+                # — every step below navigates the page to Cloud Console,
+                # and this same lookup only works against Gmail's own
+                # avatar element. Reading it after any Console navigation
+                # silently returns "", which then skips ensure_test_user
+                # and drops login_hint (verified live: this exact ordering
+                # bug broke both when the Gmail-API-enable call below was
+                # placed before this read instead of after it).
+                account_email = self._current_gmail_account_email(page)
+
+                # A project uploaded as a raw client (rather than one this
+                # app created itself via the bulk tool, which already does
+                # this) may never have had the Gmail API turned on — that
+                # otherwise only shows up as a 403 at actual send time with
+                # no warning here (verified live). Harmless to repeat if
+                # it's already enabled.
+                self._ensure_gmail_api_enabled(page, client.get("project_id", ""), log=emit)
+
+                # Verified live: a Testing-mode app's consent is only granted
+                # to accounts explicitly listed as test users — even the
+                # app's own developer gets a 403 access_denied otherwise. The
+                # new consent-screen wizard never adds anyone automatically,
+                # so every account needs this before requesting consent.
+                if account_email:
+                    self._ensure_test_user(page, client.get("project_id", ""), account_email, log=emit)
+
+                auth_url, _ = gmail_oauth.build_authorization_url(
+                    client["client_id"],
+                    loopback.redirect_uri,
+                    scope=gmail_oauth.GMAIL_SEND_AND_PROFILE_SCOPE,
+                    login_hint=account_email or None,
+                )
+                page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+
+                # From here Google may show, in order: a Testing-mode
+                # "unverified app" interstitial and finally the
+                # scope-consent screen with Allow. `login_hint` above means
+                # Google skips the account-chooser step entirely, so there
+                # is no chooser-click branch here — an earlier version
+                # tried to click any element containing the account's own
+                # email as a stand-in for a chooser, but the consent screen
+                # itself shows a plain "signed in as <email>" label that
+                # matches too, so it kept clicking that static text forever
+                # instead of ever reaching Continue/Allow (verified live).
+                deadline = time.monotonic() + 180
+                while time.monotonic() < deadline:
+                    if loopback.code is not None or loopback.error is not None:
+                        break
+                    try:
+                        advanced = page.get_by_text(re.compile(r"^Advanced$"), exact=True)
+                        if advanced.count() and advanced.first.is_visible():
+                            advanced.first.click(timeout=2000)
+                            page.wait_for_timeout(300)
+                            go_to_app = page.get_by_text(re.compile(r"^Go to .*\(unsafe\)$"))
+                            if go_to_app.count() and go_to_app.first.is_visible():
+                                go_to_app.first.click(timeout=2000)
+                                page.wait_for_timeout(1000)
+                                continue
+                        for name in ("Continue", "Allow"):
+                            action_button = page.get_by_role("button", name=re.compile(f"^{name}$", re.IGNORECASE))
+                            if action_button.count() and action_button.first.is_visible():
+                                action_button.first.click(timeout=2000)
+                                page.wait_for_timeout(1000)
+                                break
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(500)
+
+            code = loopback.wait_for_code(timeout=1)
+        finally:
+            loopback.stop()
+
+        token_payload = gmail_oauth.exchange_code_for_tokens(
+            client["client_id"], client["client_secret"], code, loopback.redirect_uri
+        )
+        refresh_token = token_payload.get("refresh_token", "")
+        if not refresh_token:
+            raise RuntimeError(
+                "Google did not return a refresh token. This account may already have granted EzyMailer "
+                "access before — remove EzyMailer's access at myaccount.google.com/permissions and retry."
+            )
+        # account_email was already read off Gmail's own UI earlier in this
+        # function (used for the test-user step and login_hint) — reuse it
+        # rather than trusting the userinfo endpoint for the email too.
+        # The account's real display name has no equivalent in Gmail's own
+        # UI though, so that one genuinely needs the profile-scoped
+        # userinfo call (requesting GMAIL_SEND_AND_PROFILE_SCOPE above is
+        # what makes this succeed instead of 401ing like the old
+        # gmail.send-only token did — verified live).
+        access_token = token_payload.get("access_token", "")
+        display_name = ""
+        if access_token:
+            profile = gmail_oauth.fetch_account_profile(access_token)
+            display_name = profile.get("name", "")
+        return {"account_email": account_email, "refresh_token": refresh_token, "display_name": display_name}
+
+    def _api_account_access_token(self, session: ApiAccountHandle) -> str:
+        if session.access_token and time.time() < session.access_token_expires_at:
+            return session.access_token
+        try:
+            credential = json.loads(session.credential_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Could not read Gmail API credential for {session.account_email}: {exc}") from exc
+        token_payload = gmail_oauth.refresh_access_token(
+            credential["client_id"], credential["client_secret"], credential["refresh_token"]
+        )
+        access_token = token_payload.get("access_token")
+        if not access_token:
+            raise RuntimeError(f"Could not refresh Gmail API access for {session.account_email}.")
+        session.access_token = access_token
+        session.access_token_expires_at = time.time() + max(60, int(token_payload.get("expires_in", 3000)) - 300)
+        return access_token
+
+    def _send_via_gmail_api(
+        self,
+        session: ApiAccountHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_html: str,
+        attachment_format: str | list[str],
+        file_name_mode: str,
+        file_name_value: str,
+        convert_enabled: bool,
+        already_resolved: bool = False,
+        log_steps: bool = True,
+    ) -> None:
+        attachment_paths: list[Path] = []
+        attachment_temp_dir: Path | None = None
+        if attachment_html.strip():
+            attachment_temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-api-"))
+            attachment_paths = self._compose_attachment_paths(
+                recipient,
+                subject,
+                attachment_html,
+                attachment_format,
+                file_name_mode,
+                file_name_value,
+                convert_enabled,
+                already_resolved=already_resolved,
+                temp_dir=attachment_temp_dir,
+            )
+            if log_steps:
+                self._log_action(f"Preparing attachment file for {recipient}")
+        try:
+            access_token = self._api_account_access_token(session)
+            gmail_oauth.send_message(
+                access_token,
+                session.account_email,
+                recipient,
+                subject,
+                body_text,
+                sender_name=session.display_name,
+                attachment_paths=attachment_paths,
+            )
+            if log_steps:
+                self._log_action(f"Gmail API send completed for {recipient}")
+        finally:
+            if attachment_temp_dir is not None:
+                shutil.rmtree(attachment_temp_dir, ignore_errors=True)
+
     def _send_compose_with_playwright(
         self,
         session: BrowserSessionHandle | BrowserTabHandle,
@@ -8901,7 +11486,7 @@ class DashboardPage(QWidget):
                 except Exception:
                     continue
             page.wait_for_timeout(200)
-        raise RuntimeError("Gmail compose control did not become visible.")
+        raise RuntimeError(f"None of the expected controls became visible ({', '.join(selectors)}).")
 
     def _gmail_subject_input(self, page):
         subject_selectors = (
@@ -10665,15 +13250,25 @@ class DashboardPage(QWidget):
             list_item.setSizeHint(row_widget.sizeHint())
             self.session_list.addItem(list_item)
             self.session_list.setItemWidget(list_item, row_widget)
+        for index, account in enumerate(self._api_accounts, start=1):
+            row_widget = self._api_account_row(account, index)
+            list_item = QListWidgetItem()
+            list_item.setSizeHint(row_widget.sizeHint())
+            self.session_list.addItem(list_item)
+            self.session_list.setItemWidget(list_item, row_widget)
+        if self.state.sending_mode == "API JSON":
+            active_paths = {str(account.credential_path) for account in self._api_accounts}
+            for path_str in self.state.api_json_paths:
+                if path_str in active_paths:
+                    continue
+                row_widget = self._pending_api_json_row(path_str)
+                list_item = QListWidgetItem()
+                list_item.setSizeHint(row_widget.sizeHint())
+                self.session_list.addItem(list_item)
+                self.session_list.setItemWidget(list_item, row_widget)
+        self._update_sending_mode_lock()
 
     def _refresh_activity(self) -> None:
-        self._sync_plain_log_view(
-            self.activity_log_view,
-            self.state.activity_log,
-            "_rendered_activity_log_entries",
-            "[--:--:--] No activity yet.",
-            30,
-        )
         self._sync_plain_log_view(
             self.send_log_view,
             self._campaign_send_log_entries,
@@ -10722,13 +13317,14 @@ class DashboardPage(QWidget):
             self._log_scroll_timer.start()
 
     def _scroll_runtime_logs_to_end(self) -> None:
-        for view in (self.activity_log_view, self.send_log_view):
-            scrollbar = view.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        scrollbar = self.send_log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _refresh_controls(self) -> None:
         self.incognito_button.setChecked(self.state.browser_mode == "Incognito")
         self.normal_button.setChecked(self.state.browser_mode == "Normal")
+        self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
+        self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
         self.normal_message_button.setChecked(self.state.body_mode == "Normal Message")
         self.html_message_button.setChecked(self.state.body_mode == "HTML Message")
         self.sender_limit.blockSignals(True)
@@ -10846,6 +13442,76 @@ class DashboardPage(QWidget):
         row_layout.addLayout(bottom_row)
         return row
 
+    def _api_account_row(self, account: ApiAccountHandle, index: int) -> QWidget:
+        row = QFrame()
+        row.setObjectName("sessionRow")
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(7, self._scale), _scaled_int(8, self._scale), _scaled_int(7, self._scale))
+        row_layout.setSpacing(_scaled_int(4, self._scale))
+        row.setMinimumHeight(_scaled_int(52, self._scale))
+
+        dot = QLabel("●")
+        dot.setObjectName("sessionDot")
+        label = QLabel(account.account_email or account.title)
+        label.setObjectName("sessionTitleSmall")
+        state = QLabel("API JSON - Online")
+        state.setObjectName("sessionState")
+        count = QLabel(f"({account.send_completed}/{account.send_total})")
+        count.setObjectName("sessionState")
+        label.setMinimumWidth(_scaled_int(72, self._scale))
+        state.setMinimumWidth(_scaled_int(80, self._scale))
+        state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        logout_button = QPushButton("Logout")
+        logout_button.setObjectName("dangerButton")
+        logout_button.clicked.connect(lambda _, acc=account: self._logout_api_account(acc))
+        logout_button.setToolTip("Sign this account out and remove its saved credential")
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(_scaled_int(6, self._scale))
+        top_row.addWidget(dot)
+        top_row.addWidget(label)
+        top_row.addStretch()
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(_scaled_int(6, self._scale))
+        bottom_row.addWidget(state)
+        bottom_row.addWidget(count)
+        bottom_row.addStretch()
+        bottom_row.addWidget(logout_button)
+
+        row_layout.addLayout(top_row)
+        row_layout.addLayout(bottom_row)
+        return row
+
+    def _logout_api_account(self, account: ApiAccountHandle) -> None:
+        if self._campaign_active or self._campaign_threads:
+            self.notify("Cancel the campaign before logging out an account")
+            return
+        try:
+            credential = json.loads(account.credential_path.read_text(encoding="utf-8"))
+            gmail_oauth.revoke_token(credential.get("refresh_token", ""))
+        except Exception as exc:
+            self._log_action(f"Could not revoke Google access for {account.account_email}: {exc}")
+        try:
+            account.credential_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if account.browser_session is not None:
+            try:
+                self._terminate_transient_session(account.browser_session)
+            except Exception:
+                pass
+        path_str = str(account.credential_path)
+        if path_str in self.state.api_json_paths:
+            self.state.api_json_paths.remove(path_str)
+        self._api_accounts = [item for item in self._api_accounts if item.session_id != account.session_id]
+        self._refresh_api_json_section()
+        self._refresh_sessions()
+        self._persist_browser_state()
+        self._update_sending_mode_lock()
+        self._log_action(f"Logged out {account.account_email}")
+        self.notify(f"Logged out {account.account_email}")
+
     def refresh(self) -> None:
         self.window_spin.setValue(self.state.window_count)
         self.tab_spin.setValue(self.state.tab_count)
@@ -10869,6 +13535,22 @@ class EzyMailerApplication(QApplication):
                 event.accept()
                 return True
         return super().event(event)
+
+
+class _CurrentPageStack(QStackedWidget):
+    """QStackedWidget sizes itself off the largest page by default, even
+    while a smaller page is the one showing. That would keep the login
+    window pinned to the dashboard's footprint. Reporting only the
+    current page's own size lets the window hug whichever page is visible.
+    """
+
+    def sizeHint(self) -> QSize:
+        current = self.currentWidget()
+        return current.sizeHint() if current is not None else super().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        current = self.currentWidget()
+        return current.minimumSizeHint() if current is not None else super().minimumSizeHint()
 
 
 class MainWindow(QMainWindow):
@@ -10904,7 +13586,7 @@ class MainWindow(QMainWindow):
         self._centered_once = False
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self.resize(_scaled_int(1120, self._scale), _scaled_int(760, self._scale))
+        self._dashboard_window_size = QSize(_scaled_int(1120, self._scale), _scaled_int(760, self._scale))
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -10918,16 +13600,25 @@ class MainWindow(QMainWindow):
         self.title_bar.sync_window_state()
         self.launch_loader = LaunchLoaderDialog(self, scale=self._scale)
 
-        self.stack = QStackedWidget()
+        self.stack = _CurrentPageStack()
         self.login_page = LoginPage(self.handle_login, scale=self._scale)
         self.dashboard_page = DashboardPage(self.state, self.handle_logout, self.show_toast, scale=self._scale)
+        self.title_bar.gmail_api_tool_button.clicked.connect(self.dashboard_page.open_gmail_api_automation_dialog)
         self.stack.addWidget(self.login_page)
         self.stack.addWidget(self.dashboard_page)
         root.addWidget(self.title_bar)
         root.addWidget(self.stack, 1)
         self.setCentralWidget(container)
         self._apply_styles()
+        self._login_window_size = self._compute_login_window_size()
         self.show_login()
+
+    def _compute_login_window_size(self) -> QSize:
+        # The window itself should hug the login card (10px outside it on
+        # every side), not float a small card inside a large empty window.
+        login_size = self.login_page.sizeHint()
+        title_bar_height = self.title_bar.sizeHint().height()
+        return QSize(login_size.width(), login_size.height() + title_bar_height)
 
     def _update_theme_button(self) -> None:
         if not hasattr(self, "title_bar"):
@@ -11660,15 +14351,6 @@ class MainWindow(QMainWindow):
             QLabel#previewMeta {
                 color: #9e9e9e;
             }
-            QTextBrowser#previewBrowser {
-                background: #111827;
-                color: #d4d4d4;
-                border: 1px solid #3c3c3c;
-                border-radius: 6px;
-                padding: 12px;
-                font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
-                font-size: 9pt;
-            }
             QTextEdit#sourceEditor {
                 background: #0f172a;
                 color: #cbd5e1;
@@ -11677,10 +14359,6 @@ class MainWindow(QMainWindow):
                 padding: 10px;
                 font-family: Consolas, "Cascadia Code", "Courier New", monospace;
                 font-size: 8.5pt;
-            }
-            QTextBrowser#previewBrowser QScrollBar:vertical,
-            QTextBrowser#previewBrowser QScrollBar:horizontal {
-                background: #111827;
             }
             """
         import re
@@ -11717,7 +14395,8 @@ class MainWindow(QMainWindow):
                 style = style.replace(dark_color, light_color)
             style += """
                 QMainWindow, QWidget#tabPage, QDialog#outputDialog { background: #f4f7fb; }
-                QDialog#confirmDialog, QMessageBox { background: rgba(15, 23, 42, 0.22); color: #0f172a; }
+                QDialog#confirmDialog { background: rgba(15, 23, 42, 0.22); }
+                QMessageBox { background: #ffffff; color: #0f172a; }
                 QFrame#topBar, QFrame#sidebar, QFrame#contentArea { background: #ffffff; }
                 QFrame#panelCard, QFrame#heroPanel, QFrame#loginCard, QFrame#loginShell,
                 QFrame#dialogCard, QFrame#confirmCard, QFrame#loaderCard { background: #ffffff; }
@@ -11777,12 +14456,23 @@ class MainWindow(QMainWindow):
         self.hide_launch_loader()
         self.title_bar.set_state("", False)
         self.stack.setCurrentWidget(self.login_page)
+        self._resize_window_for_page(self._login_window_size)
 
     def show_dashboard(self) -> None:
         self.hide_launch_loader()
         self.title_bar.set_state(self.state.username, self.state.logged_in)
         self.dashboard_page.refresh()
         self.stack.setCurrentWidget(self.dashboard_page)
+        self._resize_window_for_page(self._dashboard_window_size)
+
+    def _resize_window_for_page(self, size: QSize) -> None:
+        if self.isMaximized():
+            return
+        if self.size() == size:
+            return
+        self.resize(size)
+        if self._centered_once:
+            self._center_window_on_screen()
 
     def handle_login(self, username: str, auth_token: str = "", role: str = "", reset_workspace: bool = False) -> None:
         previous_username = self._last_login_username.strip()
