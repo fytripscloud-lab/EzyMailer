@@ -90,6 +90,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QGraphicsOpacityEffect,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -1814,6 +1815,119 @@ class AIValidationWorker(QObject):
         if not unique_models:
             raise ValueError("No models were returned by the provider.")
         return unique_models
+
+
+_AI_DESIGN_SYSTEM_PROMPT = (
+    "You are an expert HTML designer embedded in a desktop email tool. You will be "
+    "given an existing HTML document and a description of the design changes the "
+    "user wants. Rewrite the HTML to apply ONLY the requested changes, keeping "
+    "everything else - text content, structure, merge-field placeholders such as "
+    "{{tag}}, and any styling not related to the request - exactly as it was. "
+    "Reply with the complete, valid HTML document and nothing else: no explanations, "
+    "no markdown code fences, no commentary before or after the HTML."
+)
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    """Best-effort removal of a ```html ... ``` wrapper some models add anyway."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    return stripped
+
+
+class AIDesignWorker:
+    """Asks the connected AI provider to redesign a block of HTML on request.
+
+    Mirrors AIValidationWorker's direct urllib calls (no SDK dependency) but
+    hits each provider's chat/completion endpoint instead of its models list.
+    """
+
+    def __init__(self, provider: str, api_key: str, model: str):
+        self.provider = provider
+        self.api_key = api_key
+        self.model = model
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    def request_redesign(self, html: str, instructions: str) -> str:
+        context = self._ssl_context()
+        user_message = f"Current HTML:\n{html}\n\nRequested changes:\n{instructions.strip()}"
+
+        if self.provider == "Claude":
+            payload = json.dumps(
+                {
+                    "model": self.model or "claude-sonnet-5",
+                    "max_tokens": 8192,
+                    "system": _AI_DESIGN_SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": user_message}],
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                method="POST",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+        else:
+            url = (
+                "https://api.deepseek.com/chat/completions"
+                if self.provider == "DeepSeek"
+                else "https://api.openai.com/v1/chat/completions"
+            )
+            payload = json.dumps(
+                {
+                    "model": self.model or ("deepseek-chat" if self.provider == "DeepSeek" else "gpt-4o"),
+                    "messages": [
+                        {"role": "system", "content": _AI_DESIGN_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "temperature": 0.4,
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "content-type": "application/json",
+                },
+            )
+
+        try:
+            with urllib.request.urlopen(request, timeout=90, context=context) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"AI design request failed ({exc.code}): {detail}") from exc
+
+        if self.provider == "Claude":
+            blocks = result.get("content") or []
+            text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict))
+        else:
+            choices = result.get("choices") or []
+            text = choices[0]["message"]["content"] if choices else ""
+
+        html_out = _strip_markdown_code_fence(text)
+        if not html_out.strip():
+            raise RuntimeError("The AI did not return any HTML.")
+        return html_out
 
 
 class CampaignBrowserClosedError(RuntimeError):
@@ -4177,15 +4291,35 @@ class NativeWebPreviewWidget(QWidget):
 
 
 class HtmlPreviewDialog(QDialog):
-    def __init__(self, parent: QWidget, title: str, html: str, source_label: str = "", scale: float = 1.0):
+    def __init__(
+        self,
+        parent: QWidget,
+        title: str,
+        html: str,
+        source_label: str = "",
+        scale: float = 1.0,
+        *,
+        raw_html: str | None = None,
+        ai_enabled: Callable[[], bool] | None = None,
+        design_with_ai: Callable[[str, str], str] | None = None,
+        on_save: Callable[[str], None] | None = None,
+    ):
         super().__init__(parent)
         self._scale = scale
         self.setModal(False)
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.setObjectName("previewDialog")
         self._source_html = html
+        # The raw, un-substituted template source (tags like {{name}} intact).
+        # Design with AI edits and Save always operate on this, never on the
+        # tag-substituted preview, so a save can never bake sample values in.
+        self._raw_html = raw_html if raw_html is not None else html
         self._source_visible = False
         self._zoom_factor = 1.0
+        self._ai_enabled_check = ai_enabled
+        self._design_with_ai = design_with_ai
+        self._on_save = on_save
+        self._ai_busy = False
         self._build_ui(title, source_label, html)
 
     def _build_ui(self, title: str, source_label: str, html: str) -> None:
@@ -4204,6 +4338,15 @@ class HtmlPreviewDialog(QDialog):
         title_label.setObjectName("sectionTitle")
         header_row.addWidget(title_label)
         header_row.addStretch()
+
+        design_ai_button = QPushButton("Design with AI")
+        design_ai_button.setObjectName("secondaryButton")
+        design_ai_button.setFixedHeight(_scaled_int(28, self._scale))
+        design_ai_button.clicked.connect(self._design_with_ai_clicked)
+        design_ai_button.setVisible(self._design_with_ai is not None and self._on_save is not None)
+        self.design_ai_button = design_ai_button
+        header_row.addWidget(design_ai_button)
+
         reload_button = QPushButton("Reload")
         reload_button.setObjectName("secondaryButton")
         reload_button.setFixedHeight(_scaled_int(28, self._scale))
@@ -4239,12 +4382,23 @@ class HtmlPreviewDialog(QDialog):
         for button in (reload_button, source_button, zoom_out_button, zoom_reset_button, zoom_in_button):
             header_row.addWidget(button)
 
+        save_button = QPushButton("Save")
+        save_button.setObjectName("primaryButton")
+        save_button.setFixedHeight(_scaled_int(28, self._scale))
+        save_button.setToolTip("Save the AI-redesigned HTML back to the editor")
+        save_button.clicked.connect(self._save_clicked)
+        save_button.setVisible(False)
+        self.save_button = save_button
+        header_row.addWidget(save_button)
+
         close_button = QPushButton("Close")
         close_button.setObjectName("secondaryButton")
         close_button.setFixedHeight(_scaled_int(28, self._scale))
         close_button.clicked.connect(self.close)
         header_row.addWidget(close_button)
         card_layout.addLayout(header_row)
+
+        self._refresh_ai_button_state()
 
         if source_label:
             meta_label = QLabel(source_label)
@@ -4275,6 +4429,73 @@ class HtmlPreviewDialog(QDialog):
     def _toggle_source_view(self, checked: bool) -> None:
         self._source_visible = checked
         self.source_view.setVisible(checked)
+
+    def _refresh_ai_button_state(self) -> None:
+        if not hasattr(self, "design_ai_button"):
+            return
+        available = self._design_with_ai is not None and self._on_save is not None
+        self.design_ai_button.setVisible(available)
+        if not available:
+            return
+        connected = bool(self._ai_enabled_check and self._ai_enabled_check())
+        self.design_ai_button.setEnabled(connected and not self._ai_busy)
+        self.design_ai_button.setToolTip(
+            "Ask AI to redesign this content" if connected else "Connect an AI provider first"
+        )
+
+    def notify_ai_connection_changed(self) -> None:
+        """Called by the controller whenever AI connect/disconnect happens."""
+        self._refresh_ai_button_state()
+
+    def _design_with_ai_clicked(self) -> None:
+        if self._design_with_ai is None or self._ai_busy:
+            return
+        instructions, ok = QInputDialog.getMultiLineText(
+            self,
+            "Design with AI",
+            "Describe the design changes you want. Only what you describe here will change.",
+        )
+        if not ok or not instructions.strip():
+            return
+
+        self._ai_busy = True
+        self._refresh_ai_button_state()
+        self.design_ai_button.setText("Designing…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            new_html = self._design_with_ai(self._raw_html, instructions.strip())
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self._ai_busy = False
+            self.design_ai_button.setText("Design with AI")
+            self._refresh_ai_button_state()
+            QMessageBox.warning(self, "Design with AI failed", str(exc))
+            return
+
+        QApplication.restoreOverrideCursor()
+        self._ai_busy = False
+        self.design_ai_button.setText("Design with AI")
+        self._refresh_ai_button_state()
+
+        self._raw_html = new_html
+        self._source_html = new_html
+        self.preview_browser.load_html(new_html)
+        self.source_view.setPlainText(new_html)
+        self.source_view.setVisible(True)
+        self.source_button.setChecked(True)
+        self._source_visible = True
+        self.save_button.setVisible(True)
+
+    def _save_clicked(self) -> None:
+        if self._on_save is None:
+            return
+        try:
+            self._on_save(self._raw_html)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+        self.save_button.setVisible(False)
 
     def _zoom_preview(self, step: int) -> None:
         self._zoom_factor = min(3.0, max(0.25, self._zoom_factor + step * 0.1))
@@ -5706,6 +5927,10 @@ class DashboardPage(QWidget):
             if index >= 0:
                 self.ai_model_combo.setCurrentIndex(index)
         self.ai_model_combo.blockSignals(False)
+
+        for window in list(self._floating_windows):
+            if isinstance(window, HtmlPreviewDialog):
+                window.notify_ai_connection_changed()
 
     def _current_sending_settings_payload(self) -> dict[str, object]:
         delay_type = "Auto (system-oriented)"
@@ -7392,8 +7617,26 @@ class DashboardPage(QWidget):
         </html>
         """
 
-    def _build_preview_dialog(self, title: str, html_content: str, source_label: str) -> HtmlPreviewDialog:
-        dialog = HtmlPreviewDialog(self.window(), title, html_content, source_label, scale=self._scale)
+    def _build_preview_dialog(
+        self,
+        title: str,
+        html_content: str,
+        source_label: str,
+        *,
+        raw_html: str | None = None,
+        on_save: Callable[[str], None] | None = None,
+    ) -> HtmlPreviewDialog:
+        dialog = HtmlPreviewDialog(
+            self.window(),
+            title,
+            html_content,
+            source_label,
+            scale=self._scale,
+            raw_html=raw_html,
+            ai_enabled=lambda: self.state.ai_connected,
+            design_with_ai=self._request_ai_html_design,
+            on_save=on_save,
+        )
         self._floating_windows.append(dialog)
         dialog.finished.connect(lambda _result, d=dialog: self._remove_floating_window(d))
         dialog.destroyed.connect(lambda *_args, d=dialog: self._remove_floating_window(d))
@@ -7403,9 +7646,23 @@ class DashboardPage(QWidget):
         if dialog in self._floating_windows:
             self._floating_windows.remove(dialog)
 
+    def _request_ai_html_design(self, html: str, instructions: str) -> str:
+        if not self.state.ai_connected or not self.state.ai_api_key:
+            raise RuntimeError("Connect an AI provider first.")
+        worker = AIDesignWorker(self.state.ai_provider, self.state.ai_api_key, self.state.ai_model)
+        return worker.request_redesign(html, instructions)
+
+    def _save_attachment_widget_html(self, widget: "AttachmentDraftEditor", new_html: str) -> None:
+        if widget.mode_text() == "Text Editor":
+            widget.rich_editor.setHtml(new_html)
+        else:
+            widget.html_editor.setPlainText(new_html)
+
     def _preview_subject_body(self) -> None:
         subject = self._apply_tags_to_text(self.subject_input.text().strip()) or "Subject Preview"
         current_body = self._current_body_widget()
+        raw_html: str | None = None
+        on_save: Callable[[str], None] | None = None
         if current_body is not None:
             body_payload = current_body.payload()
             if body_payload["mode"] == "HTML Message":
@@ -7413,6 +7670,11 @@ class DashboardPage(QWidget):
                 source = "Previewing the HTML message content."
                 if not html_content:
                     html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML content available.</body></html>"
+                # Design with AI must edit the raw template (tags intact),
+                # never the tag-substituted preview above, so Save can't
+                # bake sample values over the recipient merge fields.
+                raw_html = body_payload["html_text"]
+                on_save = current_body.html_editor.setPlainText
             else:
                 body_text = self._apply_tags_to_text(body_payload["plain_text"].strip())
                 source = "Previewing the plain-text message as HTML."
@@ -7423,7 +7685,7 @@ class DashboardPage(QWidget):
             html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No message body available.</body></html>"
             source = "No active body is available."
 
-        dialog = self._build_preview_dialog("Message Preview", html_content, source)
+        dialog = self._build_preview_dialog("Message Preview", html_content, source, raw_html=raw_html, on_save=on_save)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -7441,7 +7703,13 @@ class DashboardPage(QWidget):
             return
 
         title = widget.title_text() or "HTML Body Preview"
-        dialog = self._build_preview_dialog(title, html_content, "Previewing the selected HTML body.")
+        dialog = self._build_preview_dialog(
+            title,
+            html_content,
+            "Previewing the selected HTML body.",
+            raw_html=widget.html_editor.toPlainText(),
+            on_save=widget.html_editor.setPlainText,
+        )
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -7451,16 +7719,24 @@ class DashboardPage(QWidget):
     def _preview_html_content(self, title: str = "HTML Preview") -> None:
         current_widget = self._current_attachment_widget()
         html_content = ""
+        raw_html: str | None = None
+        on_save: Callable[[str], None] | None = None
         if current_widget is not None:
-            html_content = self._apply_tags_to_text(current_widget.content_html().strip())
+            raw_html = current_widget.content_html()
+            html_content = self._apply_tags_to_text(raw_html.strip())
+            on_save = lambda new_html, w=current_widget: self._save_attachment_widget_html(w, new_html)
         elif hasattr(self, "html_editor") and isinstance(self.html_editor, QTextEdit):
-            html_content = self._apply_tags_to_text(self.html_editor.toPlainText().strip())
+            raw_html = self.html_editor.toPlainText()
+            html_content = self._apply_tags_to_text(raw_html.strip())
+            on_save = self.html_editor.setPlainText
         if not html_content:
             html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML template available.</body></html>"
         dialog = self._build_preview_dialog(
             title,
             html_content,
             "Previewing the HTML template in a separate window.",
+            raw_html=raw_html,
+            on_save=on_save,
         )
         dialog.show()
         dialog.raise_()
@@ -12365,7 +12641,13 @@ class DashboardPage(QWidget):
             self.notify("Add attachment content first")
             return
         title = widget.title_text() or "Attachment Content Preview"
-        dialog = self._build_preview_dialog(title, html_content, "Previewing the selected attachment content.")
+        dialog = self._build_preview_dialog(
+            title,
+            html_content,
+            "Previewing the selected attachment content.",
+            raw_html=html_content,
+            on_save=lambda new_html, w=widget: self._save_attachment_widget_html(w, new_html),
+        )
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
