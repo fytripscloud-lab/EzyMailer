@@ -1,0 +1,47 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Build macOS DMG with all requirements
+        env:
+          EZYM_MAILER_API_BASE_URL: http://15.206.161.73:8765
+          EZYM_MAILER_BOOTSTRAP_API: "0"
+        run: ./build-macos.sh
+
+      - name: Validate DMG and create checksum
+        run: |
+          set -euo pipefail
+          if [ ! -f "dist/EzyMailer-macOS.dmg" ]; then
+            echo "dist/EzyMailer-macOS.dmg was not generated" >&2
+            exit 1
+          fi
+          ls -l dist/EzyMailer-macOS.dmg
+          cat dist/EzyMailer-macOS.dmg.sha256
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EzyMailer-macOS
+          path: |
+            dist/EzyMailer-macOS.dmg
+            dist/EzyMailer-macOS.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30

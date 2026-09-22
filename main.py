@@ -154,6 +154,7 @@ LOCAL_TAG_STATE_KEY = "tag_state"
 LOCAL_CUSTOMER_VARIABLES_TABLE = "customer_variables"
 LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
+LOCAL_DATA_TAB_SETTINGS_KEY = "data_tab_settings_state"
 GOOGLE_API_ACCOUNTS_DIR = LOCAL_CACHE_DIR / "api_accounts"
 
 
@@ -1417,6 +1418,7 @@ class AppState:
     window_send_mode: str = "Parallel"
     fast_compose: bool = True
     ai_available_models: list[str] = field(default_factory=list)
+    auto_delete_sent_emails: bool = True
 
 
 class FairThreadLock:
@@ -2068,6 +2070,7 @@ class CampaignSendWorker(QObject):
                                 self.convert_enabled,
                                 True,
                                 False,
+                                body_html=task.get("body_html", ""),
                             )
                         sent_ok = True
                         break
@@ -3994,6 +3997,58 @@ class OutputOptionsDialog(QDialog):
         return card
 
 
+class DataTabSettingsDialog(QDialog):
+    def __init__(self, parent=None, scale: float = 1.0, auto_delete_sent: bool = True):
+        super().__init__(parent)
+        self._scale = scale
+        self.setWindowTitle("Customer Emails Settings")
+        self.setModal(True)
+        self.setObjectName("outputDialog")
+        self.auto_delete_checkbox = QCheckBox("Automatically delete an email once it has been sent")
+        self.auto_delete_checkbox.setChecked(bool(auto_delete_sent))
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
+
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        card_layout.setSpacing(_scaled_int(8, self._scale))
+        title = QLabel("AUTO EMAIL DELETE")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+        hint = QLabel(
+            "When enabled, each recipient is removed from the Customer Emails list right "
+            "after its email is sent, so the list always shows only the addresses still "
+            "waiting to be sent."
+        )
+        hint.setObjectName("sectionSubtitle")
+        hint.setWordWrap(True)
+        card_layout.addWidget(hint)
+        card_layout.addWidget(self.auto_delete_checkbox)
+        layout.addWidget(card)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent is not None:
+            self.adjustSize()
+            parent_center = parent.frameGeometry().center()
+            self.move(
+                parent_center.x() - self.width() // 2,
+                parent_center.y() - self.height() // 2,
+            )
+
+
 class FileFormatDialog(QDialog):
     def __init__(
         self,
@@ -4899,6 +4954,73 @@ _TAG_COMPANY_NAMES: tuple[str, ...] = (
     "Disney", "Warner Bros. Discovery", "Comcast", "Paramount", "Sony Pictures",
 )
 
+# Spanish given names + surnames for the $spanishname tag. Stock macOS/Windows
+# ship no Spanish name list (macOS's /usr/share/dict/propernames is English
+# only), so these are built in. A full name is "<given> <surname> <surname>"
+# (Spanish naming convention); _spanish_name_pool() below pairs every given
+# name with every surname, so the pool is far larger than 2,000 names.
+_TAG_SPANISH_FIRST_NAMES: tuple[str, ...] = tuple(dict.fromkeys((
+    # Female
+    "María", "Carmen", "Josefa", "Isabel", "Ana", "Dolores", "Pilar", "Teresa", "Lucía", "Laura",
+    "Marta", "Cristina", "Elena", "Paula", "Sara", "Raquel", "Rosa", "Antonia", "Francisca", "Concepción",
+    "Mercedes", "Rocío", "Beatriz", "Silvia", "Patricia", "Julia", "Irene", "Alba", "Andrea", "Natalia",
+    "Sofía", "Valentina", "Camila", "Isabella", "Daniela", "Gabriela", "Mariana", "Carolina", "Fernanda", "Paola",
+    "Verónica", "Claudia", "Adriana", "Alejandra", "Angélica", "Bárbara", "Carla", "Diana", "Eva", "Inés",
+    "Lorena", "Manuela", "Marina", "Mónica", "Nuria", "Olivia", "Pamela", "Rebeca", "Susana", "Tamara",
+    "Victoria", "Ximena", "Yolanda", "Amparo", "Araceli", "Aurora", "Blanca", "Catalina", "Clara", "Consuelo",
+    "Débora", "Elisa", "Emilia", "Esperanza", "Estela", "Fabiola", "Gloria", "Graciela", "Guadalupe", "Inmaculada",
+    "Jimena", "Karina", "Leticia", "Lidia", "Lourdes", "Luisa", "Magdalena", "Margarita", "Milagros", "Miriam",
+    "Noelia", "Ofelia", "Piedad", "Regina", "Renata", "Rosario", "Salomé", "Soledad", "Sonia", "Trinidad",
+    "Valeria", "Vanesa", "Viviana", "Zulema", "Abril", "Agustina", "Alicia", "Almudena", "Anabel", "Belén",
+    "Brenda", "Candela", "Celia", "Cecilia", "Dayana", "Delia", "Denise", "Dulce", "Edith", "Elvira",
+    "Emma", "Erika", "Evelyn", "Flor", "Genoveva", "Helena", "Ivana", "Jazmín", "Jessica", "Joana",
+    "Judith", "Julieta", "Kiara", "Laia", "Leonor", "Liliana", "Lola", "Lucrecia", "Luz", "Macarena",
+    "Maite", "Malena", "Marisol", "Marisa", "Matilde", "Micaela", "Montserrat", "Nadia", "Nerea", "Nicole",
+    "Noemí", "Paloma", "Priscila", "Rafaela", "Rita", "Roxana", "Sabrina", "Selena", "Tatiana", "Úrsula",
+    "Vera", "Yesenia", "Yasmín", "Zoe",
+    # Male
+    "José", "Antonio", "Manuel", "Francisco", "Juan", "David", "Javier", "Daniel", "Carlos", "Miguel",
+    "Rafael", "Pedro", "Ángel", "Alejandro", "Fernando", "Luis", "Sergio", "Pablo", "Jorge", "Alberto",
+    "Álvaro", "Adrián", "Diego", "Andrés", "Rubén", "Enrique", "Ramón", "Vicente", "Ignacio", "Iván",
+    "Óscar", "Raúl", "Víctor", "Marcos", "Mario", "Santiago", "Mateo", "Sebastián", "Nicolás", "Emiliano",
+    "Matías", "Samuel", "Benjamín", "Joaquín", "Tomás", "Gonzalo", "Martín", "Lucas", "Leonardo", "Gabriel",
+    "Cristian", "Eduardo", "Ricardo", "Roberto", "Héctor", "Gustavo", "Guillermo", "Hugo", "Julián", "Felipe",
+    "Esteban", "Alfonso", "Alfredo", "Armando", "Arturo", "Augusto", "Bernardo", "Camilo", "César", "Claudio",
+    "Cristóbal", "Damián", "Darío", "Domingo", "Edgar", "Edmundo", "Efraín", "Elías", "Emilio", "Ernesto",
+    "Eugenio", "Fabián", "Federico", "Fidel", "Gerardo", "Germán", "Gilberto", "Gregorio", "Ismael", "Jaime",
+    "Jesús", "Jonás", "Leandro", "Lorenzo", "Maximiliano", "Mauricio", "Moisés", "Nelson", "Néstor", "Octavio",
+    "Orlando", "Pascual", "Patricio", "Rodrigo", "Rogelio", "Rolando", "Salvador", "Saúl", "Simón", "Teodoro",
+    "Ulises", "Valentín", "Wilfredo", "Xavier", "Yago", "Zacarías", "Abel", "Abraham", "Adolfo", "Aitor",
+    "Alan", "Alonso", "Anselmo", "Baltasar", "Bruno", "Cayetano", "Ciro", "Cornelio", "Dante", "Elián",
+    "Ezequiel", "Fausto", "Florencio", "Genaro", "Gael", "Hernán", "Horacio", "Iker", "Isaac", "Isidro",
+    "Joel", "Josué", "Kevin", "Lisandro", "Marcelo", "Mariano", "Nahuel", "Noé", "Omar", "Osvaldo",
+    "Pelayo", "Reinaldo", "Renato", "Ariel", "Bastián", "Bautista", "Ciriaco", "Dionisio", "Eloy", "Facundo",
+)))
+_TAG_SPANISH_SURNAMES: tuple[str, ...] = tuple(dict.fromkeys((
+    "García", "Fernández", "González", "Rodríguez", "López", "Martínez", "Sánchez", "Pérez", "Gómez", "Martín",
+    "Jiménez", "Ruiz", "Hernández", "Díaz", "Moreno", "Muñoz", "Álvarez", "Romero", "Alonso", "Gutiérrez",
+    "Navarro", "Torres", "Domínguez", "Vázquez", "Ramos", "Gil", "Ramírez", "Serrano", "Blanco", "Molina",
+    "Morales", "Suárez", "Ortega", "Delgado", "Castro", "Ortiz", "Rubio", "Marín", "Sanz", "Núñez",
+    "Iglesias", "Medina", "Garrido", "Cortés", "Castillo", "Santos", "Lozano", "Guerrero", "Cano", "Prieto",
+    "Méndez", "Cruz", "Calvo", "Gallego", "Vidal", "León", "Márquez", "Herrera", "Peña", "Flores",
+    "Cabrera", "Campos", "Vega", "Fuentes", "Carrasco", "Díez", "Caballero", "Reyes", "Nieto", "Aguilar",
+    "Pascual", "Santana", "Herrero", "Lorenzo", "Montero", "Hidalgo", "Giménez", "Ibáñez", "Ferrer", "Durán",
+    "Santiago", "Benítez", "Mora", "Vicente", "Vargas", "Arias", "Carmona", "Crespo", "Román", "Pastor",
+    "Soto", "Sáez", "Velasco", "Moya", "Soler", "Parra", "Esteban", "Bravo", "Gallardo", "Rojas",
+    "Pardo", "Merino", "Franco", "Espinosa", "Izquierdo", "Lara", "Rivas", "Silva", "Rivera", "Casado",
+    "Arroyo", "Redondo", "Camacho", "Rey", "Vera", "Robles", "Aguirre", "Bermúdez", "Sandoval", "Salazar",
+    "Zamora", "Valdés", "Mendoza", "Guzmán", "Contreras", "Cárdenas", "Ávila", "Paredes", "Palacios", "Villalobos",
+    "Figueroa", "Acosta", "Bautista", "Ponce", "Quintero", "Escobar", "Miranda", "Maldonado", "Solís", "Trujillo",
+    "Ibarra", "Barrera", "Cervantes", "Montes", "Orozco", "Salinas", "Valencia", "Villanueva", "Zúñiga", "Beltrán",
+    "Lugo", "Aranda", "Ochoa", "Olivares", "Padilla", "Pineda", "Rangel", "Rosales", "Tapia", "Valdez",
+    "Villegas", "Yáñez", "Zavala", "Alarcón", "Bustos", "Cisneros", "Córdoba", "Duarte", "Echeverría", "Estrada",
+    "Galindo", "Godoy", "Ledesma", "Luna", "Macías", "Meza", "Naranjo", "Olmos", "Osorio", "Pacheco",
+    "Quiroga", "Rincón", "Saavedra", "Tovar", "Uribe", "Varela", "Velázquez", "Zapata", "Bernal", "Bonilla",
+    "Carvajal", "Cordero", "Correa", "Fajardo", "Feliciano", "Gaitán", "Gamboa", "Garza", "Guerra", "Henríquez",
+    "Huerta", "Lucero", "Mejía", "Mesa", "Nava", "Noriega", "Oliva", "Peralta", "Portillo", "Quesada",
+    "Ríos", "Sepúlveda", "Toledo", "Ureña", "Vallejo", "Zambrano",
+)))
+
 
 # There's no database bundled with this app, but stock macOS already ships
 # a large English dictionary and a proper-names list (BSD heritage, present
@@ -4951,6 +5073,110 @@ def _os_city_pool() -> tuple[str, ...]:
     except Exception:
         pass
     return ("Seattle", "Austin", "Denver", "Miami", "Chennai", "Berlin")
+
+
+@functools.lru_cache(maxsize=1)
+def _spanish_name_pool() -> tuple[str, ...]:
+    # Every given name x every surname (well over 2,000 distinct names).
+    return tuple(f"{first} {surname}" for first in _TAG_SPANISH_FIRST_NAMES for surname in _TAG_SPANISH_SURNAMES)
+
+
+def _spanish_full_name(first_and_surname: str) -> str:
+    # Adds the second surname (Spanish names carry two), never repeating the first.
+    while True:
+        second = secrets.choice(_TAG_SPANISH_SURNAMES)
+        if not first_and_surname.endswith(f" {second}"):
+            return f"{first_and_surname} {second}"
+
+
+# Attachment images are rendered at least 800px wide, so a narrow centered
+# card (e.g. a 600px receipt) ends up with wide empty bands on both sides.
+_SIDE_GAP_MIN_PX = 80
+_SIDE_GAP_KEEP_PX = 32
+_SIDE_GAP_TOLERANCE = 6
+
+
+def _trim_side_gaps(image):
+    """Crop empty left/right bands off a rendered page image.
+
+    A band counts as empty while every column in it is one flat colour (same
+    across its full height and matching its neighbours), so shadows, borders
+    and any real content stop the scan. Only gaps of at least
+    _SIDE_GAP_MIN_PX are trimmed, leaving _SIDE_GAP_KEEP_PX of margin.
+    """
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+
+    def gap(from_left: bool) -> int:
+        base = None
+        count = 0
+        columns = range(width) if from_left else range(width - 1, -1, -1)
+        for x in columns:
+            extrema = rgb.crop((x, 0, x + 1, height)).getextrema()
+            if any(high - low > _SIDE_GAP_TOLERANCE for low, high in extrema):
+                break
+            color = tuple((low + high) // 2 for low, high in extrema)
+            if base is None:
+                base = color
+            elif any(abs(a - b) > _SIDE_GAP_TOLERANCE for a, b in zip(color, base)):
+                break
+            count += 1
+        return count
+
+    left = gap(True)
+    right = gap(False)
+    if left + right >= width:
+        return image
+    crop_left = left - _SIDE_GAP_KEEP_PX if left >= _SIDE_GAP_MIN_PX else 0
+    crop_right = right - _SIDE_GAP_KEEP_PX if right >= _SIDE_GAP_MIN_PX else 0
+    if crop_left <= 0 and crop_right <= 0:
+        return image
+    return image.crop((max(0, crop_left), 0, width - max(0, crop_right), height))
+
+
+# Every attachment page is A4 portrait; content is fitted to the page width.
+_ATTACHMENT_PAGE_IN = (8.27, 11.69)
+_ATTACHMENT_BLANK_TOLERANCE = 6
+
+
+def _attachment_page_slices(image, aspect: float) -> list:
+    """Split a rendered image into portrait page strips (height <= width * aspect).
+
+    Cuts prefer a blank row near the page boundary so lines of text aren't
+    sliced in half, and a trailing all-blank remainder doesn't get its own page.
+    """
+    width, height = image.size
+    page_px = max(1, int(round(width * aspect)))
+    if height <= page_px:
+        return [image]
+    rgb = image.convert("RGB")
+
+    def is_flat(box) -> bool:
+        return all(high - low <= _ATTACHMENT_BLANK_TOLERANCE for low, high in rgb.crop(box).getextrema())
+
+    slices = []
+    top = 0
+    window = int(page_px * 0.15)
+    while height - top > page_px:
+        cut = top + page_px
+        for y in range(cut, cut - window, -1):
+            if y > top and is_flat((0, y, width, y + 1)):
+                cut = y
+                break
+        slices.append(image.crop((0, top, width, cut)))
+        top = cut
+    if not is_flat((0, top, width, height)):
+        slices.append(image.crop((0, top, width, height)))
+    return slices
+
+
+def _jpeg_stream(image):
+    from io import BytesIO
+
+    stream = BytesIO()
+    image.convert("RGB").save(stream, format="JPEG", quality=92, optimize=True)
+    stream.seek(0)
+    return stream
 
 
 class _ElidingLabel(QLabel):
@@ -5464,8 +5690,17 @@ class DashboardPage(QWidget):
         page_layout = QVBoxLayout(page)
         page_layout.setSpacing(_scaled_int(10, self._scale))
 
-        header = self._section_title("CUSTOMER EMAILS")
-        page_layout.addWidget(header)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addWidget(self._section_title("CUSTOMER EMAILS"), 1)
+        self.data_settings_button = QPushButton("⚙")
+        self.data_settings_button.setObjectName("secondaryButton")
+        self.data_settings_button.setFixedWidth(_scaled_int(30, self._scale))
+        self.data_settings_button.setToolTip("Customer email list settings")
+        self.data_settings_button.setCursor(Qt.PointingHandCursor)
+        self.data_settings_button.clicked.connect(self._open_data_tab_settings)
+        header_row.addWidget(self.data_settings_button, 0, Qt.AlignTop)
+        page_layout.addLayout(header_row)
 
         self.pending_emails_editor.setPlaceholderText("Paste email addresses here, one per line...")
         self.pending_emails_editor.setObjectName("bodyEditor")
@@ -6835,6 +7070,7 @@ class DashboardPage(QWidget):
             {"title": "Up to 24 hours", "token": "$resptime", "description": "Random customer support SLA response time", "default_value": "Up to 24 hours"},
             {"title": "Total", "token": "$total", "description": "Random billing total label", "default_value": "Total"},
             {"title": "Angel Lee", "token": "$fullname", "description": "Random First Name + Last Name", "default_value": "Angel Lee"},
+            {"title": "María García López", "token": "$spanishname", "description": "Random Spanish full name (given name + two surnames)", "default_value": "María García López"},
             {"title": "09/17/2026", "token": "$date", "description": "Current date MM/DD/YYYY", "default_value": "09/17/2026"},
             {"title": "03:10 PM", "token": "$time", "description": "Current time HH:MM AM/PM", "default_value": "03:10 PM"},
             {"title": "Microsoft", "token": "$company", "description": "Random real global company name", "default_value": "Microsoft"},
@@ -7071,6 +7307,8 @@ class DashboardPage(QWidget):
             return secrets.choice(_TAG_TOTAL_LABELS)
         if token == "$fullname":
             return f"{secrets.choice(_os_first_name_pool())} {secrets.choice(_TAG_LAST_NAMES)}"
+        if token == "$spanishname":
+            return _spanish_full_name(secrets.choice(_spanish_name_pool()))
         if token == "$date":
             today = QDateTime.currentDateTime().date()
             return f"{today.month():02d}/{today.day():02d}/{today.year()}"
@@ -7099,6 +7337,7 @@ class DashboardPage(QWidget):
         return {
             "$name": first_name_picker,
             "$fullname": first_name_picker,
+            "$spanishname": _UniquePicker(_spanish_name_pool()),
             "$city": _UniquePicker(_os_city_pool()),
             "$company": _UniquePicker(_TAG_COMPANY_NAMES),
             "$order": _UniquePicker(_TAG_ORDER_LABELS),
@@ -7120,6 +7359,8 @@ class DashboardPage(QWidget):
         """
         if token in ("$name", "$fullname"):
             return f"{pickers[token].next()} {secrets.choice(_TAG_LAST_NAMES)}"
+        if token == "$spanishname":
+            return _spanish_full_name(pickers[token].next())
         if token in pickers:
             return pickers[token].next()
         return self._generate_random_tag_value(token, default_value)
@@ -8516,10 +8757,12 @@ class DashboardPage(QWidget):
         current_body = self._current_body_widget()
         body_text = ""
         body_html = ""
+        body_mode = ""
         if current_body is not None:
             payload = current_body.payload()
             body_text = str(payload.get("plain_text") or "").strip()
             body_html = str(payload.get("html_text") or "").strip()
+            body_mode = str(payload.get("mode") or "")
         attachment_widget = self._current_attachment_widget()
         attachment_html = attachment_widget.content_html().strip() if attachment_widget is not None else ""
         return {
@@ -8528,6 +8771,7 @@ class DashboardPage(QWidget):
             "subjects": subjects,
             "body_text": body_text,
             "body_html": body_html,
+            "body_mode": body_mode,
             "attachment_html": attachment_html,
             "attachment_format": self.attach_format_value,
             "attachment_formats": self._normalize_attachment_format_values(self.attach_format_value),
@@ -8768,6 +9012,7 @@ class DashboardPage(QWidget):
         attachment_html: str,
         attachment_formats: list[str],
         file_name_value: str,
+        body_html_template: str = "",
     ) -> Callable[[str], dict[str, str]]:
         """Capture immutable campaign data and personalize one queued recipient locally."""
         custom1 = self.custom1_input.text().strip()
@@ -8842,6 +9087,7 @@ class DashboardPage(QWidget):
                 "recipient": recipient,
                 "subject": subject,
                 "body_text": apply_values(body_template, replacements),
+                "body_html": apply_values(body_html_template, replacements),
                 "attachment_html": apply_values(attachment_html, replacements),
                 "attachment_format": default_attachment_format,
                 "file_name_value": apply_values(file_name_value, replacements),
@@ -8859,6 +9105,7 @@ class DashboardPage(QWidget):
         attachment_formats: list[str],
         file_name_mode: str,
         file_name_value: str,
+        body_html_template: str = "",
     ) -> list[dict[str, object]]:
         chunks = self._chunk_campaign_recipients(
             recipients,
@@ -8873,6 +9120,7 @@ class DashboardPage(QWidget):
             attachment_html,
             attachment_formats,
             file_name_value,
+            body_html_template,
         )
         jobs: list[dict[str, object]] = []
         for index, (session, chunk) in enumerate(zip(sessions, chunks), start=1):
@@ -8943,6 +9191,7 @@ class DashboardPage(QWidget):
         thread.started.connect(worker.run, Qt.DirectConnection)
         worker.log.connect(self._append_campaign_send_log)
         worker.progress.connect(self._on_campaign_worker_progress)
+        worker.email_sent.connect(self._on_campaign_email_sent)
         worker.finished.connect(self._on_campaign_worker_finished)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -9188,7 +9437,11 @@ class DashboardPage(QWidget):
             subject_template = str(payload.get("subject") or "").strip()
         if not subject_template:
             subject_template = str(payload.get("subject") or "").strip()
-        body_template = self._campaign_body_text(str(payload.get("body_text") or ""), str(payload.get("body_html") or ""))
+        body_mode = str(payload.get("body_mode") or "")
+        body_template = self._campaign_body_text(
+            str(payload.get("body_text") or ""), str(payload.get("body_html") or ""), body_mode
+        )
+        body_html_template = self._campaign_body_html(str(payload.get("body_html") or ""), body_mode)
         if not body_template:
             self.notify("Add body content before starting the campaign")
             self._log_action("Campaign blocked: no body content available")
@@ -9243,6 +9496,7 @@ class DashboardPage(QWidget):
             attachment_formats,
             file_name_mode,
             file_name_value,
+            body_html_template=body_html_template,
         )
         self._campaign_worker_queue = list(jobs)
         self._log_action(
@@ -9367,7 +9621,11 @@ class DashboardPage(QWidget):
             subject_template = str(payload.get("subject") or "").strip()
         if not subject_template:
             subject_template = str(payload.get("subject") or "").strip()
-        body_template = self._campaign_body_text(str(payload.get("body_text") or ""), str(payload.get("body_html") or ""))
+        body_mode = str(payload.get("body_mode") or "")
+        body_template = self._campaign_body_text(
+            str(payload.get("body_text") or ""), str(payload.get("body_html") or ""), body_mode
+        )
+        body_html_template = self._campaign_body_html(str(payload.get("body_html") or ""), body_mode)
         if not body_template:
             self.notify("Add body content before starting the campaign")
             self._log_action("Campaign blocked: no body content available")
@@ -9425,6 +9683,7 @@ class DashboardPage(QWidget):
             attachment_formats,
             file_name_mode,
             file_name_value,
+            body_html_template=body_html_template,
         )
         self._campaign_worker_queue = list(jobs)
         self._log_action(f"Campaign ready for {total} recipient(s) across {lane_count} Gmail API account(s)")
@@ -9440,20 +9699,81 @@ class DashboardPage(QWidget):
                 self._queue_campaign_job(job)
 
     def _html_to_plain_text(self, value: str) -> str:
-        cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", value or "")
+        cleaned = re.sub(r"(?is)<(script|style|head|title).*?>.*?</\1>", "", value or "")
         cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
         cleaned = re.sub(r"(?i)</p\s*>", "\n\n", cleaned)
+        cleaned = re.sub(r"(?i)</(div|h[1-6]|tr|li|table)\s*>", "\n", cleaned)
+        cleaned = re.sub(r"(?i)</t[dh]\s*>", " ", cleaned)
         cleaned = re.sub(r"<[^>]+>", "", cleaned)
         cleaned = html.unescape(cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
-    def _campaign_body_text(self, body_text: str, body_html: str) -> str:
+    @staticmethod
+    def _use_html_body(body_html: str, body_mode: str) -> bool:
+        return bool(body_html.strip()) and body_mode == "HTML Message"
+
+    def _campaign_body_text(self, body_text: str, body_html: str, body_mode: str = "") -> str:
+        if self._use_html_body(body_html, body_mode):
+            return self._html_to_plain_text(body_html)
         if body_text.strip():
             return body_text.strip()
         if body_html.strip():
             return self._html_to_plain_text(body_html)
         return ""
+
+    @staticmethod
+    def _html_to_node_tree(fragment: str) -> list:
+        """HTML fragment -> nested {t, a, c} dicts / text strings.
+
+        Gmail enforces Trusted Types, so its compose box rejects HTML strings
+        (innerHTML / execCommand insertHTML). The page rebuilds this tree with
+        createElement/setAttribute instead, which Trusted Types doesn't gate.
+        """
+        import lxml.html
+
+        skip = {"script", "style", "head", "title", "meta", "link", "noscript", "iframe", "object", "embed"}
+        root = lxml.html.fragment_fromstring(fragment, create_parent="div")
+
+        def children(element) -> list:
+            out: list = []
+            if element.text:
+                out.append(element.text)
+            for child in element:
+                if isinstance(child.tag, str) and child.tag.lower() not in skip:
+                    attrs = {
+                        key: value
+                        for key, value in child.attrib.items()
+                        if not key.lower().startswith("on")
+                        and not (key.lower() in ("href", "src") and value.strip().lower().startswith("javascript:"))
+                    }
+                    out.append({"t": child.tag, "a": attrs, "c": children(child)})
+                if child.tail:
+                    out.append(child.tail)
+            return out
+
+        return children(root)
+
+    def _campaign_body_html(self, body_html: str, body_mode: str = "") -> str:
+        """Body HTML prepared for Gmail: CSS inlined, wrapped to a body fragment.
+
+        Gmail's compose box and message viewer drop <style> blocks and class
+        rules, so every rule is inlined into style="" attributes first. Only
+        the <body> content is kept (the <head>/<title> must not leak into the
+        message), with the body's own styles carried on a wrapper div.
+        """
+        if not self._use_html_body(body_html, body_mode):
+            return ""
+        import css_inline
+        import lxml.html
+
+        inlined = css_inline.inline(body_html, keep_style_tags=False, load_remote_stylesheets=False)
+        body = lxml.html.document_fromstring(inlined).body
+        inner = (body.text or "") + "".join(lxml.html.tostring(child, encoding="unicode") for child in body)
+        body_style = body.get("style", "").strip()
+        if body_style:
+            return f'<div style="{html.escape(body_style, quote=True)}">{inner}</div>'
+        return inner
 
     def _gmail_compose_url(self, recipient: str = "", subject: str = "", body_text: str = "") -> str:
         # Compose strictly through Gmail's URL. The nonce is important when a
@@ -9548,9 +9868,10 @@ class DashboardPage(QWidget):
             if image.mode in {"RGBA", "LA"}:
                 background = Image.new("RGB", image.size, (255, 255, 255))
                 background.paste(image, mask=image.split()[-1])
-                background.save(output_path, format="JPEG", quality=92, optimize=True)
+                flattened = background
             else:
-                image.convert("RGB").save(output_path, format="JPEG", quality=92, optimize=True)
+                flattened = image.convert("RGB")
+            _trim_side_gaps(flattened).save(output_path, format="JPEG", quality=92, optimize=True)
         finally:
             image.close()
             try:
@@ -9572,15 +9893,6 @@ class DashboardPage(QWidget):
         finally:
             image.close()
 
-    def _attachment_page_dimensions(self, image_width: int, image_height: int) -> tuple[float, float]:
-        if image_width >= image_height:
-            page_width_in = 13.333
-            page_height_in = max(6.0, 13.333 * (float(image_height) / float(image_width)))
-        else:
-            page_height_in = 11.0
-            page_width_in = max(6.0, 11.0 * (float(image_width) / float(image_height)))
-        return page_width_in, page_height_in
-
     def _export_jpg_to_format(self, jpg_path: Path, format_value: str, output_path: Path) -> Path:
         ensure_external_dependencies()
         from docx import Document
@@ -9595,37 +9907,62 @@ class DashboardPage(QWidget):
 
         format_value = (format_value or "").strip()
         if format_value == "PDF document":
-            image_width, image_height = self._attachment_image_size(jpg_path)
-            page_width_in, page_height_in = self._attachment_page_dimensions(image_width, image_height)
-            pdf = canvas.Canvas(
-                str(output_path),
-                pagesize=(page_width_in * reportlab_inch, page_height_in * reportlab_inch),
-            )
-            pdf.drawImage(
-                ImageReader(str(jpg_path)),
-                0,
-                0,
-                width=page_width_in * reportlab_inch,
-                height=page_height_in * reportlab_inch,
-            )
-            pdf.showPage()
+            from PIL import Image
+
+            page_width_in, page_height_in = _ATTACHMENT_PAGE_IN
+            page_width = page_width_in * reportlab_inch
+            page_height = page_height_in * reportlab_inch
+            pdf = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
+            source = Image.open(jpg_path)
+            try:
+                for part in _attachment_page_slices(source.convert("RGB"), page_height_in / page_width_in):
+                    # Below-content area takes the strip's own bottom-left colour
+                    # so short content blends into the page instead of a white block.
+                    red, green, blue = part.getpixel((0, part.height - 1))
+                    pdf.setFillColorRGB(red / 255, green / 255, blue / 255)
+                    pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
+                    draw_height = page_width * part.height / part.width
+                    pdf.drawImage(
+                        ImageReader(_jpeg_stream(part)),
+                        0,
+                        page_height - draw_height,
+                        width=page_width,
+                        height=draw_height,
+                    )
+                    pdf.showPage()
+            finally:
+                source.close()
             pdf.save()
             return output_path
 
         if format_value == "Word document (DOCX)":
-            image_width, image_height = self._attachment_image_size(jpg_path)
-            page_width_in, page_height_in = self._attachment_page_dimensions(image_width, image_height)
+            from PIL import Image
+
+            page_width_in, page_height_in = _ATTACHMENT_PAGE_IN
             doc = Document()
             section = doc.sections[0]
             section.page_width = Inches(page_width_in)
             section.page_height = Inches(page_height_in)
-            margin = Inches(0.15)
-            section.top_margin = margin
-            section.bottom_margin = margin
-            section.left_margin = margin
-            section.right_margin = margin
-            available_width = section.page_width - section.left_margin - section.right_margin
-            doc.add_picture(str(jpg_path), width=available_width)
+            margin_in = 0.15
+            section.top_margin = Inches(margin_in)
+            section.bottom_margin = Inches(margin_in)
+            section.left_margin = Inches(margin_in)
+            section.right_margin = Inches(margin_in)
+            content_width_in = page_width_in - 2 * margin_in
+            # A little under the full content height so the picture's paragraph
+            # never spills onto a blank extra page.
+            content_height_in = page_height_in - 2 * margin_in - 0.2
+            source = Image.open(jpg_path)
+            try:
+                parts = _attachment_page_slices(source.convert("RGB"), content_height_in / content_width_in)
+            finally:
+                source.close()
+            for index, part in enumerate(parts):
+                doc.add_picture(_jpeg_stream(part), width=Inches(content_width_in))
+                paragraph = doc.paragraphs[-1]
+                paragraph.paragraph_format.space_after = 0
+                paragraph.paragraph_format.space_before = 0
+                paragraph.paragraph_format.page_break_before = index > 0
             doc.save(str(output_path))
             return output_path
 
@@ -9637,7 +9974,7 @@ class DashboardPage(QWidget):
             sheet.title = "Attachment"
             sheet.freeze_panes = "A1"
             sheet.sheet_view.zoomScale = 90
-            sheet.page_setup.orientation = "landscape" if image_width >= image_height else "portrait"
+            sheet.page_setup.orientation = "portrait"
             sheet.page_setup.fitToWidth = 1
             sheet.page_setup.fitToHeight = 0
             sheet.page_margins.left = 0.1
@@ -9657,15 +9994,25 @@ class DashboardPage(QWidget):
             return output_path
 
         if format_value in {"PowerPoint presentation (PPTX)", "PowerPoint slideshow (PPSX)"}:
+            from PIL import Image
+            from pptx.dml.color import RGBColor
+
+            slide_width_in, slide_height_in = _ATTACHMENT_PAGE_IN
             presentation = Presentation()
-            image_width, image_height = self._attachment_image_size(jpg_path)
-            slide_width_in, slide_height_in = self._attachment_page_dimensions(image_width, image_height)
             slide_width = PptxInches(slide_width_in)
-            slide_height = PptxInches(slide_height_in)
             presentation.slide_width = slide_width
-            presentation.slide_height = slide_height
-            slide = presentation.slides.add_slide(presentation.slide_layouts[6])
-            slide.shapes.add_picture(str(jpg_path), 0, 0, width=slide_width, height=slide_height)
+            presentation.slide_height = PptxInches(slide_height_in)
+            source = Image.open(jpg_path)
+            try:
+                parts = _attachment_page_slices(source.convert("RGB"), slide_height_in / slide_width_in)
+            finally:
+                source.close()
+            for part in parts:
+                slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+                red, green, blue = part.getpixel((0, part.height - 1))
+                slide.background.fill.solid()
+                slide.background.fill.fore_color.rgb = RGBColor(red, green, blue)
+                slide.shapes.add_picture(_jpeg_stream(part), 0, 0, width=slide_width)
             presentation.save(str(output_path))
             return output_path
 
@@ -9831,6 +10178,7 @@ class DashboardPage(QWidget):
         body_text: str,
         *,
         log_steps: bool = True,
+        body_html: str = "",
     ) -> None:
         """Drive Gmail's inline Compose popup on an already-loaded inbox tab.
 
@@ -9890,7 +10238,7 @@ class DashboardPage(QWidget):
             'div[role="textbox"][aria-label*="Message Body"], '
             'div[contenteditable="true"][aria-label*="Message Body"]'
         ).first
-        self._verify_gmail_body(body_box, body_text)
+        self._verify_gmail_body(body_box, body_text, body_html)
 
         if log_steps:
             self._log_action("Gmail inline compose opened")
@@ -9968,7 +10316,9 @@ class DashboardPage(QWidget):
             if isinstance(exc, RuntimeError):
                 raise
 
-    def _verify_url_composed_email(self, page, recipient: str, subject: str, body_text: str) -> None:
+    def _verify_url_composed_email(
+        self, page, recipient: str, subject: str, body_text: str, body_is_html: bool = False
+    ) -> None:
         """Verify Gmail's visible standalone Compose form after URL prefill."""
 
         def normalize(value: str) -> str:
@@ -10026,7 +10376,10 @@ class DashboardPage(QWidget):
                     )
                     # Gmail signatures may follow the campaign body, so the
                     # expected normalized content only needs to be preserved.
-                    body_ready = bool(expected_body and expected_body in actual_body)
+                    # Rendered HTML lays text out differently from the plain
+                    # text version (cell/tag boundaries), so only require that
+                    # the editor holds content.
+                    body_ready = bool(actual_body) if body_is_html else bool(expected_body and expected_body in actual_body)
                     if body_ready:
                         break
             except Exception:
@@ -10046,12 +10399,45 @@ class DashboardPage(QWidget):
             "Gmail URL Compose verification could not see: " + ", ".join(missing)
         )
 
-    def _verify_gmail_body(self, locator, expected: str) -> None:
+    def _verify_gmail_body(self, locator, expected: str, body_html: str = "") -> None:
         locator.wait_for(state="visible", timeout=10000)
         try:
             locator.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
+        if body_html:
+            # body_html arrives with its CSS already inlined (Gmail drops
+            # <style>). It is rebuilt node-by-node rather than inserted as an
+            # HTML string because Gmail's Trusted Types policy rejects strings.
+            try:
+                locator.click(timeout=3000)
+            except Exception:
+                pass
+            locator.evaluate(
+                """
+                (element, nodes) => {
+                    const build = (node) => {
+                        if (typeof node === 'string') return document.createTextNode(node);
+                        const created = document.createElement(node.t);
+                        for (const [name, value] of Object.entries(node.a)) created.setAttribute(name, value);
+                        for (const child of node.c) created.appendChild(build(child));
+                        return created;
+                    };
+                    element.focus();
+                    while (element.firstChild) element.removeChild(element.firstChild);
+                    for (const node of nodes) element.appendChild(build(node));
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertFromPaste'
+                    }));
+                }
+                """,
+                self._html_to_node_tree(body_html),
+            )
+            actual_html_text = str(locator.evaluate("element => element.innerText || element.textContent || ''"))
+            if not actual_html_text.strip():
+                raise RuntimeError("Gmail message body was not filled.")
+            return
         try:
             locator.click(timeout=3000)
             locator.fill(expected)
@@ -11264,6 +11650,8 @@ class DashboardPage(QWidget):
         convert_enabled: bool,
         already_resolved: bool = False,
         log_steps: bool = True,
+        *,
+        body_html: str = "",
     ) -> None:
         attachment_paths: list[Path] = []
         attachment_temp_dir: Path | None = None
@@ -11291,6 +11679,7 @@ class DashboardPage(QWidget):
                 subject,
                 body_text,
                 sender_name=session.display_name,
+                html_body=body_html or None,
                 attachment_paths=attachment_paths,
             )
             if log_steps:
@@ -11312,6 +11701,8 @@ class DashboardPage(QWidget):
         convert_enabled: bool,
         already_resolved: bool = False,
         log_steps: bool = True,
+        *,
+        body_html: str = "",
     ) -> None:
         if not attachment_html.strip():
             self._send_compose_with_playwright_attachment(
@@ -11321,6 +11712,7 @@ class DashboardPage(QWidget):
                 body_text,
                 [],
                 log_steps=log_steps,
+                body_html=body_html,
             )
             return
         attachment_temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
@@ -11346,6 +11738,7 @@ class DashboardPage(QWidget):
                 body_text,
                 attachment_paths,
                 log_steps=log_steps,
+                body_html=body_html,
             )
         finally:
             try:
@@ -11362,6 +11755,7 @@ class DashboardPage(QWidget):
         attachment_paths: list[Path],
         *,
         log_steps: bool = True,
+        body_html: str = "",
     ) -> None:
         ensure_external_dependencies()
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -11460,7 +11854,7 @@ class DashboardPage(QWidget):
                 if bool(getattr(self.state, "fast_compose", True)):
                     try:
                         self._open_inline_gmail_compose(
-                            page, session, recipient, subject, body_text, log_steps=log_steps
+                            page, session, recipient, subject, body_text, log_steps=log_steps, body_html=body_html
                         )
                         composed_inline = True
                     except Exception as exc:
@@ -11496,7 +11890,13 @@ class DashboardPage(QWidget):
                 # state even though EzyMailer never enables the feature.
                 self._dismiss_gmail_confidential_mode(page)
 
-                self._verify_url_composed_email(page, recipient, subject, body_text)
+                if body_html and not composed_inline:
+                    url_body_box = page.locator(
+                        'div[role="textbox"][aria-label*="Message Body"], '
+                        'div[contenteditable="true"][aria-label*="Message Body"]'
+                    ).first
+                    self._verify_gmail_body(url_body_box, body_text, body_html)
+                self._verify_url_composed_email(page, recipient, subject, body_text, body_is_html=bool(body_html))
                 if log_steps:
                     self._log_action(
                         "Recipient, subject, and body loaded"
@@ -13316,6 +13716,7 @@ class DashboardPage(QWidget):
             self._load_body_tabs_from_state()
             self._load_attachment_tabs_from_local()
             self._load_pending_emails_from_local()
+            self._load_data_tab_settings()
             self._load_tags_state()
         finally:
             self._workspace_loading = False
@@ -13335,6 +13736,59 @@ class DashboardPage(QWidget):
             editor.setTextCursor(cursor)
         finally:
             editor.blockSignals(signals_were_blocked)
+
+    def _open_data_tab_settings(self) -> None:
+        dialog = DataTabSettingsDialog(
+            self,
+            scale=self._scale,
+            auto_delete_sent=bool(getattr(self.state, "auto_delete_sent_emails", True)),
+        )
+        if dialog.exec() == QDialog.Accepted:
+            enabled = bool(dialog.auto_delete_checkbox.isChecked())
+            self.state.auto_delete_sent_emails = enabled
+            _upsert_ui_state(LOCAL_DATA_TAB_SETTINGS_KEY, {"auto_delete_sent_emails": enabled})
+            self._log_action(f"Auto email delete {'enabled' if enabled else 'disabled'}")
+
+    def _load_data_tab_settings(self) -> None:
+        payload = _load_ui_state(LOCAL_DATA_TAB_SETTINGS_KEY)
+        if "auto_delete_sent_emails" in payload:
+            self.state.auto_delete_sent_emails = bool(payload.get("auto_delete_sent_emails"))
+        else:
+            self.state.auto_delete_sent_emails = True
+
+    def _on_campaign_email_sent(self, recipient: str, subject: str) -> None:
+        if not bool(getattr(self.state, "auto_delete_sent_emails", True)):
+            return
+        self._remove_sent_recipient_from_list(recipient)
+
+    def _remove_sent_recipient_from_list(self, recipient: str) -> None:
+        email = str(recipient or "").strip().lower()
+        if not email:
+            return
+
+        lines = self.pending_emails_editor.toPlainText().split("\n")
+        remaining_lines: list[str] = []
+        removed = False
+        for line in lines:
+            if not removed and line.strip().lower() == email:
+                removed = True
+                continue
+            remaining_lines.append(line)
+        if not removed:
+            return
+
+        self.pending_emails_editor.blockSignals(True)
+        try:
+            self.pending_emails_editor.setPlainText("\n".join(remaining_lines))
+        finally:
+            self.pending_emails_editor.blockSignals(False)
+
+        self.state.pending_recipients = [
+            item for item in self.state.pending_recipients if str(item).strip().lower() != email
+        ]
+        self._refresh_pending_email_summary()
+        self._persist_pending_emails_state()
+        self._refresh_campaign_action_state()
 
     def _clear_pending_emails(self) -> None:
         if self._campaign_active or self._campaign_threads:
@@ -14212,6 +14666,15 @@ class MainWindow(QMainWindow):
                 background: #252526;
                 border: 1px solid #333333;
                 border-radius: 10px;
+            }
+            QFrame#loginShell QLabel {
+                font-size: 9pt;
+            }
+            QFrame#loginShell QLineEdit {
+                font-size: 9.5pt;
+            }
+            QFrame#loginShell QPushButton {
+                font-size: 9.5pt;
             }
             QFrame#topBar {
                 background: #1f1f1f;
