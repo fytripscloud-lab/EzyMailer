@@ -156,6 +156,8 @@ LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 LOCAL_DATA_TAB_SETTINGS_KEY = "data_tab_settings_state"
 GOOGLE_API_ACCOUNTS_DIR = LOCAL_CACHE_DIR / "api_accounts"
+LOCAL_API_JSON_OUTPUT_STATE_KEY = "api_json_output_state"
+DEFAULT_API_JSON_OUTPUT_DIR = Path.home() / "Downloads" / "EzyMailer Gmail API JSON"
 
 
 def _set_hidden_file_attribute(path: Path) -> None:
@@ -194,13 +196,14 @@ DEPENDENCY_RELEASE_BASE = (
 BROWSER_LAUNCH_STAGGER_MS = 4000
 # Extra Chrome flags that cut per-window CPU and memory without affecting
 # campaign sending (sending uses DOM selectors on the compose box, not
-# rendered images or extensions).
+# extensions). Images stay enabled: Google's sign-in and OAuth consent
+# pages can show an image captcha that can't be solved without them, and
+# people check Sent items in these same windows while a campaign runs.
 BROWSER_RESOURCE_FLAGS = (
     "--disable-extensions",
     "--disable-sync",
     "--disable-component-update",
     "--disable-breakpad",
-    "--blink-settings=imagesEnabled=false",
     "--js-flags=--max-old-space-size=512",
 )
 # "Fast compose" reuses one warm Gmail tab and opens the inline Compose
@@ -1131,6 +1134,30 @@ def _load_ui_state(state_key: str) -> dict[str, object]:
             return {}
     finally:
         connection.close()
+
+
+def _api_json_output_dir() -> Path:
+    """Folder where finished account credentials are saved as <email>.json.
+
+    The person's last chosen folder, remembered across launches; falls back
+    to the default Downloads folder if none was chosen or the chosen one is
+    gone (e.g. an unplugged external drive).
+    """
+    try:
+        saved = str(_load_ui_state(LOCAL_API_JSON_OUTPUT_STATE_KEY).get("path") or "")
+    except Exception:
+        saved = ""
+    if saved and Path(saved).is_dir():
+        return Path(saved)
+    return DEFAULT_API_JSON_OUTPUT_DIR
+
+
+def _set_api_json_output_dir(path: Path) -> None:
+    _upsert_ui_state(LOCAL_API_JSON_OUTPUT_STATE_KEY, {"path": str(path)})
+
+
+def _api_credential_file_name(account_email: str) -> str:
+    return f"{re.sub(r'[^a-zA-Z0-9_.@-]', '_', account_email) or 'account'}.json"
 
 
 def _delete_ui_state(state_key: str) -> None:
@@ -2688,7 +2715,7 @@ class GmailApiAutomationDialog(QDialog):
         self.controller = controller
         self._scale = scale
         self._sheet_path: Path | None = None
-        self._output_dir = Path.home() / "Downloads" / "EzyMailer Gmail API JSON"
+        self._output_dir = _api_json_output_dir()
         self._thread: QThread | None = None
         self._worker: GmailApiAutomationWorker | None = None
         self._close_pending = False
@@ -2797,6 +2824,8 @@ class GmailApiAutomationDialog(QDialog):
             return
         self._output_dir = Path(folder)
         self.folder_label.setText(str(self._output_dir))
+        # Remembered for next time, and used by the manual "Login" flow too.
+        _set_api_json_output_dir(self._output_dir)
 
     def _append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
@@ -10552,17 +10581,34 @@ class DashboardPage(QWidget):
         client ID/secret (Google's raw OAuth-client download, or a manual
         upload) drives the full sign-in-and-approve flow instead — the
         person signs in and clicks Allow themselves in the window that
-        opens — and the resulting refresh token is written back into the
-        same file so it's a ready credential from then on. Either way the
+        opens — and the resulting credential is saved as <email>.json in
+        the API JSON output folder so it's ready to reuse. Either way the
         browser window is left open (not closed) for the person to watch
         while sending runs later.
         """
         emit = log or (lambda message: None)
         path = Path(path_str)
         client = self._read_api_client_payload(path)
+        reuse_token = bool(client["refresh_token"] and client["account_email"])
+        if reuse_token:
+            # A saved credential from before the consent screen's scope
+            # checkbox was ticked automatically only holds the profile scope
+            # and can never send (403 insufficient scopes, verified live).
+            # Re-run consent for those instead of bringing them online, so
+            # one more Login repairs the file in place.
+            try:
+                reuse_token = gmail_oauth.token_grants_send(
+                    gmail_oauth.refresh_access_token(client["client_id"], client["client_secret"], client["refresh_token"])
+                )
+            except Exception as exc:
+                emit(f"Saved access for {client['account_email']} no longer works ({exc}); asking Google again")
+                reuse_token = False
+            else:
+                if not reuse_token:
+                    emit(f"Saved access for {client['account_email']} is missing the send permission; asking Google again")
         session = self._launch_browser_process_threadsafe(index)
         try:
-            if client["refresh_token"] and client["account_email"]:
+            if reuse_token:
                 account_email = client["account_email"]
                 display_name = client.get("display_name", "")
                 emit(f"Opening browser window {index} for {account_email}")
@@ -10574,21 +10620,18 @@ class DashboardPage(QWidget):
                 account_email = token["account_email"]
                 display_name = token.get("display_name", "")
                 refresh_token = token["refresh_token"]
-                # Rename to the account's own email once it's known, so
-                # the file is identifiable at a glance — matching what the
-                # Gmail API Automation tool already does for its own
-                # output. The uploaded name (a raw client download's name,
-                # or whatever the person called it) is only a placeholder
-                # until this point.
+                # Save the finished credential as <email>.json in the same
+                # output folder the Gmail API Automation tool uses (default
+                # Downloads/EzyMailer Gmail API JSON, or the folder chosen
+                # there), so every account's JSON ends up in one place for
+                # reuse. The uploaded file is left untouched — it's the
+                # person's own file — and this account now points at the
+                # saved credential instead.
                 if account_email:
-                    safe_name = re.sub(r"[^a-zA-Z0-9_.@-]", "_", account_email)
-                    new_path = path.with_name(f"{safe_name}.json")
+                    new_path = _api_json_output_dir() / _api_credential_file_name(account_email)
+                    new_path.parent.mkdir(parents=True, exist_ok=True)
                     if new_path != path:
                         old_path_str = str(path)
-                        try:
-                            path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
                         path = new_path
                         if old_path_str in self.state.api_json_paths:
                             self.state.api_json_paths[self.state.api_json_paths.index(old_path_str)] = str(path)
@@ -10803,8 +10846,7 @@ class DashboardPage(QWidget):
         output_dir.mkdir(parents=True, exist_ok=True)
         account_email = token["account_email"] or email
         display_name = token.get("display_name", "")
-        safe_name = re.sub(r"[^a-zA-Z0-9_.@-]", "_", account_email) or "account"
-        path = output_dir / f"{safe_name}.json"
+        path = output_dir / _api_credential_file_name(account_email)
         path.write_text(
             json.dumps(
                 {
@@ -10848,6 +10890,33 @@ class DashboardPage(QWidget):
 
     def _console_control(self, page, selectors: tuple[str, ...], *, timeout: int = 20000):
         return self._gmail_visible_control(page, selectors, timeout=timeout)
+
+    @staticmethod
+    def _console_wait_until(page, condition: Callable[[], object], *, timeout: float = 15.0) -> bool:
+        """Poll `condition` until it's truthy; True on success, False on timeout.
+
+        Every Console step gates on an observable result of its last click
+        (a dialog closing, the next field rendering, the URL changing)
+        through this instead of a fixed pause, so the fast path moves on the
+        instant the page is ready and a slow page still gets its full wait.
+        Exceptions from a mid-navigation DOM count as "not yet".
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if condition():
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            page.wait_for_timeout(200)
+
+    @staticmethod
+    def _visible(locator) -> bool:
+        # Any match, not just `.first` — Console often renders a hidden
+        # duplicate of a control ahead of the visible one (verified live).
+        return any(locator.nth(i).is_visible() for i in range(locator.count()))
 
     def _retry_console_step(
         self,
@@ -10929,47 +10998,76 @@ class DashboardPage(QWidget):
             email_prefix = re.sub(r"[^A-Za-z0-9\-]", "", signed_in_email.split("@")[0])[:20] if signed_in_email else ""
             project_name = f"{email_prefix or 'account'}-{secrets.token_hex(3)}"
 
-            self._retry_console_step(
-                "Opening Google Cloud Console",
-                lambda: page.goto("https://console.cloud.google.com/projectcreate", wait_until="domcontentloaded", timeout=30000),
-                emit=emit,
-                timeout=60,
-            )
+            wait_until = lambda condition, timeout=15.0: self._console_wait_until(page, condition, timeout=timeout)  # noqa: E731
 
-            try:
+            def any_visible(*selectors: str) -> bool:
+                return any(self._visible(page.locator(selector)) for selector in selectors)
+
+            name_selectors = ('#p6ntest-name-input', 'input[name="name"]', 'input[aria-label*="Project name" i]')
+            terms_selectors = ('button:has-text("Agree and continue")', 'button:has-text("I agree")')
+
+            def mfa_blocked() -> bool:
+                # Since 2026-05-02 Google Cloud redirects any account without
+                # 2-Step Verification to this page instead of the requested
+                # one (verified live) — nothing past it can work.
+                return "/enable-mfa" in (page.url or "")
+
+            def open_project_create_form() -> None:
+                page.goto("https://console.cloud.google.com/projectcreate", wait_until="domcontentloaded", timeout=30000)
+                # Done only once the form (or the first-visit terms modal
+                # covering it, or the 2SV block) has actually rendered.
+                if not wait_until(lambda: mfa_blocked() or any_visible(*name_selectors, *terms_selectors), 30):
+                    raise RuntimeError("The New Project form did not load.")
+
+            self._retry_console_step("Opening Google Cloud Console", open_project_create_form, emit=emit, timeout=60)
+            if mfa_blocked():
+                raise RuntimeError(
+                    "Google Cloud requires 2-Step Verification on this Google account. Turn it on at "
+                    "myaccount.google.com/security, wait a few minutes for it to take effect, then retry."
+                )
+
+            def accept_console_terms_if_shown() -> None:
                 # A brand-new Google account's first Console visit shows a
                 # "Welcome" modal (country pre-filled from IP — verified
                 # live, no selection needed) whose "Agree and continue"
                 # button stays disabled until this checkbox is checked.
                 # Clicking the button alone (the old behavior) silently did
                 # nothing on a fresh account.
+                if not any_visible(*terms_selectors):
+                    return
                 terms_checkbox = page.locator('mat-checkbox[formcontrolname="umbrella"] input[type="checkbox"]')
-                if terms_checkbox.count() and terms_checkbox.first.is_visible():
+                if self._visible(terms_checkbox):
                     terms_checkbox.first.check(force=True, timeout=3000)
-                    page.wait_for_timeout(300)
-                terms_button = self._console_control(
-                    page,
-                    ('button:has-text("Agree and continue")', 'button:has-text("I agree")'),
-                    timeout=6000,
-                )
-                terms_button.click(timeout=3000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
+                terms_button = self._console_control(page, terms_selectors, timeout=6000)
+                wait_until(terms_button.is_enabled, 10)
+                terms_button.click(timeout=10000, no_wait_after=True)
+                if not wait_until(lambda: not any_visible(*terms_selectors), 15):
+                    raise RuntimeError("The Cloud Console terms dialog did not close.")
+
+            def on_project_create_form() -> bool:
+                return "projectcreate" in (page.url or "") and any_visible(*name_selectors)
 
             def create_project() -> None:
-                name_field = self._console_control(
-                    page,
-                    ('#p6ntest-name-input', 'input[name="name"]', 'input[aria-label*="Project name" i]'),
-                    timeout=10000,
-                )
-                name_field.fill(project_name)
+                # Safe to retry: once Console has accepted the Create click
+                # and left the form, a retry sees that and stops instead of
+                # submitting (and creating) a second project.
+                if "projectcreate" not in (page.url or ""):
+                    return
+                accept_console_terms_if_shown()
+                name_field = self._console_control(page, name_selectors, timeout=10000)
+                if name_field.input_value() != project_name:
+                    name_field.fill(project_name)
+                    if not wait_until(lambda: name_field.input_value() == project_name, 5):
+                        raise RuntimeError("The project name field did not accept the name.")
                 create_button = self._console_control(
                     page,
                     ('button.projtest-create-form-submit', 'button[type="submit"]:has-text("Create")', 'button:has-text("Create")'),
                     timeout=8000,
                 )
-                create_button.click(timeout=3000)
+                wait_until(create_button.is_enabled, 10)
+                create_button.click(timeout=10000, no_wait_after=True)
+                if not wait_until(lambda: not on_project_create_form(), 30):
+                    raise RuntimeError("Console did not leave the New Project form after clicking Create.")
 
             def select_created_project() -> None:
                 # Console does not automatically switch the active project
@@ -10991,14 +11089,24 @@ class DashboardPage(QWidget):
                 # overlay backdrop is still up — that backdrop otherwise
                 # intercepts every click for the rest of the attempt
                 # (verified live).
+                switcher_selector = 'button[data-prober="cloud-console-core-functions-project-switcher"]'
+                if project_name in (page.locator(switcher_selector).first.inner_text(timeout=10000) or ""):
+                    return
+                # Some popups Console opens right after creating a project
+                # ignore Escape, and their transparent backdrop then
+                # intercepts every click (verified live). Clicking that
+                # backdrop is how Material closes them.
                 page.keyboard.press("Escape")
-                page.wait_for_timeout(300)
-                switcher = self._console_control(
-                    page,
-                    ('button[data-prober="cloud-console-core-functions-project-switcher"]',),
-                    timeout=10000,
-                )
-                switcher.click(timeout=3000)
+                backdrop = page.locator(".cdk-overlay-backdrop-showing")
+                if not wait_until(lambda: not self._visible(backdrop), 2):
+                    for i in range(backdrop.count()):
+                        try:
+                            backdrop.nth(i).click(timeout=2000, force=True, no_wait_after=True)
+                        except Exception:
+                            pass
+                    wait_until(lambda: not self._visible(backdrop), 5)
+                switcher = self._console_control(page, (switcher_selector,), timeout=10000)
+                switcher.click(timeout=10000, no_wait_after=True)
                 result_link = self._console_control(
                     page,
                     (f'a[data-prober="cloud-console-core-functions-project-name"]:has-text("{project_name}")',),
@@ -11010,19 +11118,18 @@ class DashboardPage(QWidget):
                 # Poll this same link in place rather than re-opening the
                 # switcher — reopening it is what triggered the overlay
                 # backdrop intercepting every click on a prior attempt.
-                disabled_deadline = time.monotonic() + 20
-                while (
-                    result_link.get_attribute("aria-disabled") == "true"
-                    and time.monotonic() < disabled_deadline
-                ):
-                    page.wait_for_timeout(500)
-                result_link.click(timeout=3000)
-                page.wait_for_timeout(2000)
+                wait_until(lambda: result_link.get_attribute("aria-disabled") != "true", 25)
+                result_link.click(timeout=10000, no_wait_after=True)
+                # Selected only once the header's project switcher names it.
+                if not wait_until(lambda: project_name in (page.locator(switcher_selector).first.inner_text() or ""), 15):
+                    raise RuntimeError("The new project did not become the active project.")
 
             emit(f"Creating Google Cloud project {project_name}")
+            project_selected = False
             try:
-                self._retry_console_step("Creating the Cloud project", create_project, emit=emit, timeout=45)
-                self._retry_console_step("Selecting the new Cloud project", select_created_project, emit=emit, timeout=30)
+                self._retry_console_step("Creating the Cloud project", create_project, emit=emit, timeout=60)
+                self._retry_console_step("Selecting the new Cloud project", select_created_project, emit=emit, timeout=45)
+                project_selected = True
             except Exception as exc:
                 # Not fatal: the remaining steps below only need *some*
                 # project to be active, not specifically one this automation
@@ -11035,14 +11142,6 @@ class DashboardPage(QWidget):
                     f"the remaining steps will continue automatically."
                 )
 
-            # A freshly created (or freshly selected) GCP project can take a
-            # while before it is usable on other Console pages. Kept short
-            # since resolve_active_project_id() and enable_gmail_api() right
-            # after this both already retry on their own (30s/90s budgets),
-            # so a long fixed wait here only adds latency on the common case
-            # where the project is already ready.
-            page.wait_for_timeout(3000)
-
             def resolve_active_project_id() -> str:
                 # Verified live: Console does not reliably keep the active
                 # project selected when navigating straight to a
@@ -11054,9 +11153,20 @@ class DashboardPage(QWidget):
                 # active (created, selected, or already active from before),
                 # so every later navigation can carry that id explicitly.
                 page.goto("https://console.cloud.google.com/home/dashboard", wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-                query = urlparse(page.url).query
-                return parse_qs(query).get("project", [""])[0]
+                current_project = lambda: parse_qs(urlparse(page.url).query).get("project", [""])[0]  # noqa: E731
+                if not wait_until(current_project, 20):
+                    raise RuntimeError("Console did not report an active project.")
+                # When this run created and selected its own project, don't
+                # accept any other project id Console might briefly redirect
+                # to while the switch settles.
+                if project_selected and not wait_until(
+                    lambda: project_name in (page.locator(
+                        'button[data-prober="cloud-console-core-functions-project-switcher"]'
+                    ).first.inner_text() or ""),
+                    15,
+                ):
+                    raise RuntimeError(f"Console is not showing the new project {project_name} as active.")
+                return current_project()
 
             project_id = ""
             try:
@@ -11095,58 +11205,63 @@ class DashboardPage(QWidget):
                 # silently skipping the whole consent-screen setup. Poll for
                 # up to 15s before concluding it's genuinely already done.
                 get_started = page.locator('text="Get started"')
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    if get_started.count() and get_started.first.is_visible():
-                        break
-                    page.wait_for_timeout(500)
-                else:
+                if not wait_until(lambda: self._visible(get_started), 15):
                     return
-                get_started.first.click(timeout=5000)
-                page.wait_for_timeout(1500)
+                get_started.first.click(timeout=10000, no_wait_after=True)
 
+                # Each click below is followed by waiting for the control the
+                # next action needs (via _console_control, which polls until
+                # it's visible) or an explicit check that the click took, so
+                # nothing runs against a half-rendered wizard step.
                 app_name_field = self._console_control(
-                    page, ('input[formcontrolname="displayName"]',), timeout=10000
+                    page, ('input[formcontrolname="displayName"]',), timeout=15000
                 )
-                app_name_field.fill(email_prefix or "Mail Client")
+                app_name = email_prefix or "Mail Client"
+                app_name_field.fill(app_name)
+                if not wait_until(lambda: app_name_field.input_value() == app_name, 5):
+                    raise RuntimeError("The app name field did not accept the name.")
 
                 email_dropdown = self._console_control(
                     page, ('cfc-select[formcontrolname="userSupportEmail"]',), timeout=8000
                 )
-                email_dropdown.click(timeout=3000)
-                page.wait_for_timeout(600)
+                email_dropdown.click(timeout=10000, no_wait_after=True)
                 options = page.locator('mat-option, [role="option"]')
-                email_option = None
-                for i in range(options.count()):
-                    if options.nth(i).is_visible() and "@" in options.nth(i).inner_text():
-                        email_option = options.nth(i)
-                        break
-                if email_option is None:
+
+                def visible_email_option():
+                    for i in range(options.count()):
+                        if options.nth(i).is_visible() and "@" in options.nth(i).inner_text():
+                            return options.nth(i)
+                    return None
+
+                if not wait_until(visible_email_option, 8):
                     raise RuntimeError("No support email option was available to select.")
+                email_option = visible_email_option()
                 # Reuse the selected support email as the developer contact
                 # email a few steps later instead of leaving it empty.
                 support_email = (email_option.inner_text() or "").strip()
-                email_option.click(timeout=3000)
-                page.wait_for_timeout(300)
+                email_option.click(timeout=10000, no_wait_after=True)
+                wait_until(lambda: not visible_email_option(), 5)
 
-                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(800)
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=10000, no_wait_after=True)
 
                 # "Internal" is disabled for non-Workspace accounts; External
                 # is the only usable choice for a personal Gmail account.
-                self._console_control(page, ('text="External"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(300)
-                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(800)
+                external = self._console_control(page, ('text="External"',), timeout=10000)
+                external.click(timeout=10000, no_wait_after=True)
+                external_radio = page.locator('input[type="radio"][value="EXTERNAL" i], mat-radio-button:has-text("External") input')
+                if external_radio.count():
+                    wait_until(lambda: external_radio.first.is_checked(), 5)
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=10000, no_wait_after=True)
 
                 contact_email_field = self._console_control(
-                    page, ('input[aria-label="Text field for emails"]',), timeout=8000
+                    page, ('input[aria-label="Text field for emails"]',), timeout=10000
                 )
                 contact_email_field.fill(support_email)
                 page.keyboard.press("Enter")
-                page.wait_for_timeout(500)
-                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(800)
+                # Enter turns the typed address into a chip and clears the input.
+                if not wait_until(lambda: contact_email_field.input_value() == "", 5):
+                    raise RuntimeError("The contact email was not accepted.")
+                self._console_control(page, ('text="Next"',), timeout=8000).click(timeout=10000, no_wait_after=True)
 
                 # The agreement is a Material checkbox; clicking its label or
                 # host element can land on the adjacent policy link instead,
@@ -11154,13 +11269,18 @@ class DashboardPage(QWidget):
                 terms_checkbox = self._console_control(
                     page,
                     ('mat-checkbox[formcontrolname="termsAgreement"] input[type="checkbox"]',),
-                    timeout=8000,
+                    timeout=10000,
                 )
                 terms_checkbox.check(force=True, timeout=3000)
-                page.wait_for_timeout(300)
+                if not wait_until(terms_checkbox.is_checked, 5):
+                    raise RuntimeError("The user data policy agreement did not get checked.")
 
-                self._console_control(page, ('text="Create"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(4000)
+                self._console_control(page, ('text="Create"',), timeout=8000).click(timeout=10000, no_wait_after=True)
+                # Created once the wizard itself goes away.
+                if not wait_until(lambda: not self._visible(page.locator(
+                    'mat-checkbox[formcontrolname="termsAgreement"]'
+                )), 30):
+                    raise RuntimeError("The consent screen wizard did not finish after clicking Create.")
 
             emit("Configuring the OAuth consent screen")
             try:
@@ -11184,34 +11304,48 @@ class DashboardPage(QWidget):
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-                self._console_control(page, ('text="Create client"',), timeout=15000).click(timeout=3000)
-                page.wait_for_timeout(1500)
+                self._console_control(page, ('text="Create client"',), timeout=15000).click(timeout=10000, no_wait_after=True)
 
+                # The create form renders well after its URL changes on a
+                # fresh project (verified live: >10s once), so wait for the
+                # type dropdown itself rather than a fixed pause.
                 type_dropdown = self._console_control(
-                    page, ('cfc-select[formcontrolname="typeControl"]',), timeout=10000
+                    page, ('cfc-select[formcontrolname="typeControl"]',), timeout=25000
                 )
-                type_dropdown.click(timeout=3000)
-                page.wait_for_timeout(600)
+                type_dropdown.click(timeout=10000, no_wait_after=True)
                 options = page.locator('mat-option, [role="option"]')
-                desktop_option = None
-                for i in range(options.count()):
-                    if options.nth(i).is_visible() and options.nth(i).inner_text().strip() == "Desktop app":
-                        desktop_option = options.nth(i)
-                        break
-                if desktop_option is None:
+
+                def visible_desktop_option():
+                    for i in range(options.count()):
+                        if options.nth(i).is_visible() and options.nth(i).inner_text().strip() == "Desktop app":
+                            return options.nth(i)
+                    return None
+
+                if not wait_until(visible_desktop_option, 8):
                     raise RuntimeError("The 'Desktop app' application type option was not available.")
-                desktop_option.click(timeout=3000)
-                page.wait_for_timeout(500)
+                visible_desktop_option().click(timeout=10000, no_wait_after=True)
 
-                name_field = self._console_control(page, ('input[formcontrolname="displayName"]',), timeout=8000)
-                name_field.fill(f"{email_prefix or 'account'} Desktop Client")
-
-                self._console_control(page, ('text="Create"',), timeout=8000).click(timeout=3000)
-                page.wait_for_timeout(3000)
+                # The name field only appears once a type is chosen.
+                client_name = f"{email_prefix or 'account'} Desktop Client"
+                name_field = self._console_control(page, ('input[formcontrolname="displayName"]',), timeout=10000)
+                name_field.fill(client_name)
+                if not wait_until(lambda: name_field.input_value() == client_name, 5):
+                    raise RuntimeError("The client name field did not accept the name.")
+                return self._console_control(page, ('text="Create"',), timeout=8000)
 
             emit("Creating the OAuth client credentials")
             try:
-                self._retry_console_step("Creating the OAuth client", create_oauth_client, emit=emit, timeout=60)
+                # Retried up to (not including) the Create click, so a slow
+                # page can't make a retry submit a second client.
+                create_button = self._retry_console_step(
+                    "Creating the OAuth client", create_oauth_client, emit=emit, timeout=75
+                )
+                create_button.click(timeout=10000, no_wait_after=True)
+                if not wait_until(
+                    lambda: any_visible('button:has-text("Download JSON")') or page.locator("dt", has_text="Client ID").count(),
+                    30,
+                ):
+                    raise RuntimeError("The created-client dialog did not appear after clicking Create.")
 
                 client_id = ""
                 client_secret = ""
@@ -11228,7 +11362,7 @@ class DashboardPage(QWidget):
                         cdp_session = page.context.new_cdp_session(page)
                         cdp_session.send("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": tmp_dir})
                         with page.expect_download(timeout=8000) as download_info:
-                            download_button.first.click(timeout=3000)
+                            download_button.first.click(timeout=10000, no_wait_after=True)
                         download = download_info.value
                         saved_path = Path(tmp_dir) / "client_secret.json"
                         download.save_as(str(saved_path))
@@ -11259,8 +11393,9 @@ class DashboardPage(QWidget):
                     client_secret = client_secret_dd.first.inner_text().strip()
 
                 ok_button = page.locator('text="OK"')
-                if ok_button.count() and ok_button.first.is_visible():
-                    ok_button.first.click(timeout=3000)
+                if self._visible(ok_button):
+                    ok_button.first.click(timeout=10000, no_wait_after=True)
+                    wait_until(lambda: not self._visible(ok_button), 10)
             except Exception as exc:
                 raise RuntimeError(
                     f"Cloud Console setup stopped creating the OAuth client ({exc}). "
@@ -11271,21 +11406,32 @@ class DashboardPage(QWidget):
             emit("Gmail API client created")
             return {"client_id": client_id, "client_secret": client_secret, "project_id": project_id}
 
-    def _current_gmail_account_email(self, page) -> str:
+    def _current_gmail_account_email(self, page, timeout: float = 20.0) -> str:
         """Read the signed-in address off Gmail's own account-switcher avatar.
 
         Verified live: the avatar link's aria-label reads
         'Google Account: NAME  \\n(email@gmail.com)'.
+
+        Polls rather than reading once: callers often run this right after a
+        fresh goto() to Gmail, where the URL already reads mail.google.com
+        but the avatar hasn't rendered yet. A single read there returned ""
+        (verified live), which silently skipped adding the test user and
+        dropped login_hint, leaving consent stuck on the account chooser.
         """
-        try:
-            avatar = page.locator('a[aria-label*="Google Account" i]')
-            if avatar.count() == 0:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                avatar = page.locator('a[aria-label*="Google Account" i]')
+                if avatar.count():
+                    label = avatar.first.get_attribute("aria-label") or ""
+                    match = re.search(r"\(([^()]+@[^()]+)\)", label)
+                    if match:
+                        return match.group(1).strip()
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
                 return ""
-            label = avatar.first.get_attribute("aria-label") or ""
-            match = re.search(r"\(([^()]+@[^()]+)\)", label)
-            return match.group(1).strip() if match else ""
-        except Exception:
-            return ""
+            time.sleep(0.5)
 
     def _ensure_gmail_api_enabled(self, page, project_id: str, *, log: Callable[[str], None] | None = None) -> None:
         """Make sure the Gmail API is turned on for a project before using it.
@@ -11307,17 +11453,33 @@ class DashboardPage(QWidget):
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-            page.wait_for_timeout(1000)
             # Already enabled shows "Manage" and an "API Enabled" badge
             # instead of an "Enable" button — there is nothing to click, so
             # looking for "Enable" would never succeed and just burn the
-            # whole retry budget.
-            already_enabled = page.locator('button:has-text("Manage")')
-            if already_enabled.count() and already_enabled.first.is_visible():
+            # whole retry budget. The page renders a hidden duplicate
+            # "Manage" button ahead of the visible one (verified live), so
+            # checking `.first` always saw it as hidden. Wait for whichever
+            # of the two states renders as a visible button instead.
+            control = self._console_control(
+                page,
+                ('button:has-text("Manage")', 'button:has-text("Enable")'),
+                timeout=15000,
+            )
+            if "Manage" in control.inner_text():
                 return
-            enable_button = self._console_control(page, ('button:has-text("Enable")',), timeout=15000)
-            enable_button.click(timeout=3000)
-            page.wait_for_timeout(3000)
+            control.click(timeout=10000, no_wait_after=True)
+            # Enabled once Console either moves on to the API's own details
+            # page (what it does after a successful Enable — verified live:
+            # waiting only for "Manage" there timed out even though the API
+            # was on) or the library page flips to its "Manage" state.
+            if not self._console_wait_until(
+                page,
+                lambda: "/apis/api/gmail.googleapis.com" in (page.url or "")
+                or self._visible(page.locator('button:has-text("Manage")'))
+                or self._visible(page.get_by_text("API Enabled", exact=True)),
+                timeout=60,
+            ):
+                raise RuntimeError("The Gmail API did not show as enabled after clicking Enable.")
 
         emit("Searching for the Gmail API and enabling it")
         try:
@@ -11355,40 +11517,46 @@ class DashboardPage(QWidget):
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-            page.wait_for_timeout(1500)
+            # Only judge "already a test user" once the audience page has
+            # actually rendered (its "Add users" button is there) — checking
+            # right after goto() raced the page load like the other
+            # "not visible yet == done" guards did.
+            add_button = page.locator("button", has_text="Add users").first
+            if not self._console_wait_until(page, lambda: add_button.count() > 0, timeout=20):
+                emit(f"Could not find the test-user control to add {email} automatically")
+                return
             existing = page.get_by_text(email, exact=False)
-            if existing.count() and existing.first.is_visible():
+            if self._visible(existing):
+                emit(f"{email} is already a test user")
                 return
             # page.mouse.wheel() scrolls whatever's under the cursor, which
             # isn't reliably the main content pane here — it silently failed
             # to bring "Add users" into view on a live run. Scroll the
             # button itself into view instead.
-            add_button = page.locator("button", has_text="Add users").first
             add_button.scroll_into_view_if_needed(timeout=8000)
-            page.wait_for_timeout(300)
-            if not add_button.is_visible():
+            if not self._console_wait_until(page, add_button.is_visible, timeout=5):
                 emit(f"Could not find the test-user control to add {email} automatically")
                 return
-            add_button.click(timeout=5000)
-            page.wait_for_timeout(1000)
-            email_field = self._console_control(page, ('input[aria-label="Text field for emails"]',), timeout=8000)
+            add_button.click(timeout=10000, no_wait_after=True)
+            email_field = self._console_control(page, ('input[aria-label="Text field for emails"]',), timeout=10000)
             email_field.fill(email)
             page.keyboard.press("Enter")
-            page.wait_for_timeout(500)
+            # Enter turns the typed address into a chip and clears the input.
+            self._console_wait_until(page, lambda: email_field.input_value() == "", timeout=5)
 
             # Saving here can take several seconds, and the first click
             # doesn't always register — verified live. Poll for the dialog
             # to close (success) and reissue the click once if it's still
             # sitting there partway through the wait.
             save_button = page.get_by_role("button", name="Save", exact=True)
-            save_button.first.click(timeout=5000)
+            save_button.first.click(timeout=10000, no_wait_after=True)
             deadline = time.monotonic() + 12
             retried = False
             while time.monotonic() < deadline and save_button.count() > 0:
                 page.wait_for_timeout(500)
                 if not retried and time.monotonic() > deadline - 7:
                     if save_button.count() and save_button.first.is_visible():
-                        save_button.first.click(timeout=3000)
+                        save_button.first.click(timeout=10000, no_wait_after=True)
                     retried = True
             if save_button.count() > 0:
                 emit(f"Could not confirm {email} was added as a test user; consent may fail until added by hand")
@@ -11549,6 +11717,11 @@ class DashboardPage(QWidget):
                 # so every account needs this before requesting consent.
                 if account_email:
                     self._ensure_test_user(page, client.get("project_id", ""), account_email, log=emit)
+                else:
+                    emit(
+                        "Could not read the signed-in Gmail address; skipping the test-user step. "
+                        "Consent may stop on Google's account chooser or be denied until it is added by hand"
+                    )
 
                 auth_url, _ = gmail_oauth.build_authorization_url(
                     client["client_id"],
@@ -11574,23 +11747,52 @@ class DashboardPage(QWidget):
                         break
                     try:
                         advanced = page.get_by_text(re.compile(r"^Advanced$"), exact=True)
-                        if advanced.count() and advanced.first.is_visible():
-                            advanced.first.click(timeout=2000)
-                            page.wait_for_timeout(300)
-                            go_to_app = page.get_by_text(re.compile(r"^Go to .*\(unsafe\)$"))
-                            if go_to_app.count() and go_to_app.first.is_visible():
-                                go_to_app.first.click(timeout=2000)
-                                page.wait_for_timeout(1000)
-                                continue
+                        # After each click, wait for Google to actually move
+                        # to the next screen (every screen here has its own
+                        # "Continue", so "button gone" can't tell them apart
+                        # — the URL can) or for the redirect to land, before
+                        # looking for the next one.
+                        url_before = page.url
+                        screen_done = lambda: (  # noqa: E731
+                            loopback.code is not None or loopback.error is not None or page.url != url_before
+                        )
+                        go_to_app = page.get_by_text(re.compile(r"^Go to .*\(unsafe\)$"))
+                        if self._visible(advanced) and not self._visible(go_to_app):
+                            advanced.first.click(timeout=5000, no_wait_after=True)
+                            self._console_wait_until(page, lambda: self._visible(go_to_app), timeout=5)
+                        if self._visible(go_to_app):
+                            go_to_app.first.click(timeout=5000, no_wait_after=True)
+                            self._console_wait_until(page, screen_done, timeout=15)
+                            continue
+                        # Google's granular consent screen ("Select what ...
+                        # can access") lists each requested permission with
+                        # its own checkbox, unticked by default. Continuing
+                        # without ticking "Send email on your behalf" still
+                        # completes — with only the profile scope — and every
+                        # send then fails with 403 insufficient scopes
+                        # (verified live). The app only requests what it
+                        # needs, so tick every one and confirm they stuck
+                        # before continuing.
+                        scope_boxes = page.locator('input[type="checkbox"]')
+                        visible_boxes = lambda: [  # noqa: E731
+                            scope_boxes.nth(i) for i in range(scope_boxes.count()) if scope_boxes.nth(i).is_visible()
+                        ]
+                        for box in visible_boxes():
+                            if not box.is_checked():
+                                box.check(timeout=5000, force=True, no_wait_after=True)
+                        if not self._console_wait_until(
+                            page, lambda: all(box.is_checked() for box in visible_boxes()), timeout=5
+                        ):
+                            continue
                         for name in ("Continue", "Allow"):
                             action_button = page.get_by_role("button", name=re.compile(f"^{name}$", re.IGNORECASE))
-                            if action_button.count() and action_button.first.is_visible():
-                                action_button.first.click(timeout=2000)
-                                page.wait_for_timeout(1000)
+                            if self._visible(action_button):
+                                action_button.first.click(timeout=5000, no_wait_after=True)
+                                self._console_wait_until(page, screen_done, timeout=15)
                                 break
                     except Exception:
                         pass
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(200)
 
             code = loopback.wait_for_code(timeout=1)
         finally:
@@ -11604,6 +11806,13 @@ class DashboardPage(QWidget):
             raise RuntimeError(
                 "Google did not return a refresh token. This account may already have granted EzyMailer "
                 "access before — remove EzyMailer's access at myaccount.google.com/permissions and retry."
+            )
+        if not gmail_oauth.token_grants_send(token_payload):
+            # Never save a credential that can't send — it would only fail
+            # later, at campaign time, with a 403.
+            raise RuntimeError(
+                "Google did not grant permission to send email. When Google asks what EzyMailer can "
+                "access, make sure \"Send email on your behalf\" is ticked, then retry."
             )
         # account_email was already read off Gmail's own UI earlier in this
         # function (used for the test-user step and login_hint) — reuse it
@@ -11633,6 +11842,11 @@ class DashboardPage(QWidget):
         access_token = token_payload.get("access_token")
         if not access_token:
             raise RuntimeError(f"Could not refresh Gmail API access for {session.account_email}.")
+        if "scope" in token_payload and not gmail_oauth.token_grants_send(token_payload):
+            raise RuntimeError(
+                f"{session.account_email} was authorized without permission to send email. "
+                f"Click Login for this account again and allow \"Send email on your behalf\"."
+            )
         session.access_token = access_token
         session.access_token_expires_at = time.time() + max(60, int(token_payload.get("expires_in", 3000)) - 300)
         return access_token

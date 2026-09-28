@@ -171,6 +171,17 @@ def exchange_code_for_tokens(client_id: str, client_secret: str, code: str, redi
     )
 
 
+def token_grants_send(token_payload: dict[str, Any]) -> bool:
+    """Whether a token response actually carries the gmail.send scope.
+
+    Google's granular consent screen lists "Send email on your behalf" with
+    its own checkbox, unticked by default. Continuing without ticking it
+    still issues a token — just with only the profile scope — and every
+    send then fails with 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT (verified live).
+    """
+    return GMAIL_SEND_SCOPE in str(token_payload.get("scope") or "").split()
+
+
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict[str, Any]:
     return _post_form(
         GOOGLE_TOKEN_URL,
