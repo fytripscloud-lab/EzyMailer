@@ -1701,11 +1701,9 @@ class GmailApiAutomationWorker(QObject):
             return (email, False, "Cancelled before starting")
         self.log.emit(f"[{index}/{total}] Start: {email}")
         try:
-            # The Console automation reports many internal step messages
-            # (project creation, consent screen wizard, retry attempts) via
-            # this callback — those are useful while live-debugging but too
-            # noisy for normal use, so they're discarded here. Only this
-            # row's own start/completion lines reach the visible log.
+            # Step messages (project, consent screen, test user, retries)
+            # go to the visible log, indented under this row: without them a
+            # failure only said "Failed", with no way to tell which step.
             account = self.controller._generate_api_json_from_credentials(
                 index,
                 email,
@@ -1713,7 +1711,7 @@ class GmailApiAutomationWorker(QObject):
                 self.output_dir,
                 slot=slot,
                 max_parallel=self.max_parallel,
-                log=lambda message: None,
+                log=lambda message: self.log.emit(f"[{index}/{total}]   {message}"),
             )
             self.log.emit(f"[{index}/{total}] Completed: {email}")
             self.row_finished.emit(index, True, email)
@@ -2749,9 +2747,10 @@ class GmailApiAutomationDialog(QDialog):
         title_label = QLabel("Gmail API Automation")
         title_label.setObjectName("confirmTitle")
         subtitle = QLabel(
-            "Upload a sheet (.csv or .xlsx) listing each Gmail account's email and password. "
-            "EzyMailer signs in to each one, creates its Gmail API JSON credential, and saves it "
-            "to the folder below. Upload the resulting files with the Upload JSON button afterward."
+            "Upload a sheet (.csv or .xlsx) with columns Email, Password. EzyMailer signs in to each "
+            "account, creates its Gmail API JSON credential, and saves it to the folder below. "
+            "Leave Password blank to sign in to that account yourself in the browser window "
+            "(useful when Google asks for a captcha); setup continues once the inbox opens."
         )
         subtitle.setObjectName("confirmText")
         subtitle.setWordWrap(True)
@@ -10757,31 +10756,31 @@ class DashboardPage(QWidget):
         dialog.exec()
 
     def _extract_email_password_pair(self, cells: list[str]) -> tuple[str, str, int]:
-        """First "@"-containing cell is the email; the next non-empty cell
-        after it is the password. A header row ("Email, Password") has no
-        "@" in either cell, so it's naturally skipped without special-casing.
+        """First "@"-containing cell is the email; the cell right after it
+        is the password, and the one after that the status (Email, Password,
+        Status). A header row ("Email, Password") has no "@" in either cell,
+        so it's naturally skipped without special-casing.
+
+        The password may be blank: that row is signed in by the person
+        themselves in the browser window instead of automatically. Reading
+        by position (not "next non-empty cell") keeps a blank password from
+        swallowing the status cell as if it were the password.
 
         Also returns the password cell's column index, so the caller can
         derive a "status" column (the cell right after it) for the
         resumable-sheet feature below.
         """
-        email = ""
-        password = ""
-        password_idx = -1
         for idx, raw_cell in enumerate(cells):
             cell = (raw_cell or "").strip()
-            if not cell:
-                continue
-            if not email and "@" in cell:
-                email = cell
-            elif email and not password:
-                password = cell
-                password_idx = idx
-        return email, password, password_idx
+            if "@" in cell:
+                password = (cells[idx + 1] or "").strip() if idx + 1 < len(cells) else ""
+                return cell, password, idx + 1
+        return "", "", -1
 
     def _read_credentials_sheet(self, path: Path) -> list[tuple[int, str, str, int]]:
         """Read pending (email, password) rows from a sheet, skipping any
-        row whose status column already reads "Completed" or "Failed".
+        row whose status column already reads "Completed" or "Failed". A row
+        with a blank password is included: its account is signed in by hand.
 
         The status column is the cell immediately after the password cell.
         Returns (sheet_row_number, email, password, status_column_index) so
@@ -10800,7 +10799,7 @@ class DashboardPage(QWidget):
                 for row_number, raw_row in enumerate(sheet.iter_rows(values_only=True), start=1):
                     cells = [str(cell) if cell is not None else "" for cell in raw_row]
                     email, password, password_idx = self._extract_email_password_pair(cells)
-                    if not email or not password:
+                    if not email:
                         continue
                     status_col = password_idx + 1
                     status = cells[status_col].strip() if status_col < len(cells) else ""
@@ -10813,7 +10812,7 @@ class DashboardPage(QWidget):
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 for row_number, cells in enumerate(csv.reader(handle), start=1):
                     email, password, password_idx = self._extract_email_password_pair(cells)
-                    if not email or not password:
+                    if not email:
                         continue
                     status_col = password_idx + 1
                     status = cells[status_col].strip() if status_col < len(cells) else ""
@@ -10899,7 +10898,15 @@ class DashboardPage(QWidget):
         emit = log or (lambda message: None)
         session = self._launch_browser_process_threadsafe(slot, total_override=max_parallel, blank=True)
         try:
-            self._automated_google_sign_in(session, email, password, log=emit)
+            if password:
+                self._automated_google_sign_in(session, email, password, log=emit)
+            else:
+                # No password in the sheet: the person signs in themselves
+                # in this window (any check Google shows, they can retry as
+                # often as it takes). The Console setup below starts by
+                # waiting for that sign-in, opening Google's sign-in page in
+                # the blank window first.
+                emit(f"Sign in to {email} in the browser window; setup continues once the inbox opens")
             # Each account gets its own Cloud project rather than sharing
             # one: adding a test user (or resolving the active project)
             # requires owner-level access, which only the account that
