@@ -11598,8 +11598,15 @@ class DashboardPage(QWidget):
                     retried = True
             if save_button.count() > 0:
                 emit(f"Could not confirm {email} was added as a test user; consent may fail until added by hand")
-            else:
+                return
+            # A closed dialog isn't proof the change was saved — confirm the
+            # address is really in the list after a reload.
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+            self._console_wait_until(page, lambda: add_button.count() > 0, timeout=20)
+            if self._console_wait_until(page, lambda: self._visible(page.get_by_text(email, exact=False)), timeout=15):
                 emit(f"Added {email} as a test user")
+            else:
+                emit(f"Could not confirm {email} was added as a test user; consent may fail until added by hand")
         except Exception as exc:
             emit(f"Could not add {email} as a test user automatically ({exc}); consent may fail until added by hand")
 
@@ -11831,6 +11838,23 @@ class DashboardPage(QWidget):
                 # bug broke both when the Gmail-API-enable call below was
                 # placed before this read instead of after it).
                 account_email = self._current_gmail_account_email(page)
+                if not account_email:
+                    emit("Could not read the signed-in Gmail address yet; reopening Gmail")
+                    try:
+                        page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="commit", timeout=30000)
+                    except Exception:
+                        pass
+                    self._wait_for_gmail_inbox_signed_in(session, page, timeout=60, log=emit)
+                    account_email = self._current_gmail_account_email(page)
+                if not account_email:
+                    # Without it the account can't be added as a test user,
+                    # and Google then always blocks consent with 403
+                    # access_denied — stop here with the real reason instead.
+                    raise RuntimeError(
+                        "Could not read which Gmail account is signed in, so it can't be added as a test user "
+                        "(Google would block access with 403). Make sure the Gmail inbox is open in the browser "
+                        "window, then retry."
+                    )
 
                 # A project uploaded as a raw client (rather than one this
                 # app created itself via the bulk tool, which already does
@@ -11845,13 +11869,7 @@ class DashboardPage(QWidget):
                 # app's own developer gets a 403 access_denied otherwise. The
                 # new consent-screen wizard never adds anyone automatically,
                 # so every account needs this before requesting consent.
-                if account_email:
-                    self._ensure_test_user(page, client.get("project_id", ""), account_email, log=emit)
-                else:
-                    emit(
-                        "Could not read the signed-in Gmail address; skipping the test-user step. "
-                        "Consent may stop on Google's account chooser or be denied until it is added by hand"
-                    )
+                self._ensure_test_user(page, client.get("project_id", ""), account_email, log=emit)
 
                 auth_url, _ = gmail_oauth.build_authorization_url(
                     client["client_id"],
@@ -11872,9 +11890,43 @@ class DashboardPage(QWidget):
                 # matches too, so it kept clicking that static text forever
                 # instead of ever reaching Continue/Allow (verified live).
                 deadline = time.monotonic() + 180
+                denied_attempts = 0
                 while time.monotonic() < deadline:
                     if loopback.code is not None or loopback.error is not None:
                         break
+                    # Google's own error page never redirects back to the
+                    # loopback, so without this a 403 just sat until the 3
+                    # minute timeout. access_denied here means "not an
+                    # approved tester" — seen on Windows even though the
+                    # address was listed moments earlier, i.e. Google hadn't
+                    # applied the change yet. Re-confirm it's listed, give
+                    # Google time, and ask again.
+                    if "/signin/oauth/error" in (page.url or ""):
+                        try:
+                            error_text = " ".join(page.locator("body").inner_text(timeout=5000).split())
+                        except Exception:
+                            error_text = ""
+                        if "access_denied" not in error_text:
+                            raise RuntimeError(f"Google refused the sign-in: {error_text[:300] or page.url}")
+                        denied_attempts += 1
+                        if denied_attempts > 4:
+                            raise RuntimeError(
+                                f"Google keeps blocking {account_email} with 403 access_denied. In Google Cloud "
+                                f"Console open Google Auth Platform > Audience for project "
+                                f"{client.get('project_id', '')}, check {account_email} is under Test users, "
+                                f"wait a few minutes, then retry Login."
+                            )
+                        wait_seconds = 15 * denied_attempts
+                        emit(
+                            f"Google hasn't approved {account_email} as a tester yet (403 access_denied); "
+                            f"re-checking the test-user list and retrying in {wait_seconds}s "
+                            f"(attempt {denied_attempts}/4)"
+                        )
+                        self._ensure_test_user(page, client.get("project_id", ""), account_email, log=emit)
+                        time.sleep(wait_seconds)
+                        deadline = max(deadline, time.monotonic() + 180)
+                        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                        continue
                     try:
                         advanced = page.get_by_text(re.compile(r"^Advanced$"), exact=True)
                         # After each click, wait for Google to actually move
