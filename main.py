@@ -10663,7 +10663,11 @@ class DashboardPage(QWidget):
                     encoding="utf-8",
                 )
         except Exception:
-            self._terminate_transient_session(session)
+            # Leave the window open rather than closing it: the person may
+            # still be working through Google's own sign-in checks there
+            # (a captcha can take several tries), and closing it threw that
+            # progress away. They can finish there and click Login again.
+            emit(f"Browser window {index} was left open; finish signing in there, then click Login again")
             raise
         account = ApiAccountHandle(
             session_id=f"api-account-{index}-{QDateTime.currentMSecsSinceEpoch()}",
@@ -10852,7 +10856,10 @@ class DashboardPage(QWidget):
             client = self._run_cloud_console_oauth_client_setup(session, log=emit)
             token = self._run_gmail_consent_flow(session, client, log=emit)
         except Exception:
-            self._terminate_transient_session(session)
+            # Left open for the same reason as Login: closing the window
+            # mid-way discarded anything the person was doing in it, such
+            # as retrying one of Google's sign-in checks.
+            emit(f"Browser window for {email} was left open so you can finish there")
             raise
 
         output_dir.mkdir(parents=True, exist_ok=True)
