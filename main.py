@@ -1535,11 +1535,12 @@ class _BrowserLaunchRequest:
     _launch_browser_process and fills in result/error.
     """
 
-    __slots__ = ("index", "total_override", "event", "result", "error")
+    __slots__ = ("index", "total_override", "blank", "event", "result", "error")
 
-    def __init__(self, index: int, *, total_override: int | None = None):
+    def __init__(self, index: int, *, total_override: int | None = None, blank: bool = False):
         self.index = index
         self.total_override = total_override
+        self.blank = blank
         self.event = threading.Event()
         self.result: "BrowserSessionHandle | None" = None
         self.error: Exception | None = None
@@ -8395,14 +8396,16 @@ class DashboardPage(QWidget):
 
     def _handle_launch_browser_process_request(self, request: "_BrowserLaunchRequest") -> None:
         try:
-            request.result = self._launch_browser_process(request.index, total_override=request.total_override)
+            request.result = self._launch_browser_process(
+                request.index, total_override=request.total_override, blank=request.blank
+            )
         except Exception as exc:
             request.error = exc
         finally:
             request.event.set()
 
     def _launch_browser_process_threadsafe(
-        self, index: int, *, total_override: int | None = None
+        self, index: int, *, total_override: int | None = None, blank: bool = False
     ) -> BrowserSessionHandle:
         """Open a browser window safely regardless of the calling thread.
 
@@ -8412,15 +8415,17 @@ class DashboardPage(QWidget):
         a queued signal and wait on a threading.Event for the result.
         """
         if QThread.currentThread() is self.thread():
-            return self._launch_browser_process(index, total_override=total_override)
-        request = _BrowserLaunchRequest(index, total_override=total_override)
+            return self._launch_browser_process(index, total_override=total_override, blank=blank)
+        request = _BrowserLaunchRequest(index, total_override=total_override, blank=blank)
         self._launch_browser_process_requested.emit(request)
         request.event.wait()
         if request.error is not None:
             raise request.error
         return request.result
 
-    def _launch_browser_process(self, index: int, *, total_override: int | None = None) -> BrowserSessionHandle:
+    def _launch_browser_process(
+        self, index: int, *, total_override: int | None = None, blank: bool = False
+    ) -> BrowserSessionHandle:
         binary = self._browser_binary()
         if binary is None:
             raise RuntimeError("No supported Edge, Chrome, or Chromium browser was found for this app.")
@@ -8460,8 +8465,15 @@ class DashboardPage(QWidget):
         # Open one Gmail page for every configured sending tab. Chrome accepts
         # multiple URL arguments after --new-window and creates them as tabs
         # in the same isolated browser profile.
+        #
+        # `blank` skips this for windows the automation drives itself
+        # (Login / Gmail API Automation): on Windows the launch URL has been
+        # seen to stall — shown in the address bar but never loading until
+        # the person typed an address (reported live on the EXE). Those
+        # flows open Gmail over CDP instead, which loads normally.
         tab_count = max(1, int(getattr(self.state, "tab_count", 1)))
-        args.extend(["https://mail.google.com/mail/u/0/#inbox"] * tab_count)
+        if not blank:
+            args.extend(["https://mail.google.com/mail/u/0/#inbox"] * tab_count)
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -10606,7 +10618,7 @@ class DashboardPage(QWidget):
             else:
                 if not reuse_token:
                     emit(f"Saved access for {client['account_email']} is missing the send permission; asking Google again")
-        session = self._launch_browser_process_threadsafe(index)
+        session = self._launch_browser_process_threadsafe(index, blank=True)
         try:
             if reuse_token:
                 account_email = client["account_email"]
@@ -10828,7 +10840,7 @@ class DashboardPage(QWidget):
         log: Callable[[str], None] | None = None,
     ) -> ApiAccountHandle:
         emit = log or (lambda message: None)
-        session = self._launch_browser_process_threadsafe(slot, total_override=max_parallel)
+        session = self._launch_browser_process_threadsafe(slot, total_override=max_parallel, blank=True)
         try:
             self._automated_google_sign_in(session, email, password, log=emit)
             # Each account gets its own Cloud project rather than sharing
@@ -11447,6 +11459,12 @@ class DashboardPage(QWidget):
                     match = re.search(r"\(([^()]+@[^()]+)\)", label)
                     if match:
                         return match.group(1).strip()
+                # Fallback that doesn't depend on the English "Google
+                # Account" label: Gmail's own tab title carries the address.
+                if urlparse(page.url or "").netloc == "mail.google.com":
+                    match = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", page.title() or "")
+                    if match:
+                        return match.group(0)
             except Exception:
                 pass
             if time.monotonic() >= deadline:
@@ -11655,6 +11673,7 @@ class DashboardPage(QWidget):
         deadline = time.monotonic() + timeout
         opened_at = time.monotonic()
         last_nudge = 0.0
+        start_checked = False
         while time.monotonic() < deadline:
             if session.process is not None and session.process.poll() is not None:
                 raise RuntimeError("The browser window was closed before signing in to Gmail.")
@@ -11668,13 +11687,28 @@ class DashboardPage(QWidget):
             # person typed an address themselves (reported live). Nothing can
             # progress from a non-web page, so open Gmail ourselves after a
             # short grace period (it redirects to Google sign-in when signed
-            # out). Never touches a real web page the person is on.
+            # out).
             now = time.monotonic()
-            if (
-                url_known
-                and not current_url.startswith(("http://", "https://"))
-                and now - opened_at > 3
-                and now - last_nudge > 10
+            try:
+                current_host = urlparse(current_url).netloc
+            except Exception:
+                current_host = ""
+            # A window can also come up on some unrelated page — Chrome
+            # restores the previous session's tabs after an unclean exit,
+            # e.g. a Cloud Console page (verified live: this waited forever).
+            # Send it to Gmail once at the start; after that only step in for
+            # non-web pages so a person mid-sign-in is never navigated away.
+            first_check = url_known and not start_checked
+            if url_known:
+                start_checked = True
+            off_google = current_host not in {"mail.google.com", "accounts.google.com"}
+            if url_known and (
+                (first_check and off_google and current_url.startswith(("http://", "https://")))
+                or (
+                    not current_url.startswith(("http://", "https://"))
+                    and now - opened_at > 3
+                    and now - last_nudge > 10
+                )
             ):
                 last_nudge = now
                 if log is not None:
@@ -11694,7 +11728,29 @@ class DashboardPage(QWidget):
             except Exception:
                 host = ""
             if host == "mail.google.com":
-                return
+                # The host alone isn't proof Gmail loaded: a stalled
+                # navigation reports its pending URL (verified live), which
+                # made this return before anything rendered, so the account
+                # email couldn't be read, the test-user step was skipped and
+                # consent failed with 403 access_denied (reported on the
+                # Windows EXE). A loaded, signed-in Gmail tab's title always
+                # carries the account address ("Inbox - you@gmail.com -
+                # Gmail"), in every language.
+                try:
+                    title = page.title()
+                except Exception:
+                    title = ""
+                if "@" in title:
+                    return
+                if url_known and now - max(opened_at, last_nudge) > 25:
+                    last_nudge = now
+                    if log is not None:
+                        log("Gmail hasn't finished loading; opening it again")
+                    try:
+                        page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="commit", timeout=30000)
+                    except Exception:
+                        pass
+                    continue
             try:
                 page.wait_for_timeout(1000)
             except Exception:
