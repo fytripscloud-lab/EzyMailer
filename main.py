@@ -157,6 +157,10 @@ LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 LOCAL_DATA_TAB_SETTINGS_KEY = "data_tab_settings_state"
 GOOGLE_API_ACCOUNTS_DIR = LOCAL_CACHE_DIR / "api_accounts"
 LOCAL_API_JSON_OUTPUT_STATE_KEY = "api_json_output_state"
+# Opens the Google sign-in form when signed out and goes straight on to the
+# inbox when signed in. Plain mail.google.com sends a signed-out Normal-mode
+# window to Workspace's marketing page instead (verified on Windows).
+GMAIL_SIGNIN_URL = "https://accounts.google.com/ServiceLogin?service=mail&continue=https://mail.google.com/mail/u/0/"
 DEFAULT_API_JSON_OUTPUT_DIR = Path.home() / "Downloads" / "EzyMailer Gmail API JSON"
 
 
@@ -8462,25 +8466,20 @@ class DashboardPage(QWidget):
         x, y, width, height = self._browser_launch_rect(index, max(1, tile_total))
         args.append(f"--window-position={x},{y}")
         args.append(f"--window-size={width},{height}")
-        # Open one Gmail page for every configured sending tab. Chrome accepts
-        # multiple URL arguments after --new-window and creates them as tabs
-        # in the same isolated browser profile.
-        #
-        # `blank` skips this for windows the automation drives itself
-        # (Login / Gmail API Automation): on Windows the launch URL has been
-        # seen to stall — shown in the address bar but never loading until
-        # the person typed an address (reported live on the EXE). Those
-        # flows open Gmail over CDP instead, which loads normally.
+        # No start URL on the command line: on Windows a URL passed there
+        # never loads — the tab shows it with an empty page, and Playwright
+        # can't even attach while it's pending — even with every other flag
+        # here removed (verified on a Windows runner). Windows launch blank;
+        # Start Browser windows get their Gmail tabs opened over CDP below,
+        # and Login / Gmail API Automation (`blank`) navigate themselves.
         tab_count = max(1, int(getattr(self.state, "tab_count", 1)))
-        if not blank:
-            args.extend(["https://mail.google.com/mail/u/0/#inbox"] * tab_count)
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return BrowserSessionHandle(
+        session = BrowserSessionHandle(
             session_id=session_id,
             title=title,
             mode="Incognito" if incognito else "Normal",
@@ -8492,6 +8491,60 @@ class DashboardPage(QWidget):
             debug_port=debug_port,
             tab_count=tab_count,
         )
+        if not blank:
+            # One Gmail tab per configured sending tab, opened off the GUI
+            # thread. All go through the sign-in URL: plain mail.google.com
+            # lands a signed-out Normal window on a marketing page.
+            start_urls = [GMAIL_SIGNIN_URL] * tab_count
+            threading.Thread(target=self._open_start_pages, args=(session, start_urls), daemon=True).start()
+        return session
+
+    def _open_start_pages(self, session: BrowserSessionHandle, urls: list[str]) -> None:
+        """Open a just-launched window's start pages over CDP (background thread).
+
+        Replaces command-line start URLs, which never load on Windows. Pages
+        are opened in the window's own browser context, so an Incognito
+        window's tabs stay Incognito. Best effort: if this fails the window is
+        simply left on its new-tab page.
+        """
+        try:
+            ensure_external_dependencies()
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as playwright:
+                deadline = time.monotonic() + 30
+                browser = None
+                while browser is None and time.monotonic() < deadline:
+                    try:
+                        browser = playwright.chromium.connect_over_cdp(self._browser_cdp_url(session), timeout=5000)
+                    except Exception:
+                        time.sleep(0.25)
+                if browser is None:
+                    return
+                first = self._signin_page(browser)
+                try:
+                    first.goto(urls[0], wait_until="commit", timeout=30000)
+                except Exception:
+                    pass
+                if len(urls) > 1:
+                    # Extra tabs must share the first tab's browser context,
+                    # and an --incognito window's context can't be targeted
+                    # over CDP: Playwright's new_page() and Target.createTarget
+                    # both open them in the regular profile instead (verified
+                    # live). Having the first tab open them itself keeps them
+                    # in its own context; userGesture stops Chrome treating it
+                    # as a blocked popup.
+                    first_cdp = first.context.new_cdp_session(first)
+                    for url in urls[1:]:
+                        try:
+                            first_cdp.send(
+                                "Runtime.evaluate",
+                                {"expression": f"window.open({json.dumps(url)}, '_blank')", "userGesture": True},
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _sync_browser_session_states(self) -> None:
         removed_sessions: list[BrowserSessionHandle] = []
@@ -11726,9 +11779,13 @@ class DashboardPage(QWidget):
             ):
                 last_nudge = now
                 if log is not None:
-                    log(f"Browser window opened on {current_url or 'an empty page'}; opening Gmail")
+                    # Scheme/host/path only: a restored tab's query string can
+                    # carry things like a used OAuth code (seen live), which
+                    # don't belong in the activity log.
+                    shown = current_url.split("?", 1)[0].split("#", 1)[0] or "an empty page"
+                    log(f"Browser window opened on {shown}; opening Gmail")
                 try:
-                    page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="commit", timeout=30000)
+                    page.goto(GMAIL_SIGNIN_URL, wait_until="commit", timeout=30000)
                 except Exception:
                     pass
                 continue
