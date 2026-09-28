@@ -10787,7 +10787,7 @@ class DashboardPage(QWidget):
                     time.sleep(0.25)
             if browser is None:
                 raise RuntimeError("Could not connect to the sign-in browser window.")
-            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            page = self._signin_page(browser)
             page.set_default_timeout(20000)
 
             page.goto(
@@ -10814,7 +10814,7 @@ class DashboardPage(QWidget):
             password_next.click(timeout=5000)
 
             emit("Waiting for sign-in to complete (finish any verification step in the window if one appears)")
-            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout)
+            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout, log=emit)
 
     def _generate_api_json_from_credentials(
         self,
@@ -10913,6 +10913,21 @@ class DashboardPage(QWidget):
             page.wait_for_timeout(200)
 
     @staticmethod
+    def _click_through_overlays(locator) -> None:
+        """Click, falling back to a DOM-level click if an overlay is on top.
+
+        Console stacks transparent `.cdk-overlay-backdrop` layers from
+        unrelated popups over the project picker, and they swallow real
+        pointer clicks (verified live, even with the target visible and
+        enabled). A DOM click still runs the element's own handler; callers
+        confirm the outcome afterwards either way.
+        """
+        try:
+            locator.click(timeout=3000, no_wait_after=True)
+        except Exception:
+            locator.evaluate("element => element.click()")
+
+    @staticmethod
     def _visible(locator) -> bool:
         # Any match, not just `.first` — Console often renders a hidden
         # duplicate of a control ahead of the visible one (verified live).
@@ -10983,11 +10998,11 @@ class DashboardPage(QWidget):
                     time.sleep(0.25)
             if browser is None:
                 raise RuntimeError("Could not connect to the sign-in browser window.")
-            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            page = self._signin_page(browser)
             page.set_default_timeout(20000)
 
             emit("Waiting for Gmail sign-in in the browser window")
-            self._wait_for_gmail_inbox_signed_in(session, page)
+            self._wait_for_gmail_inbox_signed_in(session, page, log=emit)
             emit("Signed in; opening Google Cloud Console")
 
             # Named after the account's own email (the part before @) so
@@ -11106,7 +11121,7 @@ class DashboardPage(QWidget):
                             pass
                     wait_until(lambda: not self._visible(backdrop), 5)
                 switcher = self._console_control(page, (switcher_selector,), timeout=10000)
-                switcher.click(timeout=10000, no_wait_after=True)
+                self._click_through_overlays(switcher)
                 result_link = self._console_control(
                     page,
                     (f'a[data-prober="cloud-console-core-functions-project-name"]:has-text("{project_name}")',),
@@ -11119,7 +11134,7 @@ class DashboardPage(QWidget):
                 # switcher — reopening it is what triggered the overlay
                 # backdrop intercepting every click on a prior attempt.
                 wait_until(lambda: result_link.get_attribute("aria-disabled") != "true", 25)
-                result_link.click(timeout=10000, no_wait_after=True)
+                self._click_through_overlays(result_link)
                 # Selected only once the header's project switcher names it.
                 if not wait_until(lambda: project_name in (page.locator(switcher_selector).first.inner_text() or ""), 15):
                     raise RuntimeError("The new project did not become the active project.")
@@ -11203,9 +11218,10 @@ class DashboardPage(QWidget):
                 # loading. Those two look identical after a short fixed
                 # wait, and treating "not loaded yet" as "already done" was
                 # silently skipping the whole consent-screen setup. Poll for
-                # up to 15s before concluding it's genuinely already done.
+                # up to 30s (Console can take well over 10s to render on a slow
+                # PC, verified live) before concluding it's genuinely done.
                 get_started = page.locator('text="Get started"')
-                if not wait_until(lambda: self._visible(get_started), 15):
+                if not wait_until(lambda: self._visible(get_started), 30):
                     return
                 get_started.first.click(timeout=10000, no_wait_after=True)
 
@@ -11299,12 +11315,16 @@ class DashboardPage(QWidget):
                 # button and the ID/secret shown as plain text — extraction
                 # below prefers the download (a real Google-formatted file,
                 # verified live) and falls back to reading the text.
+                # Open the create form by its own URL rather than clicking
+                # "Create client": below ~1000px wide (common on Windows with
+                # 125-150% display scaling) Console folds that button into
+                # the page header's overflow menu, so it never becomes
+                # visible (verified live; this failed the Windows EXE).
                 page.goto(
-                    f"https://console.cloud.google.com/auth/clients?project={project_id}",
+                    f"https://console.cloud.google.com/auth/clients/create?project={project_id}",
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-                self._console_control(page, ('text="Create client"',), timeout=15000).click(timeout=10000, no_wait_after=True)
 
                 # The create form renders well after its URL changes on a
                 # fresh project (verified live: >10s once), so wait for the
@@ -11565,6 +11585,25 @@ class DashboardPage(QWidget):
         except Exception as exc:
             emit(f"Could not add {email} as a test user automatically ({exc}); consent may fail until added by hand")
 
+    @staticmethod
+    def _signin_page(browser):
+        """Pick the tab to drive in a window this app just launched.
+
+        Prefers a tab already on Google (the one the launch URL opened),
+        then any tab, and only opens a new one when the window exposes
+        none. Callers must not assume the launch URL actually loaded: on
+        the Windows EXE the window has come up on a blank/new-tab page
+        instead (reported live), and a Google tab may not be the first one.
+        """
+        pages = [page for context in browser.contexts for page in context.pages]
+        for page in pages:
+            try:
+                if urlparse(page.url or "").netloc.endswith("google.com"):
+                    return page
+            except Exception:
+                continue
+        return pages[0] if pages else browser.contexts[0].new_page()
+
     def _wait_for_browser_session_signed_in(
         self,
         session: BrowserSessionHandle,
@@ -11594,23 +11633,58 @@ class DashboardPage(QWidget):
                     time.sleep(0.25)
             if browser is None:
                 raise RuntimeError("Could not connect to the sign-in browser window.")
-            page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+            page = self._signin_page(browser)
             emit("Waiting for Gmail sign-in in the browser window")
-            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout)
+            self._wait_for_gmail_inbox_signed_in(session, page, timeout=timeout, log=emit)
 
-    def _wait_for_gmail_inbox_signed_in(self, session: BrowserSessionHandle, page, timeout: float = 600.0) -> None:
+    def _wait_for_gmail_inbox_signed_in(
+        self,
+        session: BrowserSessionHandle,
+        page,
+        timeout: float = 600.0,
+        *,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
         """Block until the window's Gmail tab reaches a signed-in inbox URL.
 
-        The window opens on mail.google.com already (Start Browser's normal
-        launch args); this just waits for the person to finish signing in
-        there before the consent flow reuses the same authenticated session.
+        The window is launched pointed at mail.google.com; this waits for
+        the person to finish signing in there before the consent flow reuses
+        the same authenticated session, opening Gmail itself if the tab is
+        still on a blank/new-tab page (the launch URL didn't load).
         """
         deadline = time.monotonic() + timeout
+        opened_at = time.monotonic()
+        last_nudge = 0.0
         while time.monotonic() < deadline:
             if session.process is not None and session.process.poll() is not None:
                 raise RuntimeError("The browser window was closed before signing in to Gmail.")
             try:
                 current_url = str(page.url or "")
+                url_known = True
+            except Exception:
+                current_url, url_known = "", False
+            # The launch URL doesn't always load — on the Windows EXE the
+            # window has stayed on a blank/new-tab/welcome page until the
+            # person typed an address themselves (reported live). Nothing can
+            # progress from a non-web page, so open Gmail ourselves after a
+            # short grace period (it redirects to Google sign-in when signed
+            # out). Never touches a real web page the person is on.
+            now = time.monotonic()
+            if (
+                url_known
+                and not current_url.startswith(("http://", "https://"))
+                and now - opened_at > 3
+                and now - last_nudge > 10
+            ):
+                last_nudge = now
+                if log is not None:
+                    log(f"Browser window opened on {current_url or 'an empty page'}; opening Gmail")
+                try:
+                    page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="commit", timeout=30000)
+                except Exception:
+                    pass
+                continue
+            try:
                 # Google's own sign-in/password pages carry the eventual
                 # destination in a "continue=https://mail.google.com/mail/..."
                 # query parameter. A substring check on the raw URL matches
@@ -11674,7 +11748,7 @@ class DashboardPage(QWidget):
                         time.sleep(0.25)
                 if browser is None:
                     raise RuntimeError("Could not connect to the sign-in browser window.")
-                page = next((p for c in browser.contexts for p in c.pages), None) or browser.contexts[0].new_page()
+                page = self._signin_page(browser)
 
                 if assume_signed_in:
                     # Sign-in already happened before Cloud Console setup
@@ -11686,10 +11760,10 @@ class DashboardPage(QWidget):
                     # it back at mail.google.com (verified live: it would
                     # hang indefinitely on the Console page).
                     page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=30000)
-                    self._wait_for_gmail_inbox_signed_in(session, page, timeout=30)
+                    self._wait_for_gmail_inbox_signed_in(session, page, timeout=30, log=emit)
                 else:
                     emit("Waiting for you to sign in to Gmail in the browser window")
-                    self._wait_for_gmail_inbox_signed_in(session, page)
+                    self._wait_for_gmail_inbox_signed_in(session, page, log=emit)
                 emit("Signed in; starting Gmail API authorization")
 
                 # Read the account's email while the page is still on Gmail
