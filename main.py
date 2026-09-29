@@ -5,6 +5,7 @@ import html
 import base64
 import csv
 import functools
+import gzip
 import hashlib
 import json
 import os
@@ -104,6 +105,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QColorDialog,
     QPlainTextEdit,
+    QTextBrowser,
     QTextEdit,
     QDoubleSpinBox,
     QRadioButton,
@@ -4312,6 +4314,30 @@ class FileFormatDialog(QDialog):
         return default_base
 
 
+class _BackgroundTask(QObject):
+    """Runs one blocking callable on a plain thread and reports back on the
+    Qt main thread (the signals are queued across threads automatically,
+    since this QObject lives on the thread that created it)."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn: Callable[[], object], parent: QObject | None = None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="ezymailer-preview-task", daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+            return
+        self.succeeded.emit(result)
+
+
 class NativeWebPreviewWidget(QWidget):
     """Embeds macOS's native WebKit engine (same engine as Safari/Mail)
     directly inside a Qt widget for the HTML preview dialog — real,
@@ -4325,17 +4351,49 @@ class NativeWebPreviewWidget(QWidget):
     three non-default widget attributes set in __init__ below — without
     them, Qt's own compositing paints over the embedded WKWebView every
     frame, leaving it blank. Confirmed by live testing, not documentation.
+
+    Without WebKit (Windows), the page is rendered to an image by
+    `image_renderer` — the same headless Chromium that renders the real
+    attachment — and shown in a scroll area. If that isn't available
+    (Chromium not downloaded yet, or the render fails), it falls back to
+    Qt's own basic HTML viewer so the preview is never blank.
     """
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, image_renderer: Callable[[str], bytes] | None = None):
         super().__init__(parent)
         self._web_view = None
         self._pending_html: str | None = None
+        self._image_renderer = image_renderer
+        self._render_generation = 0
+        self._render_tasks: list[_BackgroundTask] = []
+        self._pixmap: QPixmap | None = None
+        self._zoom = 1.0
         if _NATIVE_WEBVIEW_AVAILABLE:
             self.setAttribute(Qt.WA_NativeWindow, True)
             self.setAttribute(Qt.WA_PaintOnScreen, True)
             self.setAttribute(Qt.WA_NoSystemBackground, True)
             self.setAutoFillBackground(False)
+            return
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._status_label = QLabel("")
+        self._status_label.setObjectName("previewMeta")
+        self._status_label.setWordWrap(True)
+        self._status_label.setVisible(False)
+        layout.addWidget(self._status_label)
+        self._image_label = QLabel()
+        self._image_label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self._image_scroll = QScrollArea()
+        self._image_scroll.setWidget(self._image_label)
+        self._image_scroll.setWidgetResizable(False)
+        self._image_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self._image_scroll.setStyleSheet("QScrollArea { background: #ffffff; border: none; }")
+        layout.addWidget(self._image_scroll, 1)
+        self._text_browser = QTextBrowser()
+        self._text_browser.setOpenExternalLinks(False)
+        self._text_browser.setVisible(False)
+        layout.addWidget(self._text_browser, 1)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -4356,12 +4414,78 @@ class NativeWebPreviewWidget(QWidget):
             self._web_view = None
 
     def load_html(self, html: str) -> None:
+        if not _NATIVE_WEBVIEW_AVAILABLE:
+            self._render_as_image(html or "")
+            return
         if self._web_view is not None:
             self._web_view.loadHTMLString_baseURL_(html or "", None)
         else:
             self._pending_html = html
 
+    def _render_as_image(self, html: str) -> None:
+        self._render_generation += 1
+        if self._image_renderer is None:
+            self._show_text_fallback(html, "")
+            return
+        generation = self._render_generation
+        self._status_label.setText("Rendering preview…")
+        self._status_label.setVisible(True)
+        task = _BackgroundTask(lambda: self._image_renderer(html), self)
+        self._render_tasks.append(task)
+
+        def done(result: object, g: int = generation, t: _BackgroundTask = task) -> None:
+            self._render_tasks.remove(t)
+            if g != self._render_generation:
+                return
+            pixmap = QPixmap()
+            if not isinstance(result, (bytes, bytearray)) or not pixmap.loadFromData(bytes(result)):
+                self._show_text_fallback(html, "Showing a simplified preview (image render failed).")
+                return
+            self._pixmap = pixmap
+            self._status_label.setVisible(False)
+            self._text_browser.setVisible(False)
+            self._image_scroll.setVisible(True)
+            self._apply_image_zoom()
+
+        def failed(message: str, g: int = generation, t: _BackgroundTask = task) -> None:
+            self._render_tasks.remove(t)
+            if g == self._render_generation:
+                self._show_text_fallback(html, f"Showing a simplified preview — full rendering is unavailable: {message}")
+
+        task.succeeded.connect(done)
+        task.failed.connect(failed)
+        task.start()
+
+    def _show_text_fallback(self, html: str, message: str) -> None:
+        self._pixmap = None
+        self._status_label.setText(message)
+        self._status_label.setVisible(bool(message))
+        self._image_scroll.setVisible(False)
+        self._text_browser.setHtml(html)
+        self._text_browser.setVisible(True)
+
+    def _apply_image_zoom(self) -> None:
+        if self._pixmap is None:
+            return
+        # The render is taken at up to 2400px wide; fit it to the viewport
+        # width at 100% so it reads like the page, then scale from there.
+        # Always leave room for the vertical scrollbar, which appears only
+        # after the (tall) image is set and would otherwise force a
+        # horizontal one.
+        viewport_width = max(200, self._image_scroll.width() - self._image_scroll.verticalScrollBar().sizeHint().width() - 4)
+        target_width = max(100, int(min(self._pixmap.width(), viewport_width) * self._zoom))
+        scaled = self._pixmap.scaledToWidth(target_width, Qt.SmoothTransformation)
+        self._image_label.setPixmap(scaled)
+        self._image_label.resize(scaled.size())
+
     def set_zoom(self, factor: float) -> None:
+        if not _NATIVE_WEBVIEW_AVAILABLE:
+            self._zoom = factor
+            self._apply_image_zoom()
+            font = self._text_browser.font()
+            font.setPointSizeF(max(6.0, 10.0 * factor))
+            self._text_browser.setFont(font)
+            return
         if self._web_view is not None:
             try:
                 self._web_view.setPageZoom_(factor)
@@ -4370,6 +4494,9 @@ class NativeWebPreviewWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if not _NATIVE_WEBVIEW_AVAILABLE:
+            self._apply_image_zoom()
+            return
         if self._web_view is not None:
             try:
                 ns_view = objc.objc_object(c_void_p=int(self.winId()))
@@ -4391,9 +4518,13 @@ class HtmlPreviewDialog(QDialog):
         ai_enabled: Callable[[], bool] | None = None,
         design_with_ai: Callable[[str, str], str] | None = None,
         on_save: Callable[[str], None] | None = None,
+        image_renderer: Callable[[str], bytes] | None = None,
+        on_download: Callable[[str], None] | None = None,
     ):
         super().__init__(parent)
         self._scale = scale
+        self._image_renderer = image_renderer
+        self._on_download = on_download
         self.setModal(False)
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.setObjectName("previewDialog")
@@ -4470,6 +4601,15 @@ class HtmlPreviewDialog(QDialog):
         for button in (reload_button, source_button, zoom_out_button, zoom_reset_button, zoom_in_button):
             header_row.addWidget(button)
 
+        download_button = QPushButton("Download PDF")
+        download_button.setObjectName("primaryButton")
+        download_button.setFixedHeight(_scaled_int(28, self._scale))
+        download_button.setToolTip("Save this preview as the exact PDF that gets attached when sending")
+        download_button.clicked.connect(self._download_clicked)
+        download_button.setVisible(self._on_download is not None)
+        self.download_button = download_button
+        header_row.addWidget(download_button)
+
         save_button = QPushButton("Save")
         save_button.setObjectName("primaryButton")
         save_button.setFixedHeight(_scaled_int(28, self._scale))
@@ -4494,7 +4634,7 @@ class HtmlPreviewDialog(QDialog):
             meta_label.setWordWrap(True)
             card_layout.addWidget(meta_label)
 
-        self.preview_browser = NativeWebPreviewWidget()
+        self.preview_browser = NativeWebPreviewWidget(image_renderer=self._image_renderer)
         self.preview_browser.setObjectName("previewBrowser")
         self.preview_browser.load_html(html)
         card_layout.addWidget(self.preview_browser, 1)
@@ -4584,6 +4724,10 @@ class HtmlPreviewDialog(QDialog):
             QMessageBox.warning(self, "Save failed", str(exc))
             return
         self.save_button.setVisible(False)
+
+    def _download_clicked(self) -> None:
+        if self._on_download is not None:
+            self._on_download(self._source_html)
 
     def _zoom_preview(self, step: int) -> None:
         self._zoom_factor = min(3.0, max(0.25, self._zoom_factor + step * 0.1))
@@ -5072,6 +5216,26 @@ def _os_word_pool() -> tuple[str, ...]:
     except Exception:
         pass
     return _DYNAMIC_TAG_WORDLIST
+
+
+@functools.lru_cache(maxsize=1)
+def _dictionary_pool() -> tuple[str, ...]:
+    # $dictionary draws from a bundled 464k-entry English word list
+    # (dwyl/english-words, public domain), gzipped in packaging/assets and
+    # shipped via --add-data into the bundle's "assets" folder. Falls back to
+    # the OS dictionary if the file is somehow missing.
+    candidates = [Path(__file__).resolve().parent / "packaging" / "assets" / "dictionary.txt.gz"]
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets" / "dictionary.txt.gz")
+    for candidate in candidates:
+        try:
+            with gzip.open(candidate, "rt", encoding="utf-8") as handle:
+                words = tuple(line.strip() for line in handle if line.strip())
+            if len(words) >= 1000:
+                return words
+        except Exception:
+            continue
+    return _os_word_pool()
 
 
 @functools.lru_cache(maxsize=1)
@@ -7110,6 +7274,7 @@ class DashboardPage(QWidget):
             {"title": "$299.99", "token": "$amount", "description": "Random dollar amount ($149.99 - $499.99), CSPRNG", "default_value": "$299.99"},
             {"title": "preview", "token": "$emailname", "description": "The name part of the recipient's email (before @)", "default_value": "preview"},
             {"title": "3471027", "token": "$invoice", "description": "Random 7-digit order/invoice ID number (CSPRNG)", "default_value": "3471027"},
+            {"title": "serendipity", "token": "$dictionary", "description": "Random word from a 464,000+ entry English dictionary", "default_value": "serendipity"},
         ]
 
     def _configure_segmented_button(self, button: QPushButton, checked: bool = False) -> None:
@@ -7358,6 +7523,8 @@ class DashboardPage(QWidget):
             return f"${dollars}.99"
         if token == "$invoice":
             return str(secrets.randbelow(9000000) + 1000000)
+        if token == "$dictionary":
+            return secrets.choice(_dictionary_pool())
         return default_value
 
     def _build_campaign_unique_pickers(self) -> dict[str, "_UniquePicker"]:
@@ -7899,6 +8066,7 @@ class DashboardPage(QWidget):
         *,
         raw_html: str | None = None,
         on_save: Callable[[str], None] | None = None,
+        on_download: Callable[[str], None] | None = None,
     ) -> HtmlPreviewDialog:
         dialog = HtmlPreviewDialog(
             self.window(),
@@ -7910,6 +8078,8 @@ class DashboardPage(QWidget):
             ai_enabled=lambda: self.state.ai_connected,
             design_with_ai=self._request_ai_html_design,
             on_save=on_save,
+            image_renderer=self._render_html_preview_png,
+            on_download=on_download,
         )
         self._floating_windows.append(dialog)
         dialog.finished.connect(lambda _result, d=dialog: self._remove_floating_window(d))
@@ -7919,6 +8089,87 @@ class DashboardPage(QWidget):
     def _remove_floating_window(self, dialog: QDialog) -> None:
         if dialog in self._floating_windows:
             self._floating_windows.remove(dialog)
+
+    _PREVIEW_SAMPLE_RECIPIENT = "john.doe@example.com"
+
+    def _preview_tag_context(self) -> tuple[str, str, dict[str, str]]:
+        """Recipient, resolved subject and one fixed set of random tag values
+        for a preview, so every variable resolves the way it will when
+        sending: the first recipient in the email list (or a sample address)
+        stands in for $email/$emailname/{{first_name}}, and the same values
+        are reused if the preview is downloaded as a PDF."""
+        recipients = list(self.state.pending_recipients or [])
+        if not recipients:
+            recipients = self._extract_email_candidates(self.pending_emails_editor.toPlainText())
+        recipient = recipients[0] if recipients else self._PREVIEW_SAMPLE_RECIPIENT
+        tag_values = self._dynamic_tag_values()
+        subject = self._apply_tags_to_text(self.subject_input.text().strip(), recipient, "", tag_values)
+        return recipient, subject, tag_values
+
+    def _render_html_preview_png(self, html_content: str) -> bytes:
+        """Preview image for platforms without native WebKit — rendered by the
+        same _render_html_to_jpg the real attachment uses. Runs off the UI
+        thread (see NativeWebPreviewWidget)."""
+        with tempfile.TemporaryDirectory(prefix="ezymailer-preview-") as temp_dir:
+            jpg_path = Path(temp_dir) / "preview.jpg"
+            self._render_html_to_jpg(html_content, jpg_path)
+            return jpg_path.read_bytes()
+
+    def _attachment_pdf_downloader(self, recipient: str, subject: str, tag_values: dict[str, str]) -> Callable[[str], None]:
+        """Download PDF handler for an attachment preview: builds the PDF with
+        the same HTML -> Chromium JPG -> PDF pipeline as a real send
+        (_compose_attachment_paths), from the exact resolved HTML shown."""
+
+        def download(preview_html: str) -> None:
+            # Resolving again is a no-op on already-resolved HTML, and covers
+            # a Design-with-AI redesign that brought raw tags back in.
+            resolved_html = self._apply_tags_to_text(preview_html, recipient, subject, tag_values)
+            base_name = self._attachment_output_name_base(
+                recipient,
+                subject,
+                "PDF document",
+                getattr(self, "attach_file_name_mode", "auto"),
+                self._apply_tags_to_text(getattr(self, "attach_file_name_value", ""), recipient, subject, tag_values),
+                resolve_tags=False,
+            )
+            downloads_dir = Path.home() / "Downloads"
+            start_path = (downloads_dir if downloads_dir.is_dir() else Path.home()) / f"{base_name}.pdf"
+            file_path, _selected = QFileDialog.getSaveFileName(self.window(), "Download PDF", str(start_path), "PDF document (*.pdf)")
+            if not file_path:
+                return
+            output_path = Path(file_path)
+            if output_path.suffix.lower() != ".pdf":
+                output_path = output_path.with_suffix(".pdf")
+
+            def build() -> str:
+                with tempfile.TemporaryDirectory(prefix="ezymailer-pdf-") as temp_dir:
+                    jpg_path = Path(temp_dir) / "attachment.jpg"
+                    self._render_html_to_jpg(resolved_html, jpg_path)
+                    pdf_path = Path(temp_dir) / "attachment.pdf"
+                    self._export_jpg_to_format(jpg_path, "PDF document", pdf_path)
+                    shutil.copyfile(pdf_path, output_path)
+                return str(output_path)
+
+            task = _BackgroundTask(build, self)
+            self._pdf_download_tasks = getattr(self, "_pdf_download_tasks", [])
+            self._pdf_download_tasks.append(task)
+            self.notify("Generating PDF…")
+
+            def done(result: object, t: _BackgroundTask = task) -> None:
+                self._pdf_download_tasks.remove(t)
+                self._log_action(f"Downloaded attachment PDF: {result}")
+                self.notify(f"PDF saved: {Path(str(result)).name}")
+
+            def failed(message: str, t: _BackgroundTask = task) -> None:
+                self._pdf_download_tasks.remove(t)
+                self._log_action(f"PDF download failed: {message}")
+                QMessageBox.warning(self.window(), "Download PDF failed", message)
+
+            task.succeeded.connect(done)
+            task.failed.connect(failed)
+            task.start()
+
+        return download
 
     def _request_ai_html_design(self, html: str, instructions: str) -> str:
         if not self.state.ai_connected or not self.state.ai_api_key:
@@ -7933,15 +8184,16 @@ class DashboardPage(QWidget):
             widget.html_editor.setPlainText(new_html)
 
     def _preview_subject_body(self) -> None:
-        subject = self._apply_tags_to_text(self.subject_input.text().strip()) or "Subject Preview"
+        recipient, subject, tag_values = self._preview_tag_context()
+        subject = subject or "Subject Preview"
         current_body = self._current_body_widget()
         raw_html: str | None = None
         on_save: Callable[[str], None] | None = None
         if current_body is not None:
             body_payload = current_body.payload()
             if body_payload["mode"] == "HTML Message":
-                html_content = self._apply_tags_to_text(body_payload["html_text"].strip())
-                source = "Previewing the HTML message content."
+                html_content = self._apply_tags_to_text(body_payload["html_text"].strip(), recipient, subject, tag_values)
+                source = f"Previewing the HTML message content for {recipient}."
                 if not html_content:
                     html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML content available.</body></html>"
                 # Design with AI must edit the raw template (tags intact),
@@ -7950,8 +8202,8 @@ class DashboardPage(QWidget):
                 raw_html = body_payload["html_text"]
                 on_save = current_body.html_editor.setPlainText
             else:
-                body_text = self._apply_tags_to_text(body_payload["plain_text"].strip())
-                source = "Previewing the plain-text message as HTML."
+                body_text = self._apply_tags_to_text(body_payload["plain_text"].strip(), recipient, subject, tag_values)
+                source = f"Previewing the plain-text message as HTML for {recipient}."
                 if not body_text:
                     body_text = "No message body available."
                 html_content = self._wrap_text_as_html(body_text, subject)
@@ -7971,7 +8223,8 @@ class DashboardPage(QWidget):
             self.notify("Switch to HTML body first")
             return
 
-        html_content = self._apply_tags_to_text(widget.html_editor.toPlainText().strip())
+        recipient, subject, tag_values = self._preview_tag_context()
+        html_content = self._apply_tags_to_text(widget.html_editor.toPlainText().strip(), recipient, subject, tag_values)
         if not html_content:
             self.notify("Add HTML content first")
             return
@@ -7980,7 +8233,7 @@ class DashboardPage(QWidget):
         dialog = self._build_preview_dialog(
             title,
             html_content,
-            "Previewing the selected HTML body.",
+            f"Previewing the selected HTML body for {recipient}.",
             raw_html=widget.html_editor.toPlainText(),
             on_save=widget.html_editor.setPlainText,
         )
@@ -7992,25 +8245,30 @@ class DashboardPage(QWidget):
 
     def _preview_html_content(self, title: str = "HTML Preview") -> None:
         current_widget = self._current_attachment_widget()
+        recipient, subject, tag_values = self._preview_tag_context()
         html_content = ""
         raw_html: str | None = None
         on_save: Callable[[str], None] | None = None
+        on_download: Callable[[str], None] | None = None
         if current_widget is not None:
             raw_html = current_widget.content_html()
-            html_content = self._apply_tags_to_text(raw_html.strip())
+            html_content = self._apply_tags_to_text(raw_html.strip(), recipient, subject, tag_values)
             on_save = lambda new_html, w=current_widget: self._save_attachment_widget_html(w, new_html)
         elif hasattr(self, "html_editor") and isinstance(self.html_editor, QTextEdit):
             raw_html = self.html_editor.toPlainText()
-            html_content = self._apply_tags_to_text(raw_html.strip())
+            html_content = self._apply_tags_to_text(raw_html.strip(), recipient, subject, tag_values)
             on_save = self.html_editor.setPlainText
-        if not html_content:
+        if html_content:
+            on_download = self._attachment_pdf_downloader(recipient, subject, tag_values)
+        else:
             html_content = "<html><body style='background:#1e1e1e; color:#d4d4d4; font-family:Segoe UI;'>No HTML template available.</body></html>"
         dialog = self._build_preview_dialog(
             title,
             html_content,
-            "Previewing the HTML template in a separate window.",
+            f"Previewing the HTML template for {recipient}.",
             raw_html=raw_html,
             on_save=on_save,
+            on_download=on_download,
         )
         dialog.show()
         dialog.raise_()
@@ -13503,17 +13761,22 @@ class DashboardPage(QWidget):
         if widget is None:
             self.notify("No attachment content available")
             return
-        html_content = widget.content_html().strip()
-        if not html_content:
+        raw_html = widget.content_html().strip()
+        if not raw_html:
             self.notify("Add attachment content first")
             return
+        # Resolve every tag the way a real send does, so the preview (and
+        # its Download PDF) match the attachment a recipient receives.
+        recipient, subject, tag_values = self._preview_tag_context()
+        html_content = self._apply_tags_to_text(raw_html, recipient, subject, tag_values)
         title = widget.title_text() or "Attachment Content Preview"
         dialog = self._build_preview_dialog(
             title,
             html_content,
-            "Previewing the selected attachment content.",
-            raw_html=html_content,
+            f"Previewing the selected attachment content for {recipient}.",
+            raw_html=raw_html,
             on_save=lambda new_html, w=widget: self._save_attachment_widget_html(w, new_html),
+            on_download=self._attachment_pdf_downloader(recipient, subject, tag_values),
         )
         dialog.show()
         dialog.raise_()

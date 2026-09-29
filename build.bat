@@ -11,7 +11,7 @@ python -m pip install --upgrade pip || exit /b 1
 python -m pip install --requirement requirements.txt || exit /b 1
 python -m pip install pyinstaller || exit /b 1
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport main.py || exit /b 1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --add-data "packaging\assets\dictionary.txt.gz;assets" --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport main.py || exit /b 1
 
 if not exist "dist\EazyMailer.exe" (
     echo ERROR: dist\EazyMailer.exe was not generated.
