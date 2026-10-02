@@ -1,0 +1,13 @@
+@keyframes floatY { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-14px); } }
+@keyframes spinSlow { to { transform: rotate(360deg); } }
+@keyframes pulseGlow { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@keyframes gridMove { to { background-position: 0 64px; } }
+@keyframes scan { 0% { transform: translateY(-100%); } 100% { transform: translateY(400%); } }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes shimmer { to { background-position: 200% center; } }
+@keyframes fillBar { from { width: 0; } }
+@keyframes marquee { to { transform: translateX(-50%); } }
+
+.reveal { opacity: 0; transform: translateY(28px); transition: opacity .8s cubic-bezier(.2,.7,.2,1), transform .8s cubic-bezier(.2,.7,.2,1); }
+.reveal.is-visible { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; } }
