@@ -245,6 +245,7 @@ def _build_mime_message(
     body_text: str,
     html_body: str | None,
     attachment_paths: list[Path],
+    extra_headers: dict[str, str] | None = None,
 ) -> bytes:
     from email.utils import formataddr
 
@@ -252,6 +253,8 @@ def _build_mime_message(
     message["To"] = to
     message["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     message["Subject"] = subject
+    for header, value in (extra_headers or {}).items():
+        message[header] = value
 
     if html_body:
         alternative = MIMEMultipart("alternative")

@@ -40,7 +40,7 @@ import tempfile
 import errno
 from typing import Callable, Sequence
 
-from backend import gmail_oauth
+from backend import gmail_oauth, smtp_sender
 from backend.local_api import (
     API_BASE_URL,
     ensure_api_server,
@@ -155,6 +155,7 @@ LOCAL_PENDING_EMAILS_STATE_KEY = "pending_emails_state"
 LOCAL_TAG_STATE_KEY = "tag_state"
 LOCAL_CUSTOMER_VARIABLES_TABLE = "customer_variables"
 LOCAL_BROWSER_STATE_KEY = "browser_controls_state"
+SENDER_LIMIT_MAX = 100000
 LOCAL_SETTINGS_STATE_KEY = "sending_settings_state"
 LOCAL_DATA_TAB_SETTINGS_KEY = "data_tab_settings_state"
 GOOGLE_API_ACCOUNTS_DIR = LOCAL_CACHE_DIR / "api_accounts"
@@ -1421,6 +1422,18 @@ class AppState:
     browser_mode: str = "Incognito"
     sending_mode: str = "Manual"
     api_json_paths: list[str] = field(default_factory=list)
+    smtp_host: str = smtp_sender.DEFAULT_HOST
+    smtp_port: int = smtp_sender.DEFAULT_PORT
+    smtp_security: str = "Auto"
+    # [{"email", "password", "sender_name"}] — stays on this machine only.
+    smtp_credentials: list[dict[str, object]] = field(default_factory=list)
+    smtp_sender_name_mode: str = "Auto"
+    smtp_sender_name_custom: str = ""
+    smtp_test_email: str = ""
+    api_sender_name_mode: str = "Google account name"
+    api_sender_name_custom: str = ""
+    # Fixed "Auto" sender name per Gmail API account (keyed by lower-case email).
+    api_sender_names: dict[str, str] = field(default_factory=dict)
     window_count: int = 1
     tab_count: int = 1
     launch_preset: str = "Default"
@@ -1509,6 +1522,13 @@ class BrowserSessionHandle:
     send_completed: int = 0
     send_total: int = 0
     health_check_failures: int = 0
+    # Per-row campaign controls in Active Sessions — see QueueLaneWorker.
+    lane_state: str = "idle"
+    paused: bool = False
+    lane_taken: int = 0
+    halt_reason: str = ""
+    halt_status: str = ""
+    errors: list[tuple[str, str, str]] = field(default_factory=list, repr=False)
     fast_compose_sends: int = 0
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     connect_lock: FairThreadLock = field(default_factory=FairThreadLock, repr=False)
@@ -1570,6 +1590,14 @@ class ApiAccountHandle:
     fast_compose_sends: int = 0
     access_token: str = field(default="", repr=False)
     access_token_expires_at: float = field(default=0.0, repr=False)
+    # Per-row campaign controls in Active Sessions — see QueueLaneWorker.
+    lane_state: str = "idle"
+    paused: bool = False
+    lane_taken: int = 0
+    halt_reason: str = ""
+    halt_status: str = ""
+    errors: list[tuple[str, str, str]] = field(default_factory=list, repr=False)
+    sender_name: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # The visible "active session" browser window opened for this account's
     # sign-in confirmation (Start Browser). Sending itself never uses this —
@@ -1578,6 +1606,62 @@ class ApiAccountHandle:
 
     def is_alive(self) -> bool:
         return True
+
+
+@dataclass
+class SmtpAccountHandle:
+    """One SMTP credential, used as its own sending lane (no browser tab)."""
+
+    session_id: str
+    title: str
+    account_email: str
+    password: str = field(default="", repr=False)
+    mode: str = "SMTP"
+    browser_name: str = "SMTP"
+    # idle → (queued →) running → done. Stop on the row only pauses a
+    # running lane; a paused lane holds no recipients, so others keep going.
+    lane_state: str = "idle"
+    paused: bool = False
+    lane_taken: int = 0
+    tab_count: int = 1
+    send_completed: int = 0
+    send_total: int = 0
+    fast_compose_sends: int = 0
+    sender_name: str = ""
+    # Set when the server makes this lane unusable (bad login, daily limit).
+    halt_reason: str = ""
+    halt_status: str = ""
+    # (time, recipient, message) for every failed attempt in this campaign.
+    errors: list[tuple[str, str, str]] = field(default_factory=list, repr=False)
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    connection: object | None = field(default=None, repr=False)
+
+    @property
+    def status(self) -> str:
+        if self.halt_reason:
+            return self.halt_status or "Error"
+        if self.lane_state == "running":
+            return "Stopped" if self.paused else "Sending"
+        return {"queued": "Queued", "done": "Done"}.get(self.lane_state, "Ready")
+
+    def is_alive(self) -> bool:
+        return True
+
+
+class SmtpRecipientQueue:
+    """Recipients shared by every SMTP lane of one campaign; lanes pull one at a time."""
+
+    def __init__(self, recipients: list[str]):
+        self._items = list(reversed(recipients))
+        self._lock = threading.Lock()
+
+    def pop(self) -> str | None:
+        with self._lock:
+            return self._items.pop() if self._items else None
+
+    def remaining(self) -> int:
+        with self._lock:
+            return len(self._items)
 
 
 class ApiAccountPrepWorker(QObject):
@@ -2181,6 +2265,43 @@ class CampaignSendWorker(QObject):
             error_message,
         )
 
+class QueueLaneWorker(CampaignSendWorker):
+    """One sending lane that pulls recipients from the campaign's shared queue.
+
+    Every lane belongs to a row in Active Sessions — an SMTP credential, a
+    Gmail API account, or a browser window (each of its Gmail tabs is a
+    lane). Stop on the row pauses all its lanes; a paused lane holds no
+    recipients, so the other rows keep sending. A row stops taking
+    recipients at `lane_limit` (the Per-sender limit).
+    """
+
+    _taken_lock = threading.Lock()
+
+    def __init__(self, *args, shared_queue: SmtpRecipientQueue, lane_limit: int, row, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shared_queue = shared_queue
+        self.lane_limit = max(1, int(lane_limit))
+        self.row = row
+
+    def _iter_tasks(self):
+        row = self.row
+        while not self.cancel_event.is_set() and not row.halt_reason:
+            if row.paused:
+                # Nothing left for a paused lane to resume into: let it finish.
+                if self.shared_queue.remaining() == 0:
+                    return
+                time.sleep(0.1)
+                continue
+            with self._taken_lock:
+                if row.lane_taken >= self.lane_limit:
+                    return
+                recipient = self.shared_queue.pop()
+                if recipient is None:
+                    return
+                row.lane_taken += 1
+            yield self.task_factory(recipient)
+
+
 class AnimatedLogoBadge(QWidget):
     def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
@@ -2561,6 +2682,46 @@ class RobotLoaderBadge(QWidget):
         painter.drawLine(body.right() - 14, body.bottom() - 4, body.right() - 14, body.bottom() + 4)
 
 
+def _center_dialog_on_app_window(dialog: QWidget) -> None:
+    """Center a dialog/message box over the EzyMailer window (kept on screen).
+
+    Uses the top-level window's frame (global coordinates). A child widget's
+    own frameGeometry() is relative to its parent, which is why dialogs
+    opened from inside the dashboard used to land off-center.
+    """
+    parent = dialog.parentWidget()
+    anchor = parent.window() if parent is not None else None
+    if anchor is None or anchor is dialog or not anchor.isVisible():
+        application = QApplication.instance()
+        anchor = getattr(application, "main_window", None) or QApplication.activeWindow()
+    if anchor is None or anchor is dialog or not anchor.isVisible():
+        return
+    center = anchor.frameGeometry().center()
+    frame = dialog.frameGeometry()
+    x = center.x() - frame.width() // 2
+    y = center.y() - frame.height() // 2
+    screen = anchor.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        x = max(available.left(), min(x, available.right() - frame.width() + 1))
+        y = max(available.top(), min(y, available.bottom() - frame.height() + 1))
+    dialog.move(x, y)
+
+
+class _DialogCenterer(QObject):
+    """App-wide: every dialog and message box opens centered on the app window."""
+
+    def eventFilter(self, obj, event) -> bool:
+        if (
+            event.type() == QEvent.Show
+            and isinstance(obj, QDialog)
+            and obj.isWindow()
+            and not isinstance(obj, (LaunchLoaderDialog, QFileDialog))
+        ):
+            _center_dialog_on_app_window(obj)
+        return False
+
+
 class LaunchLoaderDialog(QDialog):
     def __init__(self, parent=None, scale: float = 1.0):
         super().__init__(parent)
@@ -2914,6 +3075,10 @@ class GmailApiAutomationDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+
+# Starter text of a new, untouched body tab (treated as empty by uploads).
+_DEFAULT_BODY_TEXT = "Hello {{first_name}},\n\nThis is a body message."
 
 
 class BodyDraftEditor(QWidget):
@@ -4009,14 +4174,8 @@ class OutputOptionsDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        parent = self.parentWidget()
-        if parent is not None:
-            self.adjustSize()
-            parent_center = parent.frameGeometry().center()
-            self.move(
-                parent_center.x() - self.width() // 2,
-                parent_center.y() - self.height() // 2,
-            )
+        self.adjustSize()
+        _center_dialog_on_app_window(self)
 
     def _dialog_card(self, title: str, options: list[str]) -> QFrame:
         card = QFrame()
@@ -4074,14 +4233,216 @@ class DataTabSettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        parent = self.parentWidget()
-        if parent is not None:
-            self.adjustSize()
-            parent_center = parent.frameGeometry().center()
-            self.move(
-                parent_center.x() - self.width() // 2,
-                parent_center.y() - self.height() // 2,
-            )
+        self.adjustSize()
+        _center_dialog_on_app_window(self)
+
+
+class SmtpTestDialog(QDialog):
+    """Send one test email from a single SMTP credential using the current setup."""
+
+    _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    def __init__(self, parent=None, scale: float = 1.0, account_email: str = "", test_email: str = "", send_fn=None):
+        super().__init__(parent)
+        self._scale = scale
+        self._send_fn = send_fn
+        self.setWindowTitle(f"Send test — {account_email}")
+        self.setModal(True)
+        self.setObjectName("outputDialog")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(14, scale), _scaled_int(14, scale), _scaled_int(14, scale), _scaled_int(14, scale))
+        layout.setSpacing(_scaled_int(10, scale))
+
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(_scaled_int(12, scale), _scaled_int(12, scale), _scaled_int(12, scale), _scaled_int(12, scale))
+        card_layout.setSpacing(_scaled_int(8, scale))
+        title = QLabel("SEND TEST EMAIL")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+        hint = QLabel(
+            f"Sends one email from {account_email} using the current setup: sender name, "
+            "subject, body and attachment (tags filled in)."
+        )
+        hint.setObjectName("sectionSubtitle")
+        hint.setWordWrap(True)
+        card_layout.addWidget(hint)
+        self.email_input = QLineEdit(test_email)
+        self.email_input.setPlaceholderText("Enter your email id")
+        self.email_input.returnPressed.connect(self._send)
+        card_layout.addWidget(self.email_input)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.status_label.setVisible(False)
+        card_layout.addWidget(self.status_label)
+        layout.addWidget(card)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        self.send_button = buttons.addButton("Send test", QDialogButtonBox.ActionRole)
+        self.send_button.setObjectName("primaryButton")
+        self.send_button.clicked.connect(self._send)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(_scaled_int(420, scale))
+
+    def _show_status(self, text: str, color: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color};")
+        self.status_label.setVisible(True)
+
+    def _send(self) -> None:
+        email = self.email_input.text().strip()
+        if not self._EMAIL.match(email):
+            self._show_status("Enter a valid email address.", "#f48771")
+            return
+        if self._send_fn is None:
+            return
+        self.send_button.setEnabled(False)
+        self.email_input.setEnabled(False)
+        self._show_status(f"Sending test email to {email}…", "#9e9e9e")
+        task = self._send_fn(email)
+        if task is None:
+            self.send_button.setEnabled(True)
+            self.email_input.setEnabled(True)
+            return
+        task.succeeded.connect(lambda name, e=email: self._finished(f"Test email sent to {e}" + (f" as \"{name}\"" if name else "") + ".", "#89d185"))
+        task.failed.connect(lambda message: self._finished(f"Test failed: {message}", "#f48771"))
+        task.start()
+
+    def _finished(self, text: str, color: str) -> None:
+        try:
+            self._show_status(text, color)
+            self.send_button.setEnabled(True)
+            self.email_input.setEnabled(True)
+        except RuntimeError:
+            pass  # dialog was closed before the send finished; the activity log has the result
+
+
+class SmtpErrorsDialog(QDialog):
+    """Every failed send attempt (and any lane-stopping error) for one SMTP credential."""
+
+    def __init__(self, parent=None, scale: float = 1.0, account: "SmtpAccountHandle | None" = None):
+        super().__init__(parent)
+        self._scale = scale
+        self.cleared = False
+        email = (getattr(account, "account_email", "") or getattr(account, "title", "")) if account is not None else ""
+        self.setWindowTitle(f"Errors — {email}")
+        self.setModal(True)
+        self.setObjectName("outputDialog")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(14, scale), _scaled_int(14, scale), _scaled_int(14, scale), _scaled_int(14, scale))
+        layout.setSpacing(_scaled_int(10, scale))
+
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(_scaled_int(12, scale), _scaled_int(12, scale), _scaled_int(12, scale), _scaled_int(12, scale))
+        card_layout.setSpacing(_scaled_int(8, scale))
+        title = QLabel("SENDING ERRORS")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+        summary = QLabel(email)
+        summary.setObjectName("sectionSubtitle")
+        summary.setWordWrap(True)
+        card_layout.addWidget(summary)
+        if account is not None and account.halt_reason:
+            halted = QLabel(f"Stopped sending: {account.halt_reason}")
+            halted.setWordWrap(True)
+            halted.setStyleSheet("color: #f48771;")
+            card_layout.addWidget(halted)
+        lines = [f"[{when}] {recipient}\n    {message}" for when, recipient, message in (account.errors if account else [])]
+        self.text = QPlainTextEdit("\n\n".join(lines) if lines else "No errors recorded.")
+        self.text.setReadOnly(True)
+        self.text.setMinimumSize(_scaled_int(520, scale), _scaled_int(260, scale))
+        card_layout.addWidget(self.text)
+        layout.addWidget(card)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        copy_button = buttons.addButton("Copy", QDialogButtonBox.ActionRole)
+        copy_button.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.text.toPlainText()))
+        clear_button = buttons.addButton("Clear errors", QDialogButtonBox.ResetRole)
+        clear_button.setEnabled(bool(lines))
+        clear_button.clicked.connect(self._clear)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _clear(self) -> None:
+        self.cleared = True
+        self.accept()
+
+
+class SmtpConnectionDialog(QDialog):
+    def __init__(self, parent=None, scale: float = 1.0, host: str = "", port: int = 587, security: str = "Auto"):
+        super().__init__(parent)
+        self._scale = scale
+        self.setWindowTitle("SMTP Connection")
+        self.setModal(True)
+        self.setObjectName("outputDialog")
+        self.host_input = QLineEdit(host)
+        self.host_input.setPlaceholderText(smtp_sender.DEFAULT_HOST)
+        self.host_input.setToolTip("SMTP server address, e.g. smtp.gmail.com")
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(int(port))
+        self.port_spin.setToolTip("587 for TLS (STARTTLS), 465 for SSL, 25 for plain")
+        self.security_combo = QComboBox()
+        self.security_combo.addItems(list(smtp_sender.SECURITY_OPTIONS))
+        self.security_combo.setCurrentText(security)
+        self.security_combo.setToolTip("Auto picks by port: 465 → SSL, 587 → TLS, others → TLS when available")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(_scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale), _scaled_int(14, self._scale))
+        layout.setSpacing(_scaled_int(10, self._scale))
+
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(_scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale), _scaled_int(12, self._scale))
+        card_layout.setSpacing(_scaled_int(8, self._scale))
+        title = QLabel("SMTP SERVER")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+        hint = QLabel("Every SMTP credential connects to this server when a campaign starts.")
+        hint.setObjectName("sectionSubtitle")
+        hint.setWordWrap(True)
+        card_layout.addWidget(hint)
+        form = QFormLayout()
+        form.setSpacing(_scaled_int(8, self._scale))
+        form.addRow("Server", self.host_input)
+        form.addRow("Port", self.port_spin)
+        form.addRow("Security", self.security_combo)
+        card_layout.addLayout(form)
+        layout.addWidget(card)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        defaults_button = buttons.addButton("Restore defaults", QDialogButtonBox.ResetRole)
+        defaults_button.setToolTip(f"{smtp_sender.DEFAULT_HOST} • {smtp_sender.DEFAULT_PORT} • Auto")
+        defaults_button.clicked.connect(self._restore_defaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(_scaled_int(380, self._scale))
+
+    def _restore_defaults(self) -> None:
+        self.host_input.setText(smtp_sender.DEFAULT_HOST)
+        self.port_spin.setValue(smtp_sender.DEFAULT_PORT)
+        self.security_combo.setCurrentText("Auto")
+
+    def values(self) -> tuple[str, int, str]:
+        return (
+            self.host_input.text().strip() or smtp_sender.DEFAULT_HOST,
+            int(self.port_spin.value()),
+            self.security_combo.currentText(),
+        )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.adjustSize()
+        _center_dialog_on_app_window(self)
 
 
 class FileFormatDialog(QDialog):
@@ -4739,18 +5100,12 @@ class HtmlPreviewDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        parent = self.parentWidget()
-        if parent is not None:
-            # No adjustSize() here: NativeWebPreviewWidget has no
-            # meaningful sizeHint of its own (it's a native NSView, not a
-            # normal Qt widget), so adjustSize() would shrink the whole
-            # dialog down to just its header — the explicit resize() in
-            # _build_ui is the real size we want; only centering happens here.
-            parent_center = parent.frameGeometry().center()
-            self.move(
-                parent_center.x() - self.width() // 2,
-                parent_center.y() - self.height() // 2,
-            )
+        # No adjustSize() here: NativeWebPreviewWidget has no meaningful
+        # sizeHint of its own (it's a native NSView, not a normal Qt widget),
+        # so adjustSize() would shrink the whole dialog down to just its
+        # header — the explicit resize() in _build_ui is the real size we
+        # want; only centering happens here.
+        _center_dialog_on_app_window(self)
 
 
 class LoginPage(QWidget):
@@ -4904,49 +5259,50 @@ class LoginPage(QWidget):
                         message = str(detail or message)
             except Exception:
                 pass
-            if retry_with_force:
-                reply = QMessageBox.question(
-                    self,
-                    "Logged in on another device",
-                    (
-                        f"{message}\n\n"
-                        "If you continue, the other device will be logged out, "
-                        "and this device will reload the campaign workspace from the dedicated database."
-                    ),
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    self._show_login_error("Login cancelled.")
-                    return
-                try:
-                    payload = api_login(
-                        username,
-                        password,
-                        timeout=15.0,
-                        device_fingerprint=_device_fingerprint(),
-                        device_name=_device_name(),
-                        force_logout_other_device=True,
-                    )
-                except urllib.error.HTTPError as retry_exc:
-                    retry_message = "The username or password is incorrect."
-                    try:
-                        retry_payload = json.loads(retry_exc.read().decode("utf-8"))
-                        detail = retry_payload.get("detail")
-                        if isinstance(detail, dict):
-                            retry_message = str(detail.get("error") or detail.get("message") or retry_message)
-                        else:
-                            retry_message = str(detail or retry_message)
-                    except Exception:
-                        pass
-                    self._show_login_error(retry_message)
-                    return
-                except Exception:
-                    self._show_login_error("Unable to reach the admin login API.", "Connection error")
-                    return
-            else:
+            if not retry_with_force:
                 self._show_login_error(message)
-            return
+                return
+            reply = QMessageBox.question(
+                self,
+                "Logged in on another device",
+                (
+                    f"{message}\n\n"
+                    "If you continue, the other device will be logged out, "
+                    "and this device will reload the campaign workspace from the dedicated database."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self._show_login_error("Login cancelled.")
+                return
+            try:
+                payload = api_login(
+                    username,
+                    password,
+                    timeout=15.0,
+                    device_fingerprint=_device_fingerprint(),
+                    device_name=_device_name(),
+                    force_logout_other_device=True,
+                )
+            except urllib.error.HTTPError as retry_exc:
+                retry_message = "The username or password is incorrect."
+                try:
+                    retry_payload = json.loads(retry_exc.read().decode("utf-8"))
+                    detail = retry_payload.get("detail")
+                    if isinstance(detail, dict):
+                        retry_message = str(detail.get("error") or detail.get("message") or retry_message)
+                    else:
+                        retry_message = str(detail or retry_message)
+                except Exception:
+                    pass
+                self._show_login_error(retry_message)
+                return
+            except Exception:
+                self._show_login_error("Unable to reach the admin login API.", "Connection error")
+                return
+            # The forced retry succeeded: fall through and open the
+            # workspace now instead of making the user click Sign In again.
         except Exception:
             self._show_login_error("Unable to reach the admin login API.", "Connection error")
             return
@@ -5208,6 +5564,8 @@ _TAG_SPANISH_SURNAMES: tuple[str, ...] = tuple(dict.fromkeys((
 # the fallback-on-missing-file behavior safe to call from any thread.
 @functools.lru_cache(maxsize=1)
 def _os_word_pool() -> tuple[str, ...]:
+    """$word12 / $word24: macOS's word list, or the bundled dictionary where
+    the OS has none (Windows) — same filter either way."""
     try:
         raw = Path("/usr/share/dict/words").read_text(encoding="utf-8", errors="ignore")
         words = [w.strip().lower() for w in raw.splitlines() if w.strip().isalpha() and 3 <= len(w.strip()) <= 10]
@@ -5215,15 +5573,17 @@ def _os_word_pool() -> tuple[str, ...]:
             return tuple(words)
     except Exception:
         pass
-    return _DYNAMIC_TAG_WORDLIST
+    bundled = tuple(
+        dict.fromkeys(w.lower() for w in _bundled_dictionary_words() if w.isalpha() and 3 <= len(w) <= 10)
+    )
+    return bundled if len(bundled) >= 1000 else _DYNAMIC_TAG_WORDLIST
 
 
 @functools.lru_cache(maxsize=1)
-def _dictionary_pool() -> tuple[str, ...]:
-    # $dictionary draws from a bundled 464k-entry English word list
-    # (dwyl/english-words, public domain), gzipped in packaging/assets and
-    # shipped via --add-data into the bundle's "assets" folder. Falls back to
-    # the OS dictionary if the file is somehow missing.
+def _bundled_dictionary_words() -> tuple[str, ...]:
+    # A bundled 464k-entry English word list (dwyl/english-words, public
+    # domain), gzipped in packaging/assets and shipped via --add-data into
+    # the bundle's "assets" folder. Empty if the file is somehow missing.
     candidates = [Path(__file__).resolve().parent / "packaging" / "assets" / "dictionary.txt.gz"]
     if getattr(sys, "frozen", False):
         candidates.insert(0, Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets" / "dictionary.txt.gz")
@@ -5235,11 +5595,52 @@ def _dictionary_pool() -> tuple[str, ...]:
                 return words
         except Exception:
             continue
-    return _os_word_pool()
+    return ()
 
 
 @functools.lru_cache(maxsize=1)
-def _os_first_name_pool() -> tuple[str, ...]:
+def _dictionary_pool() -> tuple[str, ...]:
+    # $dictionary: the bundled word list, or the OS one if the file is missing.
+    return _bundled_dictionary_words() or _os_word_pool()
+
+
+@functools.lru_cache(maxsize=1)
+def _bundled_names() -> dict[str, tuple[str, ...]]:
+    # $name / $fullname draw from a bundled list (packaging/assets/names.json.gz):
+    # 1,000 first names (US SSA baby names 1940-2008) x 1,000 surnames (US
+    # Census 2010), both public domain — one million combinations on every
+    # platform. Windows has no OS name list to fall back on.
+    candidates = [Path(__file__).resolve().parent / "packaging" / "assets" / "names.json.gz"]
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets" / "names.json.gz")
+    for candidate in candidates:
+        try:
+            with gzip.open(candidate, "rt", encoding="utf-8") as handle:
+                data = json.load(handle)
+            first = tuple(str(name) for name in data.get("first", []) if str(name).strip())
+            last = tuple(str(name) for name in data.get("last", []) if str(name).strip())
+            if len(first) >= 100 and len(last) >= 100:
+                return {"first": first, "last": last}
+        except Exception:
+            continue
+    return {}
+
+
+_TAG_EMAIL_DOMAINS: tuple[str, ...] = (
+    "gmail.com", "outlook.com", "yahoo.com", "hotmail.com", "icloud.com", "aol.com", "proton.me",
+)
+_TAG_URL_SUFFIXES: tuple[str, ...] = (".com", ".net", ".org", ".co", ".io")
+
+
+def _last_name_pool() -> tuple[str, ...]:
+    return _bundled_names().get("last") or _TAG_LAST_NAMES
+
+
+@functools.lru_cache(maxsize=1)
+def _first_name_pool() -> tuple[str, ...]:
+    bundled = _bundled_names().get("first")
+    if bundled:
+        return bundled
     try:
         raw = Path("/usr/share/dict/propernames").read_text(encoding="utf-8", errors="ignore")
         names = [n.strip() for n in raw.splitlines() if n.strip().isalpha()]
@@ -5269,6 +5670,19 @@ def _os_city_pool() -> tuple[str, ...]:
             return tuple(sorted(cities))
     except Exception:
         pass
+    # Windows has no system time zone database: use the same city list,
+    # generated from it on macOS and bundled in packaging/assets/cities.json.gz.
+    candidates = [Path(__file__).resolve().parent / "packaging" / "assets" / "cities.json.gz"]
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets" / "cities.json.gz")
+    for candidate in candidates:
+        try:
+            with gzip.open(candidate, "rt", encoding="utf-8") as handle:
+                bundled = tuple(str(city) for city in json.load(handle).get("cities", []) if str(city).strip())
+            if len(bundled) >= 50:
+                return bundled
+        except Exception:
+            continue
     return ("Seattle", "Austin", "Denver", "Miami", "Chennai", "Berlin")
 
 
@@ -5473,9 +5887,24 @@ class DashboardPage(QWidget):
         self.tab_spin = QSpinBox()
         self.sending_mode_manual_button = QPushButton("Manual")
         self.sending_mode_api_button = QPushButton("API JSON")
+        self.sending_mode_smtp_button = QPushButton("SMTP")
         self.api_json_section = QWidget()
+        self.smtp_section = QWidget()
+        self.smtp_settings_button = QPushButton("⚙")
+        self.smtp_connection_summary = QLabel("")
+        self.smtp_upload_button = QPushButton("Upload")
+        self.smtp_sample_button = QPushButton("Sample")
+        self.smtp_clear_button = QPushButton("Clear")
+        self.smtp_capacity_label = QLabel("")
+        self.smtp_limit_spin = QSpinBox()
+        self.api_limit_spin = QSpinBox()
+        self.manual_limit_spin = QSpinBox()
+        self.smtp_sender_name_combo = QComboBox()
+        self.smtp_sender_name_input = QLineEdit()
+        self._smtp_save_timer = QTimer(self)
+        self._smtp_save_timer.setSingleShot(True)
+        self._smtp_save_timer.setInterval(400)
         self.api_json_upload_button = QPushButton("Upload JSON")
-        self.api_json_status_label = QLabel("")
         self.incognito_button = QPushButton("Incognito")
         self.normal_button = QPushButton("Normal Mode")
         self.normal_message_button = QPushButton("Plain Text")
@@ -5559,6 +5988,19 @@ class DashboardPage(QWidget):
         self.fast_compose_checkbox = QCheckBox("Reuse one warm Gmail tab (faster, lower CPU)")
         self._campaign_threads: list[QThread] = []
         self._api_accounts: list[ApiAccountHandle] = []
+        self._smtp_accounts: list[SmtpAccountHandle] = []
+        # host/port/security frozen at Start Campaign; workers read only this.
+        self._smtp_campaign_config: dict[str, object] = {}
+        self._lane_queue: SmtpRecipientQueue | None = None
+        self._lane_task_factory: Callable[[str], dict[str, str]] | None = None
+        self._lane_name_pickers: dict[str, "_UniquePicker"] = {}
+        self._lane_taken_names: set[str] = set()
+        # lane (worker) id → its Active Sessions row, for the current campaign.
+        self._lane_row_of: dict[str, object] = {}
+        self._sender_names_dirty = False
+        self.api_sender_name_combo = QComboBox()
+        self.api_sender_name_input = QLineEdit()
+        self._smtp_test_tasks: list[_BackgroundTask] = []
         self._api_account_prep_thread: QThread | None = None
         self._api_account_prep_worker: ApiAccountPrepWorker | None = None
         self._campaign_workers: dict[str, CampaignSendWorker] = {}
@@ -5608,6 +6050,7 @@ class DashboardPage(QWidget):
         self._browser_watch_timer.setInterval(2000)
         self._browser_watch_timer.timeout.connect(self._sync_browser_session_states)
         self._pending_campaign_payload: dict[str, object] | None = None
+        self._first_uploaded_body: BodyDraftEditor | None = None
         self._subject_body_save_timer = QTimer(self)
         self._subject_body_save_timer.setSingleShot(True)
         self._subject_body_save_timer.setInterval(700)
@@ -5718,39 +6161,60 @@ class DashboardPage(QWidget):
         layout.setSpacing(_scaled_int(10, self._scale))
 
         sending_mode_card, sending_mode_layout = self._card("Sending Mode", "Choose how campaign emails are sent.")
-        self._configure_segmented_button(self.sending_mode_manual_button, checked=self.state.sending_mode != "API JSON")
+        self._configure_segmented_button(self.sending_mode_manual_button, checked=self.state.sending_mode == "Manual")
         self._configure_segmented_button(self.sending_mode_api_button, checked=self.state.sending_mode == "API JSON")
+        self._configure_segmented_button(self.sending_mode_smtp_button, checked=self.state.sending_mode == "SMTP")
         sending_mode_group = QButtonGroup(self)
         sending_mode_group.setExclusive(True)
         sending_mode_group.addButton(self.sending_mode_manual_button)
         sending_mode_group.addButton(self.sending_mode_api_button)
+        sending_mode_group.addButton(self.sending_mode_smtp_button)
         self.sending_mode_manual_button.clicked.connect(lambda: self._set_sending_mode("Manual"))
         self.sending_mode_api_button.clicked.connect(lambda: self._set_sending_mode("API JSON"))
+        self.sending_mode_smtp_button.clicked.connect(lambda: self._set_sending_mode("SMTP"))
         self.sending_mode_manual_button.setToolTip("Send by driving the Gmail compose UI in a browser window")
         self.sending_mode_api_button.setToolTip("Send through the Gmail API using uploaded account JSON credentials")
+        self.sending_mode_smtp_button.setToolTip("Send through an SMTP server using uploaded email + password credentials")
         sending_mode_row = QHBoxLayout()
         sending_mode_row.addWidget(self.sending_mode_manual_button)
         sending_mode_row.addWidget(self.sending_mode_api_button)
+        sending_mode_row.addWidget(self.sending_mode_smtp_button)
         sending_mode_layout.addLayout(sending_mode_row)
 
         api_json_layout = QVBoxLayout(self.api_json_section)
         api_json_layout.setContentsMargins(0, _scaled_int(8, self._scale), 0, 0)
         api_json_layout.setSpacing(_scaled_int(6, self._scale))
-        self.api_json_status_label.setObjectName("windowPill")
-        api_json_layout.addWidget(self.api_json_status_label)
         self.api_json_upload_button.setObjectName("secondaryButton")
         self.api_json_upload_button.setToolTip("Upload one Google account JSON credential per browser window")
         self.api_json_upload_button.clicked.connect(lambda: self._upload_api_json_credentials())
         self._apply_button_icon(self.api_json_upload_button, QStyle.SP_DialogOpenButton)
         api_json_layout.addWidget(self.api_json_upload_button)
-        api_json_hint = QLabel("Uploaded accounts appear below in Active Sessions — click Login to sign one in, or Start Browser to sign in all of them.")
-        api_json_hint.setObjectName("sectionHint")
-        api_json_hint.setWordWrap(True)
-        api_json_layout.addWidget(api_json_hint)
+        self.api_sender_name_combo.addItems(list(smtp_sender.API_SENDER_NAME_OPTIONS))
+        for index, option in enumerate(smtp_sender.API_SENDER_NAME_OPTIONS):
+            self.api_sender_name_combo.setItemData(index, smtp_sender.SENDER_NAME_TOOLTIPS[option], Qt.ToolTipRole)
+        self.api_sender_name_combo.setCurrentText(self.state.api_sender_name_mode)
+        self.api_sender_name_combo.setToolTip("Name shown as the sender for Gmail API emails")
+        self.api_sender_name_combo.currentTextChanged.connect(self._api_sender_settings_changed)
+        self._configure_limit_spin(self.api_limit_spin, "Maximum emails each sender sends in one campaign — the same value as Settings → Per-sender limit (per Gmail API account)")
+        api_json_layout.addWidget(self._labeled_value_row("Per sender limit", self.api_limit_spin))
+        api_json_layout.addWidget(self._labeled_value_row("Sender Name", self.api_sender_name_combo))
+        self.api_sender_name_input.setText(self.state.api_sender_name_custom)
+        self.api_sender_name_input.setPlaceholderText("Type a sender name")
+        self.api_sender_name_input.setToolTip("Used as the sender name for every Gmail API account")
+        self.api_sender_name_input.textChanged.connect(self._api_sender_settings_changed)
+        self.api_sender_name_input.setVisible(self.state.api_sender_name_mode == "Custom")
+        api_json_layout.addWidget(self.api_sender_name_input)
         self.api_json_section.setVisible(self.state.sending_mode == "API JSON")
         sending_mode_layout.addWidget(self.api_json_section)
 
+        smtp_section_layout = QVBoxLayout(self.smtp_section)
+        smtp_section_layout.setContentsMargins(0, 0, 0, 0)
+        smtp_section_layout.setSpacing(_scaled_int(10, self._scale))
+        smtp_section_layout.addWidget(self._build_smtp_connection_card())
+        smtp_section_layout.addWidget(self._build_smtp_credentials_card())
+
         launch_card, launch_layout = self._card("Browser Session Controls")
+        self.browser_session_card = launch_card
         self.window_spin.setRange(1, 99)
         self.window_spin.setValue(self.state.window_count)
         self.window_spin.setObjectName("windowSpin")
@@ -5788,6 +6252,8 @@ class DashboardPage(QWidget):
         windows_tabs_layout.setSpacing(_scaled_int(6, self._scale))
         windows_tabs_layout.addWidget(self._labeled_value_row("Windows", self.window_spin))
         windows_tabs_layout.addWidget(self._labeled_value_row("Tabs", self.tab_spin))
+        self._configure_limit_spin(self.manual_limit_spin, "Maximum emails each sender sends in one campaign — the same value as Settings → Per-sender limit (per browser window; its tabs share it)")
+        windows_tabs_layout.addWidget(self._labeled_value_row("Per sender limit", self.manual_limit_spin))
         self.windows_tabs_section.setVisible(self.state.sending_mode != "API JSON")
         launch_layout.addWidget(self.windows_tabs_section)
         launch_row.addWidget(launch_button)
@@ -5823,6 +6289,7 @@ class DashboardPage(QWidget):
         launch_layout.addLayout(preset_row)
 
         mode_card, mode_layout = self._card("Browser Mode", "Choose how sessions should open.")
+        self.browser_mode_card = mode_card
         mode_group = QButtonGroup(self)
         mode_group.setExclusive(True)
         self._configure_segmented_button(self.incognito_button, checked=True)
@@ -5841,16 +6308,127 @@ class DashboardPage(QWidget):
         mode_layout.addLayout(mode_row)
 
         sessions_card, sessions_layout = self._card("Active Sessions", "Open browser windows and their current state.")
+        self.sessions_subtitle_label = sessions_card.findChild(QLabel, "sectionSubtitle")
         self.session_list.setObjectName("sessionList")
         self.session_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         sessions_layout.addWidget(self.session_list)
 
+        # SMTP needs no browser, so its cards take the browser cards' place and
+        # Active Sessions grows into whatever height is left.
+        self.browser_controls_page = QWidget()
+        browser_controls_layout = QVBoxLayout(self.browser_controls_page)
+        browser_controls_layout.setContentsMargins(0, 0, 0, 0)
+        browser_controls_layout.setSpacing(layout.spacing())
+        browser_controls_layout.addWidget(launch_card)
+        browser_controls_layout.addWidget(mode_card)
+
         layout.addWidget(sending_mode_card)
-        layout.addWidget(launch_card)
-        layout.addWidget(mode_card)
+        layout.addWidget(self.smtp_section)
+        layout.addWidget(self.browser_controls_page)
         layout.addWidget(sessions_card, 2)
+        self._apply_sending_mode_visibility()
 
         return sidebar
+
+    def _build_smtp_connection_card(self) -> QWidget:
+        card, layout = self._card("")
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("SMTP Connection")
+        title.setObjectName("sectionTitle")
+        header_row.addWidget(title, 1)
+        self.smtp_settings_button.setObjectName("secondaryButton")
+        self.smtp_settings_button.setFixedWidth(_scaled_int(30, self._scale))
+        self.smtp_settings_button.setToolTip("SMTP server, port and security")
+        self.smtp_settings_button.setCursor(Qt.PointingHandCursor)
+        self.smtp_settings_button.clicked.connect(self._open_smtp_connection_settings)
+        header_row.addWidget(self.smtp_settings_button, 0, Qt.AlignTop)
+        layout.addLayout(header_row)
+        self.smtp_connection_summary.setObjectName("sectionSubtitle")
+        self.smtp_connection_summary.setWordWrap(True)
+        layout.addWidget(self.smtp_connection_summary)
+        self._smtp_save_timer.timeout.connect(self._persist_browser_state)
+        self._refresh_smtp_connection_summary()
+        return card
+
+    def _refresh_smtp_connection_summary(self) -> None:
+        self.smtp_connection_summary.setText(
+            f"{self.state.smtp_host}:{self.state.smtp_port} • {self.state.smtp_security}"
+        )
+
+    def _open_smtp_connection_settings(self) -> None:
+        if self._campaign_active:
+            self.notify("Wait for the campaign to finish before changing the SMTP server")
+            return
+        dialog = SmtpConnectionDialog(
+            self,
+            scale=self._scale,
+            host=self.state.smtp_host,
+            port=int(self.state.smtp_port),
+            security=self.state.smtp_security,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        host, port, security = dialog.values()
+        if (host, port, security) == (self.state.smtp_host, int(self.state.smtp_port), self.state.smtp_security):
+            return
+        self.state.smtp_host, self.state.smtp_port, self.state.smtp_security = host, port, security
+        self._refresh_smtp_connection_summary()
+        self._persist_browser_state()
+        self._log_action(f"SMTP server set to {host}:{port} ({security})")
+
+    def _build_smtp_credentials_card(self) -> QWidget:
+        card, layout = self._card("")
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("SMTP Credentials")
+        title.setObjectName("sectionTitle")
+        header_row.addWidget(title, 1)
+        self.smtp_sample_button.setFlat(True)
+        self.smtp_sample_button.setCursor(Qt.PointingHandCursor)
+        self.smtp_sample_button.setToolTip("Download a sample CSV showing the upload format (email, password)")
+        self.smtp_sample_button.setStyleSheet(
+            "QPushButton { background: transparent; border: none; padding: 0 2px; color: #4fa3ff; text-decoration: underline; }"
+            "QPushButton:hover { color: #7cbcff; }"
+        )
+        self.smtp_sample_button.clicked.connect(self._download_smtp_sample)
+        header_row.addWidget(self.smtp_sample_button, 0, Qt.AlignVCenter)
+        layout.addLayout(header_row)
+        self.smtp_capacity_label.setObjectName("sectionHint")
+        layout.addWidget(self.smtp_capacity_label)
+
+        buttons_row = QHBoxLayout()
+        self.smtp_upload_button.setObjectName("secondaryButton")
+        self.smtp_upload_button.setToolTip("Upload CSV or Excel (.xlsx, .xls) files with Email and Password columns")
+        self.smtp_upload_button.clicked.connect(lambda: self._upload_smtp_credentials())
+        self._apply_button_icon(self.smtp_upload_button, QStyle.SP_DialogOpenButton)
+        self.smtp_clear_button.setObjectName("secondaryButton")
+        self.smtp_clear_button.setToolTip("Remove every SMTP credential")
+        self.smtp_clear_button.clicked.connect(lambda: self._clear_smtp_credentials())
+        self._apply_button_icon(self.smtp_clear_button, QStyle.SP_BrowserReload)
+        buttons_row.addWidget(self.smtp_upload_button)
+        buttons_row.addWidget(self.smtp_clear_button)
+        layout.addLayout(buttons_row)
+
+        self._configure_limit_spin(self.smtp_limit_spin, "Maximum emails each sender sends in one campaign — the same value as Settings → Per-sender limit (per SMTP credential)")
+        layout.addWidget(self._labeled_value_row("Per sender limit", self.smtp_limit_spin))
+
+        self.smtp_sender_name_combo.addItems(list(smtp_sender.SENDER_NAME_OPTIONS))
+        for index, option in enumerate(smtp_sender.SENDER_NAME_OPTIONS):
+            self.smtp_sender_name_combo.setItemData(index, smtp_sender.SENDER_NAME_TOOLTIPS[option], Qt.ToolTipRole)
+        self.smtp_sender_name_combo.setCurrentText(self.state.smtp_sender_name_mode)
+        self.smtp_sender_name_combo.setToolTip(
+            "Name shown as the sender. Auto keeps one fixed random name per credential."
+        )
+        self.smtp_sender_name_combo.currentTextChanged.connect(self._smtp_settings_changed)
+        layout.addWidget(self._labeled_value_row("Sender Name", self.smtp_sender_name_combo))
+        self.smtp_sender_name_input.setText(self.state.smtp_sender_name_custom)
+        self.smtp_sender_name_input.setPlaceholderText("Type a sender name")
+        self.smtp_sender_name_input.setToolTip("Used as the sender name for every credential")
+        self.smtp_sender_name_input.textChanged.connect(self._smtp_settings_changed)
+        layout.addWidget(self.smtp_sender_name_input)
+        self._refresh_smtp_section()
+        return card
 
     def _build_content(self) -> QWidget:
         content = QFrame()
@@ -6145,7 +6723,7 @@ class DashboardPage(QWidget):
         send_card, send_layout = self._card("Sending Settings", "Tune the execution behavior for each sender.")
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
-        self.sender_limit.setRange(1, 5000)
+        self.sender_limit.setRange(1, SENDER_LIMIT_MAX)
         self.sender_limit.setValue(300)
         self.sender_limit.setObjectName("windowSpin")
         self.sender_limit.setToolTip("Set the maximum emails per sender")
@@ -6288,7 +6866,7 @@ class DashboardPage(QWidget):
         layout.addWidget(save_button, alignment=Qt.AlignLeft)
         layout.addStretch()
 
-        self.sender_limit.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
+        self.sender_limit.valueChanged.connect(self._sender_limit_changed)
         self.delay_from.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.delay_to.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
         self.retry_count.valueChanged.connect(lambda _value: self._schedule_sending_settings_save())
@@ -6481,6 +7059,7 @@ class DashboardPage(QWidget):
         _block(self.ai_api_key_input, lambda: self.ai_api_key_input.setText(ai_api_key))
 
         self.state.sender_limit = sender_limit
+        self._sender_limit_changed_quiet(sender_limit)
         self.state.delay_from = delay_from
         self.state.delay_to = delay_to
         self.state.retry_count = retry_count
@@ -7231,8 +7810,8 @@ class DashboardPage(QWidget):
             {"title": "0314", "token": "$day4", "description": "4 digit day code", "default_value": "0314"},
             {"title": "202608", "token": "$ym6", "description": "Year-month code", "default_value": "202608"},
             {"title": "94-221-88", "token": "$id9", "description": "Structured numeric token", "default_value": "94-221-88"},
-            {"title": "support@ezymailer.com", "token": "$email", "description": "Email address sample", "default_value": "support@ezymailer.com"},
-            {"title": "https://ezymailer.app", "token": "$url", "description": "Website URL sample", "default_value": "https://ezymailer.app"},
+            {"title": "jennifer.lopez42@outlook.com", "token": "$email", "description": "Random personal email address", "default_value": "jennifer.lopez42@outlook.com"},
+            {"title": "https://www.harmonbrooks.com", "token": "$url", "description": "Random website URL", "default_value": "https://www.harmonbrooks.com"},
             {"title": "Alice Johnson", "token": "$name", "description": "Full name sample", "default_value": "Alice Johnson"},
             {"title": "Seattle", "token": "$city", "description": "City sample", "default_value": "Seattle"},
             {"title": "hello-world", "token": "$slug", "description": "Slug sample", "default_value": "hello-world"},
@@ -7469,15 +8048,16 @@ class DashboardPage(QWidget):
         if token == "$phone":
             return f"1-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(3))}-{''.join(secrets.choice(string.digits) for _ in range(4))}"
         if token == "$email":
-            return f"support{secrets.randbelow(9000) + 1000}@ezymailer.com"
+            # first.last + 2 digits @ a common provider: 1,000 x 1,000 x 90 x 7 ≈ 630 million.
+            local = f"{secrets.choice(_first_name_pool())}.{secrets.choice(_last_name_pool())}".lower()
+            return f"{local}{secrets.randbelow(90) + 10}@{secrets.choice(_TAG_EMAIL_DOMAINS)}"
         if token == "$url":
-            return f"https://ezymailer-{secrets.randbelow(9000) + 1000}.app"
+            # Two common surnames read like a business name: 1,000 x 1,000 x 5 = 5 million.
+            first, second = (re.sub(r"[^a-z]", "", secrets.choice(_last_name_pool()).lower()) for _ in range(2))
+            return f"https://www.{first}{second}{secrets.choice(_TAG_URL_SUFFIXES)}"
         if token == "$name":
-            # First names come from macOS's own /usr/share/dict/propernames
-            # (over 1,300 real names) instead of a short hand-picked list —
-            # there's no equivalent OS-provided surname list, so last names
-            # still come from a small built-in set.
-            return f"{secrets.choice(_os_first_name_pool())} {secrets.choice(_TAG_LAST_NAMES)}"
+            # 1,000 bundled first names x 1,000 bundled surnames (see _bundled_names).
+            return f"{secrets.choice(_first_name_pool())} {secrets.choice(_last_name_pool())}"
         if token == "$city":
             return secrets.choice(_os_city_pool())
         if token == "$slug":
@@ -7504,7 +8084,7 @@ class DashboardPage(QWidget):
         if token == "$total":
             return secrets.choice(_TAG_TOTAL_LABELS)
         if token == "$fullname":
-            return f"{secrets.choice(_os_first_name_pool())} {secrets.choice(_TAG_LAST_NAMES)}"
+            return f"{secrets.choice(_first_name_pool())} {secrets.choice(_last_name_pool())}"
         if token == "$spanishname":
             return _spanish_full_name(secrets.choice(_spanish_name_pool()))
         if token == "$date":
@@ -7533,7 +8113,7 @@ class DashboardPage(QWidget):
         _UniquePicker for why. $name and $fullname share one first-name
         picker since they draw from the same pool.
         """
-        first_name_picker = _UniquePicker(_os_first_name_pool())
+        first_name_picker = _UniquePicker(_first_name_pool())
         return {
             "$name": first_name_picker,
             "$fullname": first_name_picker,
@@ -7558,7 +8138,7 @@ class DashboardPage(QWidget):
         token/uuid CSPRNG collisions are astronomically unlikely).
         """
         if token in ("$name", "$fullname"):
-            return f"{pickers[token].next()} {secrets.choice(_TAG_LAST_NAMES)}"
+            return f"{pickers[token].next()} {secrets.choice(_last_name_pool())}"
         if token == "$spanishname":
             return _spanish_full_name(pickers[token].next())
         if token in pickers:
@@ -7582,6 +8162,9 @@ class DashboardPage(QWidget):
             for key, value in samples_raw.items():
                 key_text = str(key).strip()
                 value_text = str(value).strip()
+                if "ezymailer" in value_text.lower():
+                    # Saved preview from before $email/$url stopped using our domains.
+                    value_text = self._generate_random_tag_value(key_text, "")
                 if key_text:
                     samples[key_text] = value_text
         self.custom1_input.blockSignals(True)
@@ -8319,32 +8902,60 @@ class DashboardPage(QWidget):
         return card
 
     def _has_active_session(self) -> bool:
-        return bool(self._browser_sessions) or bool(self._api_accounts)
+        return bool(self._browser_sessions) or bool(self._api_accounts) or self._campaign_active
 
     def _update_sending_mode_lock(self) -> None:
         locked = self._has_active_session()
-        self.sending_mode_manual_button.setEnabled(not locked)
-        self.sending_mode_api_button.setEnabled(not locked)
-        lock_tip = "End the active session (close browser windows / logout accounts) before switching sending mode"
-        self.sending_mode_manual_button.setToolTip(
-            lock_tip if locked else "Send by driving the Gmail compose UI in a browser window"
+        lock_tip = (
+            "Wait for the campaign to finish before switching sending mode"
+            if self._campaign_active
+            else "End the active session (close browser windows / logout accounts) before switching sending mode"
         )
-        self.sending_mode_api_button.setToolTip(
-            lock_tip if locked else "Send through the Gmail API using uploaded account JSON credentials"
-        )
+        for button, tip in (
+            (self.sending_mode_manual_button, "Send by driving the Gmail compose UI in a browser window"),
+            (self.sending_mode_api_button, "Send through the Gmail API using uploaded account JSON credentials"),
+            (self.sending_mode_smtp_button, "Send through an SMTP server using uploaded email + password credentials"),
+        ):
+            button.setEnabled(not locked)
+            button.setToolTip(lock_tip if locked else tip)
+
+    def _sync_sending_mode_buttons(self) -> None:
+        mode = self.state.sending_mode
+        self.sending_mode_manual_button.setChecked(mode == "Manual")
+        self.sending_mode_api_button.setChecked(mode == "API JSON")
+        self.sending_mode_smtp_button.setChecked(mode == "SMTP")
+
+    def _apply_sending_mode_visibility(self) -> None:
+        """SMTP needs no browser, so its cards replace the browser ones."""
+        mode = self.state.sending_mode
+        smtp = mode == "SMTP"
+        self.api_json_section.setVisible(mode == "API JSON")
+        controls_page = getattr(self, "browser_controls_page", None)
+        # Hide the outgoing cards first: showing both at once, even briefly,
+        # raises the sidebar minimum and the window grows to fit it.
+        outgoing, incoming = (controls_page, self.smtp_section) if smtp else (self.smtp_section, controls_page)
+        if outgoing is not None:
+            outgoing.setVisible(False)
+        if incoming is not None:
+            incoming.setVisible(True)
+        # Rows are sized to fit the list; never scroll sideways.
+        self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        subtitle = getattr(self, "sessions_subtitle_label", None)
+        if subtitle is not None:
+            subtitle.setText(
+                "SMTP credentials and their sending progress." if smtp else "Open browser windows and their current state."
+            )
 
     def _set_sending_mode(self, mode: str) -> None:
         if mode != self.state.sending_mode and self._has_active_session():
             # Revert the segmented buttons — the click already toggled them
             # before this handler ran.
-            self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
-            self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
+            self._sync_sending_mode_buttons()
             self.notify("End the active session before switching sending mode")
             return
         self.state.sending_mode = mode
-        self.sending_mode_manual_button.setChecked(mode != "API JSON")
-        self.sending_mode_api_button.setChecked(mode == "API JSON")
-        self.api_json_section.setVisible(mode == "API JSON")
+        self._sync_sending_mode_buttons()
+        self._apply_sending_mode_visibility()
         self._refresh_api_json_section()
         self._persist_browser_state()
         self._log_action(f"Sending mode set to {mode}")
@@ -8410,12 +9021,6 @@ class DashboardPage(QWidget):
             self.window_spin.setRange(1, 99)
 
     def _refresh_api_json_section(self) -> None:
-        count = len(self.state.api_json_paths)
-        if count:
-            noun = "account" if count == 1 else "accounts"
-            self.api_json_status_label.setText(f"{count} {noun} uploaded")
-        else:
-            self.api_json_status_label.setText("No JSON uploaded yet")
         self._apply_window_spin_limit()
         if hasattr(self, "windows_tabs_section"):
             self.windows_tabs_section.setVisible(self.state.sending_mode != "API JSON")
@@ -8512,6 +9117,16 @@ class DashboardPage(QWidget):
             "browser_mode": self.state.browser_mode,
             "sending_mode": self.state.sending_mode,
             "api_json_paths": list(self.state.api_json_paths),
+            "smtp_host": self.state.smtp_host,
+            "smtp_port": int(self.state.smtp_port),
+            "smtp_security": self.state.smtp_security,
+            "smtp_credentials": [dict(item) for item in self.state.smtp_credentials],
+            "smtp_sender_name_mode": self.state.smtp_sender_name_mode,
+            "smtp_sender_name_custom": self.state.smtp_sender_name_custom,
+            "smtp_test_email": self.state.smtp_test_email,
+            "api_sender_name_mode": self.state.api_sender_name_mode,
+            "api_sender_name_custom": self.state.api_sender_name_custom,
+            "api_sender_names": dict(self.state.api_sender_names),
             "launch_preset": self.state.launch_preset,
             "window_count": int(self.state.window_count),
             "tab_count": int(self.state.tab_count),
@@ -8535,19 +9150,461 @@ class DashboardPage(QWidget):
             tab_count = 1
 
         self.state.browser_mode = browser_mode if browser_mode in {"Incognito", "Normal"} else "Incognito"
-        self.state.sending_mode = sending_mode if sending_mode in {"Manual", "API JSON"} else "Manual"
+        self.state.sending_mode = sending_mode if sending_mode in {"Manual", "API JSON", "SMTP"} else "Manual"
         self.state.api_json_paths = self._discover_saved_api_accounts(api_json_paths)
         self.state.launch_preset = launch_preset
         self.state.window_count = window_count
         self.state.tab_count = tab_count
-        self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
-        self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
-        self.api_json_section.setVisible(self.state.sending_mode == "API JSON")
+        self._apply_smtp_state_payload(payload)
+        self._sync_sending_mode_buttons()
+        self._apply_sending_mode_visibility()
         self._refresh_api_json_section()
         for spin, value in ((self.window_spin, window_count), (self.tab_spin, tab_count)):
             spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(False)
+
+    def _apply_smtp_state_payload(self, payload: dict[str, object]) -> None:
+        self.state.smtp_host = str(payload.get("smtp_host") or smtp_sender.DEFAULT_HOST).strip() or smtp_sender.DEFAULT_HOST
+        try:
+            self.state.smtp_port = max(1, min(65535, int(payload.get("smtp_port") or smtp_sender.DEFAULT_PORT)))
+        except Exception:
+            self.state.smtp_port = smtp_sender.DEFAULT_PORT
+        security = str(payload.get("smtp_security") or "Auto")
+        self.state.smtp_security = security if security in smtp_sender.SECURITY_OPTIONS else "Auto"
+        name_mode = str(payload.get("smtp_sender_name_mode") or "Auto")
+        self.state.smtp_sender_name_mode = name_mode if name_mode in smtp_sender.SENDER_NAME_OPTIONS else "Auto"
+        self.state.smtp_sender_name_custom = str(payload.get("smtp_sender_name_custom") or "")
+        self.state.smtp_test_email = str(payload.get("smtp_test_email") or "")
+        api_mode = str(payload.get("api_sender_name_mode") or smtp_sender.ACCOUNT_SENDER_NAME)
+        self.state.api_sender_name_mode = api_mode if api_mode in smtp_sender.API_SENDER_NAME_OPTIONS else smtp_sender.ACCOUNT_SENDER_NAME
+        self.state.api_sender_name_custom = str(payload.get("api_sender_name_custom") or "")
+        raw_api_names = payload.get("api_sender_names") or {}
+        self.state.api_sender_names = (
+            {str(k).lower(): str(v) for k, v in raw_api_names.items() if v} if isinstance(raw_api_names, dict) else {}
+        )
+        for widget in (self.api_sender_name_combo, self.api_sender_name_input):
+            widget.blockSignals(True)
+        try:
+            self.api_sender_name_combo.setCurrentText(self.state.api_sender_name_mode)
+            self.api_sender_name_input.setText(self.state.api_sender_name_custom)
+        finally:
+            for widget in (self.api_sender_name_combo, self.api_sender_name_input):
+                widget.blockSignals(False)
+        self.api_sender_name_input.setVisible(self.state.api_sender_name_mode == "Custom")
+        raw_credentials = payload.get("smtp_credentials") or []
+        self.state.smtp_credentials = [
+            {
+                "email": str(item.get("email") or "").strip(),
+                "password": str(item.get("password") or ""),
+                # Fixed name for the "Auto" sender-name option, assigned on first send.
+                "sender_name": str(item.get("sender_name") or ""),
+            }
+            for item in (raw_credentials if isinstance(raw_credentials, list) else [])
+            if isinstance(item, dict) and str(item.get("email") or "").strip() and item.get("password")
+        ]
+        self._rebuild_smtp_accounts()
+        widgets = (
+            self.smtp_sender_name_combo,
+            self.smtp_sender_name_input,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.smtp_sender_name_combo.setCurrentText(self.state.smtp_sender_name_mode)
+            self.smtp_sender_name_input.setText(self.state.smtp_sender_name_custom)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self._refresh_smtp_connection_summary()
+        self._refresh_smtp_section()
+
+    def _smtp_settings_changed(self, *_args) -> None:
+        self.state.smtp_sender_name_mode = self.smtp_sender_name_combo.currentText()
+        self.state.smtp_sender_name_custom = self.smtp_sender_name_input.text().strip()
+        self._refresh_smtp_section()
+        # Debounced: typing a custom name shouldn't write the local DB per keystroke.
+        self._smtp_save_timer.start()
+
+    def _limit_spins(self) -> tuple[QSpinBox, ...]:
+        """Every "Per sender limit" control: the three sidebar ones + Settings."""
+        return (self.smtp_limit_spin, self.api_limit_spin, self.manual_limit_spin, self.sender_limit)
+
+    def _configure_limit_spin(self, spin: QSpinBox, tooltip: str) -> None:
+        spin.setRange(1, SENDER_LIMIT_MAX)
+        spin.setValue(int(self.state.sender_limit))
+        spin.setObjectName("windowSpin")
+        spin.setToolTip(tooltip)
+        spin.valueChanged.connect(self._sender_limit_changed)
+
+    def _sender_limit_changed(self, value: int) -> None:
+        """Keep every Per sender limit control on one value (Settings is the saved one)."""
+        value = max(1, int(value))
+        self.state.sender_limit = value
+        for spin in self._limit_spins():
+            if spin.value() != value:
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+        self._refresh_smtp_section()
+        self._schedule_sending_settings_save()
+
+    def _sender_limit_changed_quiet(self, value: int) -> None:
+        """Mirror a loaded Settings value into the sidebar controls without saving."""
+        for spin in (self.smtp_limit_spin, self.api_limit_spin, self.manual_limit_spin):
+            spin.blockSignals(True)
+            spin.setValue(max(1, int(value)))
+            spin.blockSignals(False)
+        self._refresh_smtp_section()
+
+    def _row_limit(self, row) -> int:
+        """Per-sender limit for one Active Sessions row (credential, account or window)."""
+        return max(1, int(self.state.sender_limit))
+
+    def _mode_limit(self) -> int:
+        return max(1, int(self.state.sender_limit))
+
+    def _api_sender_settings_changed(self, *_args) -> None:
+        self.state.api_sender_name_mode = self.api_sender_name_combo.currentText()
+        self.state.api_sender_name_custom = self.api_sender_name_input.text().strip()
+        self.api_sender_name_input.setVisible(self.state.api_sender_name_mode == "Custom")
+        self._smtp_save_timer.start()
+
+    def _refresh_smtp_section(self) -> None:
+        count = len(self.state.smtp_credentials)
+        if count:
+            noun = "credential" if count == 1 else "credentials"
+            capacity = count * int(self.state.sender_limit)
+            self.smtp_capacity_label.setText(f"{count} {noun} • up to {capacity} emails")
+        self.smtp_capacity_label.setVisible(bool(count))
+        self.smtp_clear_button.setEnabled(bool(count) and not self._campaign_active)
+        self.smtp_sender_name_input.setVisible(self.state.smtp_sender_name_mode == "Custom")
+
+    def _rebuild_smtp_accounts(self) -> None:
+        """Keep one SmtpAccountHandle per saved credential, preserving live ones."""
+        existing = {account.account_email.lower(): account for account in self._smtp_accounts}
+        accounts: list[SmtpAccountHandle] = []
+        for item in self.state.smtp_credentials:
+            email = str(item["email"])
+            account = existing.get(email.lower())
+            if account is None:
+                account = SmtpAccountHandle(session_id=f"smtp:{uuid.uuid4().hex[:10]}", title=email, account_email=email)
+            account.password = str(item["password"])
+            accounts.append(account)
+        self._smtp_accounts = accounts
+
+    def _upload_smtp_credentials(self) -> None:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload SMTP credentials",
+            "",
+            "Credential files (*.csv *.xlsx *.xls *.txt);;CSV files (*.csv);;Excel files (*.xlsx *.xls);;All files (*)",
+        )
+        if not file_paths:
+            return
+        index = {str(item["email"]).lower(): item for item in self.state.smtp_credentials}
+        added = updated = 0
+        for file_name in file_paths:
+            path = Path(file_name)
+            try:
+                parsed = smtp_sender.read_credentials_file(path)
+            except Exception as exc:
+                self._log_action(f"Could not read SMTP credential file {path.name}: {exc}")
+                continue
+            if not parsed:
+                self._log_action(f"No email + password rows found in {path.name}")
+            for email, password in parsed:
+                current = index.get(email.lower())
+                if current is None:
+                    current = {"email": email, "password": password, "sender_name": ""}
+                    self.state.smtp_credentials.append(current)
+                    index[email.lower()] = current
+                    added += 1
+                elif current["password"] != password:
+                    current["password"] = password
+                    updated += 1
+        if not (added or updated):
+            self.notify("No new SMTP credentials found — use the Sample file's Email, Password columns")
+            return
+        self._rebuild_smtp_accounts()
+        self._refresh_smtp_section()
+        self._refresh_sessions()
+        self._persist_browser_state()
+        message = f"Added {added} SMTP credential(s)" + (f", updated {updated}" if updated else "")
+        self._log_action(message)
+        self.notify(message)
+
+    def _download_smtp_sample(self) -> None:
+        default_path = Path.home() / "Downloads" / "smtp-credentials-sample.csv"
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save sample SMTP credentials file",
+            str(default_path),
+            "CSV files (*.csv)",
+        )
+        if not file_name:
+            return
+        path = Path(file_name)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+        try:
+            path.write_text(smtp_sender.SAMPLE_CREDENTIALS_CSV, encoding="utf-8")
+        except Exception as exc:
+            self.notify(f"Could not save the sample file: {exc}")
+            return
+        self._log_action(f"Saved sample SMTP credentials file to {path}")
+        self.notify(f"Sample saved: {path.name}")
+
+    def _remove_smtp_credential(self, email: str) -> None:
+        if self._campaign_active:
+            self.notify("Wait for the campaign to finish before removing credentials")
+            return
+        self.state.smtp_credentials = [
+            item for item in self.state.smtp_credentials if str(item["email"]).lower() != email.lower()
+        ]
+        self._rebuild_smtp_accounts()
+        self._refresh_smtp_section()
+        self._refresh_sessions()
+        self._persist_browser_state()
+        self._log_action(f"Removed SMTP credential {email}")
+
+    def _clear_smtp_credentials(self) -> None:
+        if self._campaign_active or not self.state.smtp_credentials:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear SMTP credentials",
+            f"Remove all {len(self.state.smtp_credentials)} SMTP credential(s)?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.state.smtp_credentials = []
+        self._rebuild_smtp_accounts()
+        self._refresh_smtp_section()
+        self._refresh_sessions()
+        self._persist_browser_state()
+        self._log_action("Cleared all SMTP credentials")
+
+    def _lane_rows(self) -> list:
+        """Active Sessions rows that can send in the current sending mode."""
+        mode = self.state.sending_mode
+        if mode == "SMTP":
+            return list(self._smtp_accounts)
+        if mode == "API JSON":
+            return list(self._api_accounts)
+        return list(self._browser_sessions)
+
+    @staticmethod
+    def _row_can_send(row) -> bool:
+        if isinstance(row, BrowserSessionHandle):
+            return row.debug_port is not None and row.status not in {"Starting", "Closed", "Stopped"}
+        return True
+
+    @staticmethod
+    def _row_name(row) -> str:
+        return getattr(row, "account_email", "") or row.title
+
+    def _lane_status(self, row) -> str:
+        if row.halt_reason:
+            return row.halt_status or "Error"
+        if row.lane_state == "running":
+            return "Stopped" if row.paused else "Sending"
+        if row.lane_state == "queued":
+            return "Queued"
+        if row.lane_state == "done":
+            # Every attempt failed: don't show it as a successful finish.
+            return "Failed" if row.errors and not row.send_completed else "Done"
+        if isinstance(row, BrowserSessionHandle):
+            return "Ready" if row.status == "Running" else row.status
+        return "Online" if isinstance(row, ApiAccountHandle) else "Ready"
+
+    def _lane_row_action(self, row) -> None:
+        """Start/Stop on one Active Sessions row.
+
+        Running → Stop pauses just this row. Otherwise Start sends from it
+        right away: it joins the running campaign, or starts a new one with
+        this row alone.
+        """
+        name = self._row_name(row)
+        if row.lane_state == "running":
+            row.paused = not row.paused
+            self._log_action(f"{'Stopped' if row.paused else 'Resumed'} {name}")
+        elif self._campaign_active:
+            queue = self._lane_queue
+            if queue is None:
+                self.notify("Wait for the current campaign to finish")
+                return
+            if row.halt_reason:
+                self.notify(f"{name}: {self._lane_status(row)} — check its error details")
+                return
+            if row.lane_state == "done":
+                self.notify(f"{name} already finished its share of this campaign")
+                return
+            if queue.remaining() == 0:
+                self.notify("No emails left to send in this campaign")
+                return
+            if row.lane_state == "queued":
+                self._start_queued_row_now(row)
+            else:
+                self._launch_row(row)
+            self._log_action(f"Started {name}")
+        else:
+            self._start_single_row(row)
+        self._refresh_sessions()
+
+    _smtp_row_action = _lane_row_action
+
+    def _start_queued_row_now(self, row) -> None:
+        jobs = [job for job in self._campaign_worker_queue if job.get("queue_lane", (None,))[0] is row]
+        self._campaign_worker_queue = [job for job in self._campaign_worker_queue if job not in jobs]
+        for job in jobs:
+            self._start_queue_lane_job(job)
+
+    def _open_row_test(self, row) -> None:
+        dialog = SmtpTestDialog(
+            self,
+            scale=self._scale,
+            account_email=self._row_name(row),
+            test_email=self.state.smtp_test_email,
+            send_fn=lambda email, r=row: self._start_row_test_send(r, email),
+        )
+        dialog.exec()
+
+    _open_smtp_test = _open_row_test
+
+    def _test_email_task(self, row, recipient: str) -> tuple[dict[str, str], list[str], str, bool]:
+        """The current subject/body/attachment for one test recipient (tags resolved)."""
+        payload = self._current_campaign_payload() or {}
+        subject_values = payload.get("subjects")
+        subject_template: str | list[str] = (
+            [str(item).strip() for item in subject_values if str(item).strip()] if isinstance(subject_values, list) else ""
+        ) or str(payload.get("subject") or "").strip()
+        body_mode = str(payload.get("body_mode") or "")
+        body_template = self._campaign_body_text(
+            str(payload.get("body_text") or ""), str(payload.get("body_html") or ""), body_mode
+        )
+        body_html_template = self._campaign_body_html(str(payload.get("body_html") or ""), body_mode)
+        if not subject_template:
+            subject_template = "EzyMailer test email"
+        if not body_template:
+            body_template = f"This is a test email from EzyMailer, sent by {self._row_name(row)}."
+        attachment_html = str(payload.get("attachment_html") or "").strip()
+        attachment_formats = self._normalize_attachment_format_values(
+            payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document"
+        )
+        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
+        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
+        task = self._campaign_task_factory(
+            subject_template, body_template, attachment_html, attachment_formats, file_name_value, body_html_template
+        )(recipient)
+        return task, attachment_formats, file_name_mode, bool(self.attach_convert_checkbox.isChecked())
+
+    def _start_row_test_send(self, row, recipient: str) -> "_BackgroundTask":
+        """Snapshot the current setup on the GUI thread, then send one test email off it."""
+        if recipient != self.state.smtp_test_email:
+            self.state.smtp_test_email = recipient
+            self._persist_browser_state()
+        task, attachment_formats, file_name_mode, convert_enabled = self._test_email_task(row, recipient)
+        sender_name = self._row_sender_name(row, self._build_campaign_unique_pickers(), self._taken_sender_names())
+        self._persist_sender_names_if_changed()
+
+        def build_attachments(temp_dir: Path) -> list[Path]:
+            if not task["attachment_html"].strip():
+                return []
+            return self._compose_attachment_paths(
+                recipient,
+                task["subject"],
+                task["attachment_html"],
+                attachment_formats,
+                file_name_mode,
+                task["file_name_value"],
+                convert_enabled,
+                already_resolved=True,
+                temp_dir=temp_dir,
+            )
+
+        if isinstance(row, SmtpAccountHandle):
+            host, port, security = self.state.smtp_host, int(self.state.smtp_port), self.state.smtp_security
+            email, password = row.account_email, row.password
+
+            def send() -> str:
+                temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-test-"))
+                try:
+                    attachment_paths = build_attachments(temp_dir)
+                    client = smtp_sender.connect(host, port, security, email, password)
+                    try:
+                        smtp_sender.send_message(
+                            client, email, recipient, task["subject"], task["body_text"],
+                            sender_name=sender_name, html_body=task.get("body_html") or None,
+                            attachment_paths=attachment_paths,
+                        )
+                    finally:
+                        smtp_sender.close(client)
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                return sender_name
+
+        elif isinstance(row, ApiAccountHandle):
+
+            def send() -> str:
+                temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-test-"))
+                try:
+                    attachment_paths = build_attachments(temp_dir)
+                    gmail_oauth.send_message(
+                        self._api_account_access_token(row), row.account_email, recipient,
+                        task["subject"], task["body_text"],
+                        sender_name=sender_name, html_body=task.get("body_html") or None,
+                        attachment_paths=attachment_paths,
+                    )
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                return sender_name
+
+        else:
+            tab = BrowserTabHandle(
+                session_id=f"{row.session_id}:test",
+                window_session_id=row.session_id,
+                title=f"{row.title} / Test",
+                mode=row.mode,
+                browser_name=row.browser_name,
+                debug_port=int(row.debug_port or 0),
+                tab_index=1,
+                connect_lock=row.connect_lock,
+            )
+
+            def send() -> str:
+                with tab.send_lock:
+                    self._send_compose_with_playwright(
+                        tab, recipient, task["subject"], task["body_text"], task["attachment_html"],
+                        attachment_formats, file_name_mode, task["file_name_value"], convert_enabled,
+                        True, False, body_html=task.get("body_html", ""),
+                    )
+                return ""  # Gmail's web compose always sends as the account's own name
+
+        background = _BackgroundTask(send, self)
+        self._smtp_test_tasks.append(background)
+        name = self._row_name(row)
+
+        def forget(*_args, t: _BackgroundTask = background) -> None:
+            if t in self._smtp_test_tasks:
+                self._smtp_test_tasks.remove(t)
+
+        background.succeeded.connect(lambda _n, r=recipient: (forget(), self._log_action(f"Test email sent from {name} to {r}")))
+        background.failed.connect(lambda message: (forget(), self._log_action(f"Test email from {name} failed: {message}")))
+        return background
+
+    _start_smtp_test_send = _start_row_test_send
+
+    def _show_row_errors(self, row) -> None:
+        dialog = SmtpErrorsDialog(self, scale=self._scale, account=row)
+        dialog.exec()
+        if dialog.cleared:
+            row.errors.clear()
+            self._refresh_sessions()
+
+    _show_smtp_errors = _show_row_errors
 
     def _load_browser_state(self) -> None:
         payload = _load_ui_state(LOCAL_BROWSER_STATE_KEY)
@@ -9142,6 +10199,23 @@ class DashboardPage(QWidget):
             missing.append("body content")
         return missing
 
+    _MISSING_FIELD_TABS = {
+        "customer emails": "Customer emails — add them in the Data tab",
+        "subject": "Subject — add one in the Subject + Body tab",
+        "body content": "Body — write one in the Subject + Body tab",
+    }
+
+    def _warn_missing_campaign_fields(self, missing: list[str]) -> None:
+        details = "\n".join(f"• {self._MISSING_FIELD_TABS.get(item, item)}" for item in missing)
+        QMessageBox.warning(
+            self,
+            "Missing campaign information",
+            f"Please add the following before sending:\n\n{details}",
+        )
+        joined = ", ".join(missing)
+        self.notify(f"Add {joined} before starting the campaign")
+        self._log_action(f"Campaign blocked: missing {joined}")
+
     def _refresh_campaign_action_state(self) -> None:
         self._update_campaign_action_state()
 
@@ -9283,7 +10357,9 @@ class DashboardPage(QWidget):
     def _update_campaign_action_state(self) -> None:
         runtime_busy = self._campaign_active or bool(self._campaign_threads)
         missing_fields = self._campaign_missing_fields()
-        can_start = self.state.logged_in and not runtime_busy and not missing_fields
+        # Missing fields don't disable the button: clicking it opens a dialog
+        # that says exactly what to fill in (a disabled button gives no feedback).
+        can_start = self.state.logged_in and not runtime_busy
         primary_label = "Start Campaign"
         if self._campaign_active:
             primary_label = "Resume Campaign" if self._campaign_paused else "Pause Campaign"
@@ -9307,6 +10383,21 @@ class DashboardPage(QWidget):
         self.campaign_cancel_button.setEnabled(self._campaign_active)
         self.campaign_reset_all_button.setEnabled(not runtime_busy)
         for control in (
+            self.sender_limit,
+            self.api_limit_spin,
+            self.manual_limit_spin,
+            self.api_sender_name_combo,
+            self.api_sender_name_input,
+            self.smtp_settings_button,
+            self.smtp_upload_button,
+            self.smtp_limit_spin,
+            self.smtp_sender_name_combo,
+            self.smtp_sender_name_input,
+        ):
+            control.setEnabled(not runtime_busy)
+        self._refresh_smtp_section()
+        self._update_sending_mode_lock()
+        for control in (
             getattr(self, "data_load_button", None),
             getattr(self, "data_clear_button", None),
             getattr(self, "data_validate_button", None),
@@ -9319,42 +10410,6 @@ class DashboardPage(QWidget):
             self.campaign_progress_text.setText(f"{self._campaign_completed} / {self._campaign_total} sent • {remaining} remaining")
         else:
             self.campaign_progress_text.setText("0 / 0 sent")
-
-    def _chunk_campaign_recipients(self, recipients: list[str], window_count: int, sender_limit: int) -> list[list[str]]:
-        if not recipients or window_count <= 0:
-            return []
-        total = len(recipients)
-        chunks: list[list[str]] = []
-        index = 0
-        base, remainder = divmod(total, window_count)
-        for window_index in range(window_count):
-            size = base + (1 if window_index < remainder else 0)
-            if size <= 0:
-                continue
-            next_index = min(total, index + size)
-            chunks.append(recipients[index:next_index])
-            index = next_index
-        return chunks
-
-    def _campaign_tab_lanes(self, sessions: list[BrowserSessionHandle]) -> list[BrowserTabHandle]:
-        lanes: list[BrowserTabHandle] = []
-        for window_index, session in enumerate(sessions, start=1):
-            if session.debug_port is None:
-                continue
-            for tab_index in range(1, max(1, int(session.tab_count)) + 1):
-                lanes.append(
-                    BrowserTabHandle(
-                        session_id=f"{session.session_id}:tab:{tab_index}",
-                        window_session_id=session.session_id,
-                        title=f"Window {window_index} / Tab {tab_index}",
-                        mode=session.mode,
-                        browser_name=session.browser_name,
-                        debug_port=session.debug_port,
-                        tab_index=tab_index,
-                        connect_lock=session.connect_lock,
-                    )
-                )
-        return lanes
 
     def _campaign_task_factory(
         self,
@@ -9446,60 +10501,9 @@ class DashboardPage(QWidget):
 
         return build_task
 
-    def _build_campaign_jobs(
-        self,
-        sessions: list[BrowserSessionHandle | BrowserTabHandle],
-        recipients: list[str],
-        subject_template: str | list[str],
-        body_template: str,
-        attachment_html: str,
-        attachment_formats: list[str],
-        file_name_mode: str,
-        file_name_value: str,
-        body_html_template: str = "",
-    ) -> list[dict[str, object]]:
-        chunks = self._chunk_campaign_recipients(
-            recipients,
-            len(sessions),
-            max(1, int(getattr(self.state, "sender_limit", 300))),
-        )
-        queue_dir = Path(tempfile.mkdtemp(prefix="ezymailer-campaign-"))
-        self._campaign_queue_dir = queue_dir
-        task_factory = self._campaign_task_factory(
-            subject_template,
-            body_template,
-            attachment_html,
-            attachment_formats,
-            file_name_value,
-            body_html_template,
-        )
-        jobs: list[dict[str, object]] = []
-        for index, (session, chunk) in enumerate(zip(sessions, chunks), start=1):
-            window_label = session.title
-            queue_path = queue_dir / f"lane-{index}.txt"
-            with queue_path.open("w", encoding="utf-8", newline="\n") as queue_file:
-                for recipient in chunk:
-                    queue_file.write(f"{recipient}\n")
-            jobs.append(
-                {
-                    "session": session,
-                    "window_label": window_label,
-                    "recipient_queue_path": queue_path,
-                    "task_factory": task_factory,
-                    "task_total": len(chunk),
-                }
-            )
-            parent_id = (
-                session.window_session_id
-                if isinstance(session, BrowserTabHandle)
-                else session.session_id
-            )
-            self._campaign_lane_parents[session.session_id] = parent_id
-        return jobs
-
     def _queue_campaign_job(self, job: dict[str, object]) -> None:
         session = job["session"]
-        if isinstance(session, (BrowserSessionHandle, ApiAccountHandle)):
+        if isinstance(session, (BrowserSessionHandle, ApiAccountHandle, SmtpAccountHandle)):
             session.send_completed = 0
             session.send_total = int(job["task_total"])
         lane_id = str(session.session_id)
@@ -9508,10 +10512,16 @@ class DashboardPage(QWidget):
         self._refresh_window_campaign_counts(refresh_ui=False)
         self._schedule_campaign_runtime_ui_refresh()
         thread = QThread(self)
-        send_callback = (
-            self._send_via_gmail_api if isinstance(session, ApiAccountHandle) else self._send_compose_with_playwright
-        )
-        worker = CampaignSendWorker(
+        if "send_callback" in job:
+            send_callback = job["send_callback"]
+        elif isinstance(session, SmtpAccountHandle):
+            send_callback = self._send_via_smtp
+        elif isinstance(session, ApiAccountHandle):
+            send_callback = self._send_via_gmail_api
+        else:
+            send_callback = self._send_compose_with_playwright
+        worker_cls = job.get("worker_cls", CampaignSendWorker)
+        worker = worker_cls(
             session,
             None,
             self._campaign_pause_event,
@@ -9535,6 +10545,8 @@ class DashboardPage(QWidget):
             ),
             file_name_mode=str(self._pending_campaign_payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto"),
             window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
+            cleanup_callback=self._finish_smtp_lane if isinstance(session, SmtpAccountHandle) else None,
+            **job.get("worker_kwargs", {}),
         )
         worker.moveToThread(thread)
         # Start the bootstrap worker directly on the QThread. This avoids the
@@ -9569,7 +10581,7 @@ class DashboardPage(QWidget):
         self._update_campaign_action_state()
 
     def _refresh_window_campaign_counts(self, *, refresh_ui: bool = True) -> None:
-        for session in (*self._browser_sessions, *self._api_accounts):
+        for session in (*self._browser_sessions, *self._api_accounts, *self._smtp_accounts):
             lane_ids = [
                 lane_id
                 for lane_id, parent_id in self._campaign_lane_parents.items()
@@ -9601,6 +10613,9 @@ class DashboardPage(QWidget):
         if not self._campaign_worker_queue:
             return
         job = self._campaign_worker_queue.pop(0)
+        if "queue_lane" in job:
+            self._start_queue_lane_job(job)
+            return
         self._queue_campaign_job(job)
 
     def _on_campaign_worker_progress(self, session_id: str, window_label: str, completed: int, total: int) -> None:
@@ -9621,6 +10636,17 @@ class DashboardPage(QWidget):
         self._campaign_worker_progress.clear()
         self._campaign_worker_totals.clear()
         self._campaign_lane_parents.clear()
+        lane_queue = self._lane_queue
+        self._lane_queue = None
+        if lane_queue is not None:
+            for row in (*self._smtp_accounts, *self._api_accounts, *self._browser_sessions):
+                row.paused = False
+                if row.lane_state != "done":
+                    row.lane_state = "idle"
+            left = lane_queue.remaining()
+            if message and left and not cancelled:
+                message = f"{message} • {left} left in the customer list"
+            self._refresh_sessions()
         if cancelled:
             self.notify("Campaign cancelled")
             self._log_action("Campaign cancelled")
@@ -9684,6 +10710,15 @@ class DashboardPage(QWidget):
         # Keep the Python worker wrapper alive until its QThread has fully
         # stopped. Dropping it here can deadlock with Qt's signal teardown.
         self._campaign_running_workers.discard(session_id)
+        row = self._lane_row_of.get(session_id)
+        if row is not None:
+            row_busy = any(self._lane_row_of.get(lane_id) is row for lane_id in self._campaign_running_workers) or any(
+                job.get("queue_lane", (None,))[0] is row for job in self._campaign_worker_queue
+            )
+            if not row_busy:
+                row.paused = False
+                stopped_early = (self._campaign_cancel_event.is_set() or cancelled) and not row.halt_reason
+                row.lane_state = "idle" if stopped_early else "done"
         self._campaign_worker_progress[session_id] = completed
         self._campaign_worker_totals[session_id] = total
         self._refresh_window_campaign_counts(refresh_ui=False)
@@ -9695,7 +10730,9 @@ class DashboardPage(QWidget):
             if not self._campaign_running_workers:
                 self._finish_campaign_runtime(cancelled=True)
             return
-        if self.state.window_send_mode == "Sequential" and self._campaign_worker_queue and not self._campaign_paused:
+        # Jobs are only ever queued by a Sequential start; keep draining them even
+        # if the send-mode setting was changed while the campaign was running.
+        if self._campaign_worker_queue and not self._campaign_paused:
             self._start_next_campaign_worker()
         elif not self._campaign_running_workers and not self._campaign_worker_queue:
             self._append_campaign_send_log(f"[{QDateTime.currentDateTime().toString('hh:mm:ss')}] Campaign complete")
@@ -9715,7 +10752,7 @@ class DashboardPage(QWidget):
             self._campaign_pause_event.set()
             self._update_campaign_action_state()
             self._log_action("Campaign resumed")
-            if self.state.window_send_mode == "Sequential" and not self._campaign_running_workers and self._campaign_worker_queue:
+            if not self._campaign_running_workers and self._campaign_worker_queue:
                 self._start_next_campaign_worker()
             return
         self._campaign_paused = True
@@ -9755,118 +10792,6 @@ class DashboardPage(QWidget):
                 continue
         return False
 
-    def _begin_campaign_send(self, payload: dict[str, object]) -> None:
-        if self._campaign_active:
-            self.notify("Campaign is already running")
-            return
-
-        # Snapshot this performance-critical switch directly from the UI so a
-        # campaign started immediately after toggling it does not wait for the
-        # settings autosave timer.
-        self.state.automatic_no_delay = self.automatic_send_checkbox.isChecked()
-
-        # Old temporary output is deleted in the background; recursive disk
-        # cleanup must never delay the Start button.
-        self._cleanup_campaign_temp_files_async()
-        if self._temp_storage_available() < 256 * 1024 * 1024:
-            self.notify("Please free some storage space before starting")
-            self._log_action("Campaign blocked: not enough free storage space")
-            return
-
-        recipients_raw = payload.get("recipients") or []
-        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
-        if not recipients:
-            self.notify("Add customer emails before starting the campaign")
-            self._log_action("Campaign blocked: no recipients available")
-            return
-
-        subject_values = payload.get("subjects")
-        subject_template: str | list[str]
-        if isinstance(subject_values, list):
-            subject_template = [str(item).strip() for item in subject_values if str(item).strip()]
-        else:
-            subject_template = str(payload.get("subject") or "").strip()
-        if not subject_template:
-            subject_template = str(payload.get("subject") or "").strip()
-        body_mode = str(payload.get("body_mode") or "")
-        body_template = self._campaign_body_text(
-            str(payload.get("body_text") or ""), str(payload.get("body_html") or ""), body_mode
-        )
-        body_html_template = self._campaign_body_html(str(payload.get("body_html") or ""), body_mode)
-        if not body_template:
-            self.notify("Add body content before starting the campaign")
-            self._log_action("Campaign blocked: no body content available")
-            return
-
-        attachment_html = str(payload.get("attachment_html") or "").strip()
-        attachment_formats = self._normalize_attachment_format_values(
-            payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document"
-        )
-        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
-        file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
-
-        sessions = self._usable_browser_sessions()
-        if not sessions:
-            self.notify("Open browser windows first")
-            self._log_action("Campaign blocked: no browser windows available")
-            return
-
-        ordered_recipients = list(recipients)
-        if self.state.email_send_order == "Random shuffle":
-            random.shuffle(ordered_recipients)
-
-        total = len(ordered_recipients)
-        lanes = self._campaign_tab_lanes(sessions)
-        lane_count = min(len(lanes), total)
-        self._pending_campaign_payload = payload
-        self._campaign_send_log_entries.clear()
-        self._campaign_pause_event.set()
-        self._campaign_cancel_event.clear()
-        self._campaign_active = True
-        session_timer = getattr(self.window(), "_session_check_timer", None)
-        if session_timer is not None:
-            session_timer.stop()
-        self._campaign_paused = False
-        self._campaign_total = total
-        self._campaign_completed = 0
-        self._campaign_worker_queue = []
-        self._campaign_running_workers.clear()
-        self._campaign_worker_progress.clear()
-        self._campaign_worker_totals.clear()
-        self._campaign_lane_parents.clear()
-        self.progress_bar.setValue(0)
-        self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
-        self._update_campaign_action_state()
-
-        jobs = self._build_campaign_jobs(
-            lanes[:lane_count],
-            ordered_recipients,
-            subject_template,
-            body_template,
-            attachment_html,
-            attachment_formats,
-            file_name_mode,
-            file_name_value,
-            body_html_template=body_html_template,
-        )
-        self._campaign_worker_queue = list(jobs)
-        self._log_action(
-            f"Campaign ready for {total} recipient(s) using {lane_count} tab(s) "
-            f"across {len(sessions)} browser window(s)"
-        )
-        self.notify("Sending campaign")
-        # The Campaign tab already exposes the progress bar and sent/remaining
-        # count. Keep the workspace visible while workers are running.
-        self.window().hide_launch_loader()
-
-        if self.state.window_send_mode == "Sequential":
-            self._start_next_campaign_worker()
-        else:
-            queue = list(self._campaign_worker_queue)
-            self._campaign_worker_queue.clear()
-            for job in queue:
-                self._queue_campaign_job(job)
-
     def _start_blast(self) -> None:
         if not self.state.logged_in:
             self.notify("Sign in first to start a campaign")
@@ -9875,15 +10800,12 @@ class DashboardPage(QWidget):
         payload = self._current_campaign_payload()
         missing = self._campaign_missing_fields(payload)
         if missing:
-            joined = ", ".join(missing)
-            QMessageBox.warning(
-                self,
-                "Missing campaign fields",
-                f"Please complete these fields before starting the campaign:\n\n- " + "\n- ".join(missing),
-            )
-            self.notify(f"Add {joined} before starting the campaign")
-            self._log_action(f"Campaign blocked: missing {joined}")
+            self._warn_missing_campaign_fields(missing)
             self._refresh_campaign_action_state()
+            return
+
+        if self.state.sending_mode == "SMTP":
+            self._start_queue_campaign(payload)
             return
 
         if self.state.sending_mode == "API JSON":
@@ -9892,7 +10814,7 @@ class DashboardPage(QWidget):
                 self._pending_campaign_payload = payload
                 self._handle_launch()
                 return
-            self._execute_api_json_campaign_send(payload, self._api_accounts)
+            self._start_queue_campaign(payload)
             return
 
         # The Start Campaign button is the user's explicit confirmation.
@@ -9904,7 +10826,7 @@ class DashboardPage(QWidget):
             self._handle_launch()
             return
 
-        self._execute_campaign_send(payload)
+        self._start_queue_campaign(payload)
 
     def _on_api_account_prep_thread_finished(self) -> None:
         self._api_account_prep_thread = None
@@ -9924,7 +10846,7 @@ class DashboardPage(QWidget):
         self._refresh_sessions()
         self._log_action(f"{len(accounts)} Gmail API account(s) ready")
         if pending_payload is not None:
-            self._execute_api_json_campaign_send(pending_payload, self._api_accounts)
+            self._start_queue_campaign(pending_payload)
         else:
             self.notify(f"{len(accounts)} Gmail API account(s) ready to send")
 
@@ -9945,25 +10867,158 @@ class DashboardPage(QWidget):
         self._persist_browser_state()
         self._log_action(f"{account.account_email or account.title} is online")
 
-    def _execute_api_json_campaign_send(self, payload: dict[str, object], accounts: list[ApiAccountHandle]) -> None:
+    def _smtp_credential_item(self, email: str) -> dict[str, object] | None:
+        for item in self.state.smtp_credentials:
+            if str(item["email"]).lower() == email.lower():
+                return item
+        return None
+
+    def _taken_sender_names(self) -> set[str]:
+        names = {str(item.get("sender_name")) for item in self.state.smtp_credentials if item.get("sender_name")}
+        names |= {name for name in self.state.api_sender_names.values() if name}
+        return names
+
+    def _row_sender_name(self, row, pickers: dict[str, "_UniquePicker"], taken: set[str]) -> str:
+        """Sender name for one row for this campaign (or test).
+
+        "Auto" gives each SMTP credential / API account one random name the
+        first time it sends and keeps it for every later campaign; the other
+        tag options pick a fresh name each time. Browser (Manual) sending
+        always uses the Gmail account's own name.
+        """
+        if isinstance(row, SmtpAccountHandle):
+            mode, custom, default = self.state.smtp_sender_name_mode, self.state.smtp_sender_name_custom, ""
+            item = self._smtp_credential_item(row.account_email)
+
+            def get_fixed() -> str:
+                return str(item.get("sender_name") or "") if item is not None else ""
+
+            def set_fixed(value: str) -> None:
+                if item is not None:
+                    item["sender_name"] = value
+
+        elif isinstance(row, ApiAccountHandle):
+            mode, custom, default = self.state.api_sender_name_mode, self.state.api_sender_name_custom, row.display_name
+            key = row.account_email.lower()
+
+            def get_fixed() -> str:
+                return self.state.api_sender_names.get(key, "")
+
+            def set_fixed(value: str) -> None:
+                self.state.api_sender_names[key] = value
+
+        else:
+            return ""
+        if mode == "Custom":
+            return custom.strip()
+        if mode == smtp_sender.ACCOUNT_SENDER_NAME:
+            return default
+        if mode == "Auto":
+            fixed = get_fixed()
+            if not fixed:
+                for _ in range(25):
+                    fixed = self._generate_campaign_tag_value("$fullname", "", pickers)
+                    if fixed not in taken:
+                        break
+                taken.add(fixed)
+                set_fixed(fixed)
+                self._sender_names_dirty = True
+            return fixed
+        token = "$spanishname" if mode == "$spanishname" else "$fullname"
+        return self._generate_campaign_tag_value(token, "", pickers)
+
+    def _persist_sender_names_if_changed(self) -> None:
+        if self._sender_names_dirty:
+            self._sender_names_dirty = False
+            self._persist_browser_state()
+
+    def _start_queue_campaign(self, payload: dict[str, object]) -> None:
+        """Start Campaign: every row of the current mode starts sending from one shared queue."""
         if self._campaign_active:
             self.notify("Campaign is already running")
             return
+        rows = [row for row in self._lane_rows() if self._row_can_send(row)]
+        if not rows:
+            message = {
+                "SMTP": "Upload SMTP credentials before starting the campaign",
+                "API JSON": "No Gmail API accounts are ready",
+            }.get(self.state.sending_mode, "Open browser windows first")
+            self.notify(message)
+            self._log_action(f"Campaign blocked: {message[0].lower()}{message[1:]}")
+            return
+        limit = self._mode_limit()
+        recipients = [str(item).strip() for item in (payload.get("recipients") or []) if str(item).strip()]
+        capacity = len(rows) * limit
+        if len(recipients) > capacity:
+            noun = {"SMTP": "credential(s)", "API JSON": "account(s)"}.get(self.state.sending_mode, "window(s)")
+            reply = QMessageBox.question(
+                self,
+                "Not enough sending capacity",
+                f"{len(rows)} {noun} × {limit} emails each (Per sender limit) can send {capacity} of "
+                f"{len(recipients)} recipients.\n\nThe other {len(recipients) - capacity} stay in the "
+                "customer list for a later campaign. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        if not self._begin_queue_campaign(payload):
+            return
+        if self.state.sending_mode == "SMTP":
+            self._log_action(
+                f"SMTP campaign via {self.state.smtp_host}:{self.state.smtp_port} "
+                f"({self.state.smtp_security}) using {len(rows)} credential(s)"
+            )
+        else:
+            self._log_action(f"Campaign started on {len(rows)} {self.state.sending_mode} session(s)")
+        if self.state.window_send_mode == "Sequential":
+            for row in rows:
+                row.lane_state = "queued"
+                self._campaign_worker_queue.extend(
+                    {"queue_lane": (row, lane, callback, limit)} for lane, callback, limit in self._row_lane_specs(row)
+                )
+            self._start_next_campaign_worker()
+        else:
+            for row in rows:
+                self._launch_row(row)
+        self._refresh_sessions()
 
+    _start_smtp_campaign = _start_queue_campaign
+
+    def _start_single_row(self, row) -> None:
+        """Start on an idle row with no campaign running: send from this row alone."""
+        if not self.state.logged_in:
+            self.notify("Sign in first to start a campaign")
+            return
+        if not self._row_can_send(row):
+            self.notify(f"{self._row_name(row)} is not ready to send yet")
+            return
+        payload = self._current_campaign_payload()
+        missing = self._campaign_missing_fields(payload)
+        if missing:
+            self._warn_missing_campaign_fields(missing)
+            return
+        if not self._begin_queue_campaign(payload):
+            return
+        self._log_action(f"Campaign started from {self._row_name(row)}")
+        self._launch_row(row)
+
+    def _begin_queue_campaign(self, payload: dict[str, object]) -> bool:
+        """Set up the shared recipient queue and campaign state; rows are launched separately."""
+        if self._smtp_save_timer.isActive():
+            self._smtp_save_timer.stop()
+            self._persist_browser_state()
         self.state.automatic_no_delay = self.automatic_send_checkbox.isChecked()
         self._cleanup_campaign_temp_files_async()
         if self._temp_storage_available() < 256 * 1024 * 1024:
             self.notify("Please free some storage space before starting")
             self._log_action("Campaign blocked: not enough free storage space")
-            return
-
-        recipients_raw = payload.get("recipients") or []
-        recipients = [str(item).strip() for item in recipients_raw if str(item).strip()]
+            return False
+        recipients = [str(item).strip() for item in (payload.get("recipients") or []) if str(item).strip()]
         if not recipients:
             self.notify("Add customer emails before starting the campaign")
             self._log_action("Campaign blocked: no recipients available")
-            return
-
+            return False
         subject_values = payload.get("subjects")
         subject_template: str | list[str]
         if isinstance(subject_values, list):
@@ -9980,31 +11035,40 @@ class DashboardPage(QWidget):
         if not body_template:
             self.notify("Add body content before starting the campaign")
             self._log_action("Campaign blocked: no body content available")
-            return
-
+            return False
         attachment_html = str(payload.get("attachment_html") or "").strip()
         attachment_formats = self._normalize_attachment_format_values(
             payload.get("attachment_formats") or payload.get("attachment_format") or self.attach_format_value or "PDF document"
         )
-        file_name_mode = str(payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto")
         file_name_value = str(payload.get("attachment_file_name_value") or self.attach_file_name_value or "")
-
-        if not accounts:
-            self.notify("No Gmail API accounts are ready")
-            self._log_action("Campaign blocked: no Gmail API accounts available")
-            return
 
         ordered_recipients = list(recipients)
         if self.state.email_send_order == "Random shuffle":
             random.shuffle(ordered_recipients)
+        self._lane_queue = SmtpRecipientQueue(ordered_recipients)
+        self._lane_task_factory = self._campaign_task_factory(
+            subject_template, body_template, attachment_html, attachment_formats, file_name_value, body_html_template
+        )
+        self._smtp_campaign_config = {
+            "host": self.state.smtp_host,
+            "port": int(self.state.smtp_port),
+            "security": self.state.smtp_security,
+        }
+        # Shared by every row of this campaign so rows get different names.
+        self._lane_name_pickers = self._build_campaign_unique_pickers()
+        self._lane_taken_names = self._taken_sender_names()
+        self._lane_row_of.clear()
+        for row in (*self._smtp_accounts, *self._api_accounts, *self._browser_sessions):
+            if isinstance(row, SmtpAccountHandle):
+                smtp_sender.close(row.connection)
+                row.connection = None
+            row.halt_reason = row.halt_status = ""
+            row.errors.clear()
+            row.lane_taken = row.send_completed = row.send_total = 0
+            row.lane_state = "idle"
+            row.paused = False
 
         total = len(ordered_recipients)
-        lane_count = min(len(accounts), total)
-        # _queue_campaign_job reads attachment settings off this attribute —
-        # must be the real payload here, not None (that was a copy-paste
-        # mismatch from the Manual-mode version of this function, and left
-        # every API JSON send silently crashing with AttributeError before
-        # any worker thread started).
         self._pending_campaign_payload = payload
         self._campaign_send_log_entries.clear()
         self._campaign_pause_event.set()
@@ -10024,30 +11088,89 @@ class DashboardPage(QWidget):
         self.progress_bar.setValue(0)
         self.campaign_progress_text.setText(f"0 / {total} sent • {total} remaining")
         self._update_campaign_action_state()
-
-        jobs = self._build_campaign_jobs(
-            accounts[:lane_count],
-            ordered_recipients,
-            subject_template,
-            body_template,
-            attachment_html,
-            attachment_formats,
-            file_name_mode,
-            file_name_value,
-            body_html_template=body_html_template,
-        )
-        self._campaign_worker_queue = list(jobs)
-        self._log_action(f"Campaign ready for {total} recipient(s) across {lane_count} Gmail API account(s)")
         self.notify("Sending campaign")
         self.window().hide_launch_loader()
+        return True
 
-        if self.state.window_send_mode == "Sequential":
-            self._start_next_campaign_worker()
-        else:
-            queue = list(self._campaign_worker_queue)
-            self._campaign_worker_queue.clear()
-            for job in queue:
-                self._queue_campaign_job(job)
+    def _lane_error_recorder(self, row, send_fn: Callable[..., None]) -> Callable[..., None]:
+        """Wrap a send callback so every failed attempt is kept for the row's error details."""
+
+        def send(session, recipient: str, *args, **kwargs) -> None:
+            try:
+                send_fn(session, recipient, *args, **kwargs)
+            except Exception as exc:
+                if not self._campaign_cancel_event.is_set():
+                    row.errors.append((datetime.now().strftime("%H:%M:%S"), recipient, str(exc)))
+                    del row.errors[:-200]
+                raise
+
+        return send
+
+    def _row_lane_specs(self, row) -> list[tuple[object, Callable[..., None], int]]:
+        """(lane session, send callback, row limit) for each lane of one row."""
+        if isinstance(row, SmtpAccountHandle):
+            return [(row, self._send_via_smtp, self._row_limit(row))]
+        if isinstance(row, ApiAccountHandle):
+            return [(row, self._lane_error_recorder(row, self._send_via_gmail_api), self._row_limit(row))]
+        send = self._lane_error_recorder(row, self._send_compose_with_playwright)
+        return [
+            (
+                BrowserTabHandle(
+                    session_id=f"{row.session_id}:tab:{tab_index}",
+                    window_session_id=row.session_id,
+                    title=f"{row.title} / Tab {tab_index}",
+                    mode=row.mode,
+                    browser_name=row.browser_name,
+                    debug_port=int(row.debug_port or 0),
+                    tab_index=tab_index,
+                    connect_lock=row.connect_lock,
+                ),
+                send,
+                self._row_limit(row),  # shared by the window's tabs (one Gmail account)
+            )
+            for tab_index in range(1, max(1, int(row.tab_count)) + 1)
+        ]
+
+    def _assign_row_sender_name(self, row) -> None:
+        if isinstance(row, (SmtpAccountHandle, ApiAccountHandle)):
+            row.sender_name = self._row_sender_name(row, self._lane_name_pickers, self._lane_taken_names)
+            self._persist_sender_names_if_changed()
+
+    def _launch_row(self, row) -> None:
+        if self._lane_queue is None:
+            return
+        self._assign_row_sender_name(row)
+        row.lane_state = "running"
+        row.paused = False
+        for lane, callback, limit in self._row_lane_specs(row):
+            self._launch_lane(row, lane, callback, limit)
+
+    def _start_queue_lane_job(self, job: dict[str, object]) -> None:
+        row, lane, callback, limit = job["queue_lane"]
+        if row.lane_state == "queued":
+            self._assign_row_sender_name(row)
+            row.lane_state = "running"
+            row.paused = False
+        self._launch_lane(row, lane, callback, limit)
+
+    def _launch_lane(self, row, lane, callback: Callable[..., None], limit: int) -> None:
+        queue = self._lane_queue
+        if queue is None:
+            return
+        self._lane_row_of[lane.session_id] = row
+        self._campaign_lane_parents[lane.session_id] = row.session_id
+        self._queue_campaign_job(
+            {
+                "session": lane,
+                "window_label": lane.title if isinstance(lane, BrowserTabHandle) else self._row_name(row),
+                "recipient_queue_path": None,
+                "task_factory": self._lane_task_factory,
+                "task_total": min(limit, max(1, self._campaign_total)),
+                "send_callback": callback,
+                "worker_cls": QueueLaneWorker,
+                "worker_kwargs": {"shared_queue": queue, "lane_limit": limit, "row": row},
+            }
+        )
 
     def _html_to_plain_text(self, value: str) -> str:
         cleaned = re.sub(r"(?is)<(script|style|head|title).*?>.*?</\1>", "", value or "")
@@ -12403,7 +13526,7 @@ class DashboardPage(QWidget):
                 recipient,
                 subject,
                 body_text,
-                sender_name=session.display_name,
+                sender_name=session.sender_name or session.display_name,
                 html_body=body_html or None,
                 attachment_paths=attachment_paths,
             )
@@ -12412,6 +13535,108 @@ class DashboardPage(QWidget):
         finally:
             if attachment_temp_dir is not None:
                 shutil.rmtree(attachment_temp_dir, ignore_errors=True)
+
+    def _send_via_smtp(self, session: SmtpAccountHandle, recipient: str, *args, **kwargs) -> None:
+        """Worker-thread send for one recipient; records every failure for the row's error details."""
+        try:
+            self._send_via_smtp_attempt(session, recipient, *args, **kwargs)
+        except Exception as exc:
+            if not self._campaign_cancel_event.is_set():
+                session.errors.append((datetime.now().strftime("%H:%M:%S"), recipient, str(exc)))
+                del session.errors[:-200]
+            raise
+
+    def _send_via_smtp_attempt(
+        self,
+        session: SmtpAccountHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_html: str,
+        attachment_format: str | list[str],
+        file_name_mode: str,
+        file_name_value: str,
+        convert_enabled: bool,
+        already_resolved: bool = False,
+        log_steps: bool = True,
+        *,
+        body_html: str = "",
+    ) -> None:
+        """Runs on the lane's worker thread; must not touch widgets."""
+        if session.halt_reason:
+            raise CampaignBrowserClosedError(session.halt_reason)
+
+        attachment_paths: list[Path] = []
+        attachment_temp_dir: Path | None = None
+        if attachment_html.strip():
+            attachment_temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-smtp-"))
+            attachment_paths = self._compose_attachment_paths(
+                recipient,
+                subject,
+                attachment_html,
+                attachment_format,
+                file_name_mode,
+                file_name_value,
+                convert_enabled,
+                already_resolved=already_resolved,
+                temp_dir=attachment_temp_dir,
+            )
+        config = self._smtp_campaign_config
+        try:
+            # Second pass only when the reused connection had silently dropped.
+            for attempt in (1, 2):
+                client = session.connection
+                if client is None:
+                    try:
+                        client = smtp_sender.connect(
+                            str(config["host"]),
+                            int(config["port"]),
+                            str(config["security"]),
+                            session.account_email,
+                            session.password,
+                        )
+                    except smtp_sender.SmtpAuthError as exc:
+                        self._halt_smtp_lane(session, "Failed", str(exc))
+                    session.connection = client
+                try:
+                    smtp_sender.send_message(
+                        client,
+                        session.account_email,
+                        recipient,
+                        subject,
+                        body_text,
+                        sender_name=session.sender_name,
+                        html_body=body_html or None,
+                        attachment_paths=attachment_paths,
+                    )
+                    return
+                except Exception as exc:
+                    smtp_sender.close(client)
+                    session.connection = None
+                    if self._is_smtp_sending_limit(exc):
+                        self._halt_smtp_lane(session, "Limit", f"{session.account_email} hit its sending limit: {exc}")
+                    if attempt == 1 and smtp_sender.is_connection_error(exc):
+                        continue
+                    raise
+        finally:
+            if attachment_temp_dir is not None:
+                shutil.rmtree(attachment_temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _is_smtp_sending_limit(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "5.4.5" in text or "sending limit" in text or "quota exceeded" in text
+
+    @staticmethod
+    def _halt_smtp_lane(session: SmtpAccountHandle, status: str, reason: str) -> None:
+        """Stop only this credential's lane; the worker treats this error as lane-fatal."""
+        session.halt_reason = reason
+        session.halt_status = status
+        raise CampaignBrowserClosedError(reason)
+
+    def _finish_smtp_lane(self, session: SmtpAccountHandle) -> None:
+        smtp_sender.close(session.connection)
+        session.connection = None
 
     def _send_compose_with_playwright(
         self,
@@ -13116,9 +14341,6 @@ class DashboardPage(QWidget):
             convert_enabled=True,
         )
 
-    def _execute_campaign_send(self, payload: dict[str, object]) -> None:
-        self._begin_campaign_send(payload)
-
     def _show_launch_loader(self, title: str, subtitle: str) -> None:
         self.window().show_launch_loader(title, subtitle)
 
@@ -13363,7 +14585,7 @@ class DashboardPage(QWidget):
             widget.set_content(title, mode, body_text, body_html or body_text, local_only=True)
         else:
             title = self._next_body_title()
-            widget.set_content(title, "Normal Message", "Hello {{first_name}},\n\nThis is a body message.", "<div></div>")
+            widget.set_content(title, "Normal Message", _DEFAULT_BODY_TEXT, "<div></div>")
 
         widget.titleChanged.connect(lambda title_text, w=widget: self._rename_body_tab(w, title_text))
         widget.contentChanged.connect(self._schedule_subject_body_save)
@@ -13599,13 +14821,22 @@ class DashboardPage(QWidget):
         finally:
             self._hide_subject_body_loader()
 
-    def _import_html_attachment_file(self, path: Path) -> int:
+    def _import_html_attachment_file(self, path: Path) -> AttachmentDraftEditor | None:
+        """Put one uploaded HTML file into the first empty content tab (Content 1
+        on a fresh workspace); only open a new tab when every tab has content."""
         html_text = self._read_text_template_file(path)
         if not html_text.strip():
-            return 0
+            return None
+        for index in range(self.attach_tabs.count()):
+            widget = self.attach_tabs.widget(index)
+            if isinstance(widget, AttachmentDraftEditor) and not widget.has_content():
+                widget.set_content(widget.title_text() or f"Content {index + 1}", html_text, mode="HTML Code")
+                self._rename_attachment_tab(widget, widget.title_text())
+                self._refresh_attachment_tab_labels()
+                self._persist_attachment_state()
+                return widget
         title = self._next_attachment_title()
-        self._create_and_store_attachment_tab(title=title, html_text=html_text, source_name=path.name)
-        return 1
+        return self._create_and_store_attachment_tab(title=title, html_text=html_text, source_name=path.name)
 
     def _create_and_store_attachment_tab(self, *, title: str, html_text: str, source_name: str = "") -> AttachmentDraftEditor | None:
         if self.attach_tabs.count() >= MAX_ATTACHMENT_TABS:
@@ -13632,12 +14863,8 @@ class DashboardPage(QWidget):
         if not file_paths:
             return
 
-        if self.attach_tabs.count() == 1:
-            placeholder = self._current_attachment_widget()
-            if placeholder is not None and not placeholder.has_content():
-                self.attach_tabs.removeTab(0)
-
         imported = 0
+        first_imported: AttachmentDraftEditor | None = None
         self._show_subject_body_loader("Uploading attachment files.")
         self._workspace_loading = True
         try:
@@ -13647,7 +14874,10 @@ class DashboardPage(QWidget):
                     break
                 path = Path(file_name)
                 if path.suffix.lower() in {".html", ".htm"}:
-                    imported += self._import_html_attachment_file(path)
+                    widget = self._import_html_attachment_file(path)
+                    if widget is not None:
+                        imported += 1
+                        first_imported = first_imported or widget
                 else:
                     self._log_action(f"Skipped unsupported content file: {path.name}")
         except Exception as exc:
@@ -13660,6 +14890,8 @@ class DashboardPage(QWidget):
         if self.attach_tabs.count() == 0:
             self._add_attachment_draft_tab(select=True)
         else:
+            if first_imported is not None:
+                self.attach_tabs.setCurrentWidget(first_imported)
             self._refresh_attachment_tab_labels()
             self._update_attachment_tab_controls()
             self._sync_active_attachment_widget_refs()
@@ -13997,6 +15229,7 @@ class DashboardPage(QWidget):
             )
             if body_widget is None:
                 return
+            title = body_widget.title_text() or title
             if is_html:
                 body_widget.set_content(title, "HTML Message", "", body)
             else:
@@ -14025,16 +15258,8 @@ class DashboardPage(QWidget):
         if not file_paths:
             return
 
-        if self.body_tabs.count() == 1:
-            placeholder = self._current_body_widget()
-            if placeholder is not None:
-                payload = placeholder.payload()
-                plain = str(payload.get("plain_text") or "").strip()
-                html_text = str(payload.get("html_text") or "").strip()
-                if plain in {"", "Hello {{first_name}},\n\nThis is a body message."} and not html_text:
-                    self.body_tabs.removeTab(0)
-
         imported = 0
+        self._first_uploaded_body: BodyDraftEditor | None = None
         self._show_subject_body_loader("Uploading body files.")
         self._workspace_loading = True
         try:
@@ -14061,9 +15286,12 @@ class DashboardPage(QWidget):
         if self.body_tabs.count() == 0:
             self._add_body_draft_tab(select=True)
         else:
+            if self._first_uploaded_body is not None:
+                self.body_tabs.setCurrentWidget(self._first_uploaded_body)
             self._refresh_body_tab_labels()
             self._update_body_tab_controls()
             self._sync_active_body_widget_refs()
+        self._first_uploaded_body = None
 
         if imported > 0:
             self._log_action(f"Uploaded {imported} body(s)")
@@ -14111,6 +15339,13 @@ class DashboardPage(QWidget):
         )
         return 1
 
+    @staticmethod
+    def _body_widget_is_empty(widget: BodyDraftEditor) -> bool:
+        payload = widget.payload()
+        plain = str(payload.get("plain_text") or "").strip()
+        html_text = str(payload.get("html_text") or "").strip()
+        return plain in {"", _DEFAULT_BODY_TEXT} and html_text in {"", "<div></div>"}
+
     def _create_and_store_body_tab(
         self,
         *,
@@ -14120,17 +15355,35 @@ class DashboardPage(QWidget):
         html_text: str,
         source_name: str = "",
     ) -> BodyDraftEditor | None:
-        if self.body_tabs.count() >= MAX_BODY_TABS:
-            return None
-        record = {
-            "title": title[:64] or "Body",
-            "mode": mode,
-            "plain_text": plain_text,
-            "html_text": html_text if mode == "HTML Message" else "",
-        }
-        widget = self._add_body_draft_tab(record, select=False)
-        if widget is None:
-            return None
+        """Put uploaded/loaded content into the first empty body tab (Body 1 on a
+        fresh workspace); only open a new tab when every tab has content."""
+        widget = next(
+            (
+                item
+                for item in (self.body_tabs.widget(i) for i in range(self.body_tabs.count()))
+                if isinstance(item, BodyDraftEditor) and self._body_widget_is_empty(item)
+            ),
+            None,
+        )
+        if widget is not None:
+            widget.set_content(
+                widget.title_text() or title, mode, plain_text, html_text if mode == "HTML Message" else ""
+            )
+            self._rename_body_tab(widget, widget.title_text())
+        else:
+            if self.body_tabs.count() >= MAX_BODY_TABS:
+                return None
+            record = {
+                "title": title[:64] or "Body",
+                "mode": mode,
+                "plain_text": plain_text,
+                "html_text": html_text if mode == "HTML Message" else "",
+            }
+            widget = self._add_body_draft_tab(record, select=False)
+            if widget is None:
+                return None
+        if getattr(self, "_first_uploaded_body", None) is None:
+            self._first_uploaded_body = widget
         self._refresh_body_tab_labels()
         self._update_body_tab_controls()
         self._persist_subject_body_state()
@@ -14707,31 +15960,30 @@ class DashboardPage(QWidget):
                 return result
         return super().eventFilter(obj, event)
 
+    def _add_session_row(self, row_widget: QWidget) -> None:
+        # Rows match the list's visible width so nothing scrolls sideways.
+        row_width = max(0, self.session_list.viewport().width() - 2 * self.session_list.spacing())
+        hint = row_widget.sizeHint()
+        list_item = QListWidgetItem()
+        list_item.setSizeHint(QSize(min(hint.width(), row_width) if row_width else hint.width(), hint.height()))
+        self.session_list.addItem(list_item)
+        self.session_list.setItemWidget(list_item, row_widget)
+
     def _refresh_sessions(self) -> None:
         self.session_list.clear()
         self._sync_session_state_from_handles()
         for index, item in enumerate(self._browser_sessions, start=1):
-            row_widget = self._session_row(item, index)
-            list_item = QListWidgetItem()
-            list_item.setSizeHint(row_widget.sizeHint())
-            self.session_list.addItem(list_item)
-            self.session_list.setItemWidget(list_item, row_widget)
+            self._add_session_row(self._session_row(item, index))
         for index, account in enumerate(self._api_accounts, start=1):
-            row_widget = self._api_account_row(account, index)
-            list_item = QListWidgetItem()
-            list_item.setSizeHint(row_widget.sizeHint())
-            self.session_list.addItem(list_item)
-            self.session_list.setItemWidget(list_item, row_widget)
+            self._add_session_row(self._api_account_row(account, index))
         if self.state.sending_mode == "API JSON":
             active_paths = {str(account.credential_path) for account in self._api_accounts}
             for path_str in self.state.api_json_paths:
-                if path_str in active_paths:
-                    continue
-                row_widget = self._pending_api_json_row(path_str)
-                list_item = QListWidgetItem()
-                list_item.setSizeHint(row_widget.sizeHint())
-                self.session_list.addItem(list_item)
-                self.session_list.setItemWidget(list_item, row_widget)
+                if path_str not in active_paths:
+                    self._add_session_row(self._pending_api_json_row(path_str))
+        if self.state.sending_mode == "SMTP":
+            for index, account in enumerate(self._smtp_accounts, start=1):
+                self._add_session_row(self._smtp_account_row(account, index))
         self._update_sending_mode_lock()
 
     def _refresh_activity(self) -> None:
@@ -14789,8 +16041,7 @@ class DashboardPage(QWidget):
     def _refresh_controls(self) -> None:
         self.incognito_button.setChecked(self.state.browser_mode == "Incognito")
         self.normal_button.setChecked(self.state.browser_mode == "Normal")
-        self.sending_mode_manual_button.setChecked(self.state.sending_mode != "API JSON")
-        self.sending_mode_api_button.setChecked(self.state.sending_mode == "API JSON")
+        self._sync_sending_mode_buttons()
         self.normal_message_button.setChecked(self.state.body_mode == "Normal Message")
         self.html_message_button.setChecked(self.state.body_mode == "HTML Message")
         self.sender_limit.blockSignals(True)
@@ -14865,72 +16116,142 @@ class DashboardPage(QWidget):
         if callable(self.notify):
             self.notify(message)
 
+    _LANE_STATUS_COLORS = {"Done": "#89d185", "Sending": "#4fc1ff", "Stopped": "#d7ba7d", "Queued": "#9e9e9e"}
+
+    def _row_target(self, row) -> int:
+        """How many emails this row is expected to send (shown as sent/target)."""
+        if row.lane_state == "done" or row.halt_reason:
+            return row.lane_taken
+        queue = self._lane_queue
+        if row.lane_state not in {"running", "queued"} or queue is None:
+            return 0
+        limit = self._row_limit(row)
+        lane_rows = [self._lane_row_of.get(lane_id) for lane_id in self._campaign_running_workers]
+        active = sum(1 for item in lane_rows if item is not None and not item.paused) or 1
+        mine = 0 if row.paused else sum(1 for item in lane_rows if item is row)
+        share = ceil(queue.remaining() * mine / active)
+        return row.lane_taken + min(limit - row.lane_taken, share)
+
     def _session_row(self, session: BrowserSessionHandle, index: int) -> QWidget:
-        row = QFrame()
-        row.setObjectName("sessionRow")
-        row_layout = QVBoxLayout(row)
-        row_layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(7, self._scale), _scaled_int(8, self._scale), _scaled_int(7, self._scale))
-        row_layout.setSpacing(_scaled_int(4, self._scale))
-        row.setMinimumHeight(_scaled_int(52, self._scale))
-
-        dot = QLabel("●")
-        dot.setObjectName("sessionDot")
-        label = QLabel(session.title)
-        label.setObjectName("sessionTitleSmall")
-        tab_label = "tab" if session.tab_count == 1 else "tabs"
-        state = QLabel(f"{session.mode} - {session.status} - {session.tab_count} {tab_label}")
-        state.setObjectName("sessionState")
-        count = QLabel(f"({session.send_completed}/{session.send_total})")
-        count.setObjectName("sessionState")
-        label.setMinimumWidth(_scaled_int(72, self._scale))
-        state.setMinimumWidth(_scaled_int(80, self._scale))
-        state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        close_button = QPushButton("✕")
-        close_button.setObjectName("dangerButton")
-        close_button.setFixedWidth(_scaled_int(28, self._scale))
-        close_button.clicked.connect(lambda _, sid=session.session_id: self._close_session(sid))
-        close_button.setToolTip("Close this browser window")
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(_scaled_int(6, self._scale))
-        top_row.addWidget(dot)
-        top_row.addWidget(label)
-        top_row.addStretch()
-
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(_scaled_int(6, self._scale))
-        bottom_row.addWidget(state)
-        bottom_row.addWidget(count)
-        bottom_row.addStretch()
-        bottom_row.addWidget(close_button)
-
-        row_layout.addLayout(top_row)
-        row_layout.addLayout(bottom_row)
-        return row
+        return self._lane_row_widget(session)
 
     def _api_account_row(self, account: ApiAccountHandle, index: int) -> QWidget:
-        row = QFrame()
-        row.setObjectName("sessionRow")
-        row_layout = QVBoxLayout(row)
+        return self._lane_row_widget(account)
+
+    def _smtp_account_row(self, account: SmtpAccountHandle, index: int) -> QWidget:
+        return self._lane_row_widget(account)
+
+    def _lane_row_widget(self, row) -> QWidget:
+        """One Active Sessions row: status, sent/target, Start/Stop, Try, errors, remove."""
+        widget = QFrame()
+        widget.setObjectName("sessionRow")
+        row_layout = QVBoxLayout(widget)
         row_layout.setContentsMargins(_scaled_int(8, self._scale), _scaled_int(7, self._scale), _scaled_int(8, self._scale), _scaled_int(7, self._scale))
         row_layout.setSpacing(_scaled_int(4, self._scale))
-        row.setMinimumHeight(_scaled_int(52, self._scale))
+        widget.setMinimumHeight(_scaled_int(52, self._scale))
 
         dot = QLabel("●")
         dot.setObjectName("sessionDot")
-        label = QLabel(account.account_email or account.title)
+        name = self._row_name(row)
+        label = QLabel(name if len(name) <= 25 else name[:22] + "...")
         label.setObjectName("sessionTitleSmall")
-        state = QLabel("API JSON - Online")
+        tip = [name]
+        if isinstance(row, SmtpAccountHandle):
+            item = self._smtp_credential_item(row.account_email)
+            fixed_name = str(item.get("sender_name") or "") if item is not None else ""
+            if fixed_name:
+                tip.append(f"Sender name (Auto): {fixed_name}")
+        elif isinstance(row, ApiAccountHandle):
+            fixed_name = self.state.api_sender_names.get(row.account_email.lower(), "")
+            tip.append(f"Google account name: {row.display_name or '—'}")
+            if fixed_name:
+                tip.append(f"Sender name (Auto): {fixed_name}")
+        else:
+            tab_noun = "tab" if row.tab_count == 1 else "tabs"
+            tip.append(f"{row.mode} • {row.tab_count} {tab_noun} • {row.browser_name}")
+        label.setToolTip("\n".join(tip))
+
+        status = self._lane_status(row)
+        state = QLabel(status)
         state.setObjectName("sessionState")
-        count = QLabel(f"({account.send_completed}/{account.send_total})")
+        if row.halt_reason or status == "Failed":
+            color = "#f48771"
+        elif status == "Done" and row.errors:
+            color = "#d7ba7d"  # finished, but some emails failed — see the ! details
+        else:
+            color = self._LANE_STATUS_COLORS.get(status)
+        if color:
+            state.setStyleSheet(f"color: {color};")
+        state.setToolTip(row.halt_reason or status)
+        sent, target = row.send_completed, self._row_target(row)
+        count = QLabel(f"({sent}/{target})" if (target or sent) else "")
         count.setObjectName("sessionState")
-        label.setMinimumWidth(_scaled_int(72, self._scale))
-        state.setMinimumWidth(_scaled_int(80, self._scale))
-        state.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        logout_button = QPushButton("Logout")
-        logout_button.setObjectName("dangerButton")
-        logout_button.clicked.connect(lambda _, acc=account: self._logout_api_account(acc))
-        logout_button.setToolTip("Sign this account out and remove its saved credential")
+        count.setToolTip(f"{sent} sent of {target} expected")
+
+        can_send = self._row_can_send(row)
+        running = row.lane_state == "running" and not row.paused
+        toggle_button = QPushButton("Stop" if running else "Start")
+        if running:
+            toggle_button.setObjectName("warningButton")
+            toggle_button.setStyleSheet("padding: 2px 6px;")
+            toggle_button.setToolTip("Pause sending from this session")
+        else:
+            toggle_button.setStyleSheet(
+                "QPushButton { padding: 2px 6px; background: #2e7d32; color: #ffffff; }"
+                "QPushButton:hover { background: #388e3c; }"
+                "QPushButton:disabled { background: #2f3a2f; color: #8a8a8a; }"
+            )
+            toggle_button.setEnabled(can_send)
+            toggle_button.setToolTip(
+                "Resume sending from this session"
+                if row.lane_state == "running"
+                else ("Send from this session now" if not self._campaign_active else "Join the running campaign")
+            )
+        toggle_button.clicked.connect(lambda _, r=row: self._lane_row_action(r))
+
+        try_button = QPushButton("Try")
+        try_button.setObjectName("secondaryButton")
+        try_button.setStyleSheet("padding: 2px 6px;")
+        browser_busy = isinstance(row, BrowserSessionHandle) and row.lane_state in {"running", "queued"}
+        try_button.setEnabled(can_send and not browser_busy)
+        try_button.setToolTip(
+            "Stop this window's campaign sending before testing — its Gmail tabs are busy"
+            if browser_busy
+            else "Send a test email from this session"
+        )
+        try_button.clicked.connect(lambda _, r=row: self._open_row_test(r))
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(_scaled_int(4, self._scale))
+        bottom_row.addWidget(state)
+        bottom_row.addWidget(count)
+        bottom_row.addStretch()
+        bottom_row.addWidget(toggle_button)
+        bottom_row.addWidget(try_button)
+        if row.errors or row.halt_reason:
+            error_button = QPushButton("!")
+            error_button.setObjectName("dangerButton")
+            error_button.setFixedWidth(_scaled_int(24, self._scale))
+            error_button.setStyleSheet("padding: 2px 0px;")
+            error_button.setToolTip(f"{len(row.errors)} error(s) — click for details")
+            error_button.clicked.connect(lambda _, r=row: self._show_row_errors(r))
+            bottom_row.addWidget(error_button)
+        remove_button = QPushButton("✕")
+        remove_button.setObjectName("dangerButton")
+        remove_button.setFixedWidth(_scaled_int(24, self._scale))
+        remove_button.setStyleSheet("padding: 2px 0px;")
+        if isinstance(row, SmtpAccountHandle):
+            remove_button.setToolTip("Remove this SMTP credential")
+            remove_button.setEnabled(not self._campaign_active)
+            remove_button.clicked.connect(lambda _, e=row.account_email: self._remove_smtp_credential(e))
+        elif isinstance(row, ApiAccountHandle):
+            remove_button.setToolTip("Log out this account and remove its saved credential")
+            remove_button.setEnabled(not self._campaign_active)
+            remove_button.clicked.connect(lambda _, a=row: self._logout_api_account(a))
+        else:
+            remove_button.setToolTip("Close this browser window")
+            remove_button.clicked.connect(lambda _, sid=row.session_id: self._close_session(sid))
+        bottom_row.addWidget(remove_button)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(_scaled_int(6, self._scale))
@@ -14938,16 +16259,9 @@ class DashboardPage(QWidget):
         top_row.addWidget(label)
         top_row.addStretch()
 
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(_scaled_int(6, self._scale))
-        bottom_row.addWidget(state)
-        bottom_row.addWidget(count)
-        bottom_row.addStretch()
-        bottom_row.addWidget(logout_button)
-
         row_layout.addLayout(top_row)
         row_layout.addLayout(bottom_row)
-        return row
+        return widget
 
     def _logout_api_account(self, account: ApiAccountHandle) -> None:
         if self._campaign_active or self._campaign_threads:
@@ -16093,6 +17407,8 @@ def main() -> int:
         print(f"Local login API failed to start: {exc}")
 
     app = EzyMailerApplication(sys.argv)
+    dialog_centerer = _DialogCenterer(app)
+    app.installEventFilter(dialog_centerer)
     window = MainWindow()
     app.main_window = window
     window.show()

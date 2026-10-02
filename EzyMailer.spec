@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/dictionary.txt.gz', 'assets')]
+datas = [('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/dictionary.txt.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/names.json.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/cities.json.gz', 'assets')]
 binaries = []
 hiddenimports = ['PIL.Image', 'greenlet._greenlet', 'eval_type_backport']
 tmp_ret = collect_all('PIL')

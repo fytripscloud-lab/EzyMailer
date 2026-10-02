@@ -56,6 +56,8 @@ pyinstaller \
   --name "$APP_NAME" \
   --icon "$ROOT_DIR/packaging/assets/EazyMailer.icns" \
   --add-data "$ROOT_DIR/packaging/assets/dictionary.txt.gz:assets" \
+  --add-data "$ROOT_DIR/packaging/assets/names.json.gz:assets" \
+  --add-data "$ROOT_DIR/packaging/assets/cities.json.gz:assets" \
   --collect-all PIL \
   --collect-all greenlet \
   --collect-all lxml \
