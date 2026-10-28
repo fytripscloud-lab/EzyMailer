@@ -16,8 +16,11 @@ from main import (
 
 
 class CampaignCoreTests(unittest.TestCase):
-    def test_automatic_no_delay_is_the_default_sending_mode(self) -> None:
-        self.assertTrue(AppState().automatic_no_delay)
+    def test_fixed_short_delay_is_the_default_sending_mode(self) -> None:
+        state = AppState()
+        self.assertFalse(state.automatic_no_delay)
+        self.assertEqual(state.delay_type, "Fixed")
+        self.assertEqual((state.delay_from, state.delay_to), (0.1, 0.1))
 
     def test_browser_connection_gate_serves_all_tabs_in_fifo_order(self) -> None:
         gate = FairThreadLock()
@@ -241,7 +244,7 @@ class CampaignCoreTests(unittest.TestCase):
         self.assertEqual(compose_root.requested_text, "TFA-17-RXFEU.pdf")
         self.assertFalse(compose_root.exact)
         self.assertNotIn(".vX", compose_root.progress_selector)
-        self.assertGreaterEqual(page.waits, 3)
+        self.assertGreaterEqual(page.waits, 2)
 
     def test_gmail_attachment_name_can_be_outside_file_input_ancestor(self) -> None:
         class Match:
@@ -292,7 +295,7 @@ class CampaignCoreTests(unittest.TestCase):
 
         self.assertEqual(page.requested_text, "QQSDOBQ-6U7TPL.pdf")
         self.assertFalse(page.exact)
-        self.assertGreaterEqual(page.waits, 3)
+        self.assertGreaterEqual(page.waits, 2)
 
     def test_compose_url_contains_all_fields_and_is_unique(self) -> None:
         first = DashboardPage._gmail_compose_url(

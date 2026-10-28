@@ -24,6 +24,7 @@ import select
 import string
 import threading
 import concurrent.futures
+import contextlib
 import uuid
 import certifi
 import xml.etree.ElementTree
@@ -358,6 +359,160 @@ BROWSER_RESOURCE_FLAGS = (
 # machines. Gmail's single-page app leaks memory over long runs, so the tab
 # is fully reloaded once every FAST_COMPOSE_RELOAD_EVERY sends.
 FAST_COMPOSE_RELOAD_EVERY = 60
+# Default pause between two emails from the same sender, in seconds.
+DEFAULT_SEND_DELAY_SECONDS = 0.1
+# Bumped when the default sending settings change, so settings saved under
+# older defaults move to the new ones once (see _apply_sending_settings_payload).
+SENDING_DEFAULTS_VERSION = 2
+# Chrome features that slow a Gmail tab down once its window is covered,
+# minimized or left in the background for a while. One --disable-features
+# switch only: Chrome keeps just the last one when it is repeated.
+BROWSER_DISABLED_FEATURES = (
+    "ChromeWhatsNewUI",
+    # Windows: treat a covered window as hidden and throttle it.
+    "CalculateNativeWinOcclusion",
+    # Wake hidden pages only once a minute after five minutes in background.
+    "IntensiveWakeUpThrottling",
+)
+# Above normal, not High: four Gmail browsers at High would starve whatever
+# else the person is doing on the machine.
+WINDOWS_ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+# How often each campaign browser's process tree is re-boosted on Windows.
+# Chrome starts new renderer processes and can reset their priority.
+BROWSER_PRIORITY_REFRESH_SECONDS = 5.0
+_APP_NAP_ACTIVITY = None
+# Each campaign lane (one QThread per Gmail tab) keeps one Playwright driver
+# and CDP connection for its whole run instead of starting a driver and
+# re-attaching to the browser for every email, which took about a second per
+# send. Playwright's sync objects are bound to the thread that made them, so
+# the connection is thread-local and closed by the lane's own thread.
+_LANE_PLAYWRIGHT = threading.local()
+
+
+def _close_lane_playwright() -> None:
+    state = getattr(_LANE_PLAYWRIGHT, "state", None)
+    _LANE_PLAYWRIGHT.state = None
+    if state is None:
+        return
+    try:
+        state["manager"].__exit__(None, None, None)
+    except Exception:
+        pass
+
+
+def _windows_process_tree(root_pid: int) -> list[int]:
+    """The root process and all its descendants (Chrome's renderers, GPU...)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+        return [root_pid]
+    children: dict[int, list[int]] = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            children.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    tree = [root_pid]
+    index = 0
+    while index < len(tree):
+        tree.extend(pid for pid in children.get(tree[index], []) if pid not in tree)
+        index += 1
+    return tree
+
+
+def _windows_boost_process(pid: int) -> None:
+    """Above-normal priority and no Windows power throttling ("Efficiency mode").
+
+    Windows 11 puts the processes of covered and minimized windows on EcoQoS,
+    which runs them on slow cores at low clock speed. Opting the process out
+    keeps a background Gmail tab sending at full speed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.ULONG),
+            ("ControlMask", wintypes.ULONG),
+            ("StateMask", wintypes.ULONG),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    # PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel32.OpenProcess(0x0200 | 0x1000, False, pid)
+    if not handle:
+        return
+    try:
+        kernel32.SetPriorityClass(handle, WINDOWS_ABOVE_NORMAL_PRIORITY_CLASS)
+        set_information = getattr(kernel32, "SetProcessInformation", None)
+        if set_information is not None:
+            # Control EXECUTION_SPEED and IGNORE_TIMER_RESOLUTION, both off.
+            state = PROCESS_POWER_THROTTLING_STATE(1, 0x1 | 0x4, 0)
+            set_information(handle, 4, ctypes.byref(state), ctypes.sizeof(state))  # ProcessPowerThrottling
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _boost_process_tree(root_pid: int) -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        for pid in _windows_process_tree(root_pid):
+            _windows_boost_process(pid)
+    except Exception:
+        pass
+
+
+def _keep_app_fully_active() -> None:
+    """Stop the OS from throttling EzyMailer's own sending threads.
+
+    macOS App Nap slows timers and threads of an app whose windows are
+    hidden or covered; Windows does the same through power throttling.
+    """
+    global _APP_NAP_ACTIVITY
+    if IS_WINDOWS:
+        _boost_process_tree(os.getpid())
+    elif IS_MAC and _APP_NAP_ACTIVITY is None:
+        try:
+            from Foundation import NSProcessInfo
+
+            # NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+            options = 0x00EFFFFF | 0xFF00000000
+            _APP_NAP_ACTIVITY = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+                options, "Sending email campaigns in the background"
+            )
+        except Exception:
+            pass
 
 
 def _runtime_root() -> Path:
@@ -1592,12 +1747,12 @@ class AppState:
     ai_model: str = ""
     ai_connected: bool = False
     sender_limit: int = 300
-    delay_from: float = 0.2
-    delay_to: float = 0.5
+    delay_from: float = DEFAULT_SEND_DELAY_SECONDS
+    delay_to: float = DEFAULT_SEND_DELAY_SECONDS
     retry_count: int = 3
     retry_enabled: bool = True
-    automatic_no_delay: bool = True
-    delay_type: str = "Auto (system-oriented)"
+    automatic_no_delay: bool = False
+    delay_type: str = "Fixed"
     email_send_order: str = "Sequential"
     window_send_mode: str = "Parallel"
     fast_compose: bool = True
@@ -2253,13 +2408,16 @@ class CampaignSendWorker(QObject):
         return False
 
     def _sleep_with_controls(self, seconds: float) -> bool:
-        deadline = time.time() + max(0.0, float(seconds))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             if self.cancel_event.is_set():
                 return False
             if not self._wait_for_resume():
                 return False
-            time.sleep(0.1)
+            time.sleep(min(0.05, remaining))
         return not self.cancel_event.is_set()
 
     def _delay_seconds(self) -> float:
@@ -2287,6 +2445,7 @@ class CampaignSendWorker(QObject):
         processed = 0
         total = self.task_total
         error_message = ""
+        _LANE_PLAYWRIGHT.enabled = True
         try:
             task_iterator = self._iter_tasks()
             for task in task_iterator:
@@ -2376,6 +2535,9 @@ class CampaignSendWorker(QObject):
         except Exception as exc:
             error_message = str(exc)
             self.log.emit(f"[{self._timestamp()}] {self.window_label} failed to read its recipient queue: {error_message}")
+        finally:
+            _LANE_PLAYWRIGHT.enabled = False
+            _close_lane_playwright()
 
         if self.cleanup_callback is not None:
             try:
@@ -6868,11 +7030,11 @@ class DashboardPage(QWidget):
         self.delay_from.setDecimals(1)
         self.delay_from.setRange(0.0, 60.0)
         self.delay_from.setSingleStep(0.1)
-        self.delay_from.setValue(0.2)
+        self.delay_from.setValue(DEFAULT_SEND_DELAY_SECONDS)
         self.delay_to.setDecimals(1)
         self.delay_to.setRange(0.0, 60.0)
         self.delay_to.setSingleStep(0.1)
-        self.delay_to.setValue(0.5)
+        self.delay_to.setValue(DEFAULT_SEND_DELAY_SECONDS)
         self.retry_count.setRange(0, 20)
         self.retry_count.setValue(3)
         self.delay_from.setToolTip("Minimum delay between emails")
@@ -6880,7 +7042,7 @@ class DashboardPage(QWidget):
         self.retry_count.setToolTip("Number of retry attempts for failed sends")
 
         form.addRow("Per-sender limit", self.sender_limit)
-        self.automatic_send_checkbox.setChecked(True)
+        self.automatic_send_checkbox.setChecked(False)
         self.automatic_send_checkbox.setToolTip(
             "Send the next assigned email immediately; configured delays are ignored"
         )
@@ -7102,7 +7264,7 @@ class DashboardPage(QWidget):
             "retry_count": int(self.retry_count.value()),
             "retry_enabled": bool(self.retry_enable_checkbox.isChecked()),
             "automatic_no_delay": bool(self.automatic_send_checkbox.isChecked()),
-            "automatic_no_delay_default_version": 1,
+            "automatic_no_delay_default_version": SENDING_DEFAULTS_VERSION,
             "delay_type": delay_type,
             "email_send_order": email_send_order,
             "window_send_mode": window_send_mode,
@@ -7148,19 +7310,19 @@ class DashboardPage(QWidget):
                 widget.blockSignals(False)
 
         sender_limit = _as_int(payload.get("sender_limit"), 300)
-        delay_from = _as_float(payload.get("delay_from"), 0.2)
-        delay_to = _as_float(payload.get("delay_to"), 0.5)
         retry_count = _as_int(payload.get("retry_count"), 3)
         retry_enabled = _as_bool(payload.get("retry_enabled"), True)
-        automatic_default_version = _as_int(
-            payload.get("automatic_no_delay_default_version"), 0
-        )
-        automatic_no_delay = (
-            True
-            if automatic_default_version < 1
-            else _as_bool(payload.get("automatic_no_delay"), True)
-        )
-        delay_type = str(payload.get("delay_type") or "Auto (system-oriented)")
+        defaults_version = _as_int(payload.get("automatic_no_delay_default_version"), 0)
+        if defaults_version < SENDING_DEFAULTS_VERSION:
+            # Saved under older defaults: move to a fixed 0.1 s delay.
+            delay_from = delay_to = DEFAULT_SEND_DELAY_SECONDS
+            automatic_no_delay = False
+            delay_type = "Fixed"
+        else:
+            delay_from = _as_float(payload.get("delay_from"), DEFAULT_SEND_DELAY_SECONDS)
+            delay_to = _as_float(payload.get("delay_to"), DEFAULT_SEND_DELAY_SECONDS)
+            automatic_no_delay = _as_bool(payload.get("automatic_no_delay"), False)
+            delay_type = str(payload.get("delay_type") or "Fixed")
         if delay_type == "Random range":
             delay_type = "Auto (system-oriented)"
         email_send_order = str(payload.get("email_send_order") or "Sequential")
@@ -7185,7 +7347,7 @@ class DashboardPage(QWidget):
         _block(self.delay_random_radio, lambda: self.delay_random_radio.setChecked(delay_type == "Auto (system-oriented)"))
         _block(self.delay_human_radio, lambda: self.delay_human_radio.setChecked(delay_type == "Human-like pattern"))
         if not any((self.delay_fixed_radio.isChecked(), self.delay_random_radio.isChecked(), self.delay_human_radio.isChecked())):
-            self.delay_random_radio.setChecked(True)
+            self.delay_fixed_radio.setChecked(True)
 
         _block(self.send_seq_radio, lambda: self.send_seq_radio.setChecked(email_send_order != "Random shuffle"))
         _block(self.send_rand_radio, lambda: self.send_rand_radio.setChecked(email_send_order == "Random shuffle"))
@@ -9813,6 +9975,43 @@ class DashboardPage(QWidget):
         self._seed_browser_profile_dir(profile_dir)
         return profile_dir, is_temporary
 
+    def _start_browser_priority_keeper(self) -> None:
+        """Keep every open browser's whole process tree boosted (Windows).
+
+        Chrome renders Gmail in child processes it starts and re-prioritizes
+        itself, so the boost is re-applied on a short interval for as long as
+        any browser window is open.
+        """
+        if not IS_WINDOWS:
+            return
+        keeper = getattr(self, "_browser_priority_thread", None)
+        if keeper is not None and keeper.is_alive():
+            return
+
+        def keep_boosted() -> None:
+            while True:
+                pids = [
+                    session.process.pid
+                    for session in list(self._browser_sessions)
+                    if session.process is not None and session.process.poll() is None
+                ]
+                if not pids:
+                    return
+                for pid in pids:
+                    _boost_process_tree(pid)
+                time.sleep(BROWSER_PRIORITY_REFRESH_SECONDS)
+
+        # The window being launched is not in _browser_sessions yet; give
+        # it a moment so the first pass already includes it.
+        def start() -> None:
+            time.sleep(1.0)
+            keep_boosted()
+
+        self._browser_priority_thread = threading.Thread(
+            target=start, name="ezymailer-browser-priority", daemon=True
+        )
+        self._browser_priority_thread.start()
+
     def _reserve_debug_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
@@ -9906,7 +10105,8 @@ class DashboardPage(QWidget):
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
-                "--disable-features=ChromeWhatsNewUI",
+                "--disable-ipc-flooding-protection",
+                "--disable-features=" + ",".join(BROWSER_DISABLED_FEATURES),
                 f"--remote-debugging-port={debug_port}",
                 "--remote-allow-origins=*",
             ]
@@ -9930,7 +10130,9 @@ class DashboardPage(QWidget):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            creationflags=WINDOWS_ABOVE_NORMAL_PRIORITY_CLASS if IS_WINDOWS else 0,
         )
+        self._start_browser_priority_keeper()
         session = BrowserSessionHandle(
             session_id=session_id,
             title=title,
@@ -10669,12 +10871,12 @@ class DashboardPage(QWidget):
             task_factory=job["task_factory"],
             task_total=int(job["task_total"]),
             window_label=str(job["window_label"]),
-            delay_mode=getattr(self.state, "delay_type", "Auto (system-oriented)"),
-            delay_from=float(getattr(self.state, "delay_from", 0.2)),
-            delay_to=float(getattr(self.state, "delay_to", 0.5)),
+            delay_mode=getattr(self.state, "delay_type", "Fixed"),
+            delay_from=float(getattr(self.state, "delay_from", DEFAULT_SEND_DELAY_SECONDS)),
+            delay_to=float(getattr(self.state, "delay_to", DEFAULT_SEND_DELAY_SECONDS)),
             retry_count=int(getattr(self.state, "retry_count", 3)),
             retry_enabled=bool(getattr(self.state, "retry_enabled", True)),
-            automatic_no_delay=bool(getattr(self.state, "automatic_no_delay", True)),
+            automatic_no_delay=bool(getattr(self.state, "automatic_no_delay", False)),
             convert_enabled=bool(self.attach_convert_checkbox.isChecked()),
             attachment_formats=self._normalize_attachment_format_values(
                 self._pending_campaign_payload.get("attachment_formats")
@@ -11711,7 +11913,7 @@ class DashboardPage(QWidget):
                     control = controls.nth(index)
                     if control.is_visible():
                         control.click(timeout=1500)
-                        page.wait_for_timeout(250)
+                        page.wait_for_timeout(100)
                         return
             except Exception:
                 continue
@@ -11729,7 +11931,7 @@ class DashboardPage(QWidget):
                     control = controls.nth(index)
                     if control.is_visible():
                         control.click(timeout=1500)
-                        page.wait_for_timeout(250)
+                        page.wait_for_timeout(100)
                         return
             except Exception:
                 continue
@@ -11748,7 +11950,7 @@ class DashboardPage(QWidget):
                     cancel.first.click(timeout=3000)
                 else:
                     page.keyboard.press("Escape")
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(100)
                 return True
         except Exception:
             return False
@@ -11778,7 +11980,7 @@ class DashboardPage(QWidget):
                     return
             except Exception:
                 pass
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(100)
         raise RuntimeError("Gmail Compose button was not available. Confirm that this browser window is signed in.")
 
     def _open_inline_gmail_compose(
@@ -11835,13 +12037,12 @@ class DashboardPage(QWidget):
         self._fill_gmail_field(recipient_input, recipient, "recipient")
         # Commit the address to a chip so Gmail treats it as a real recipient.
         recipient_input.press("Tab")
-        page.wait_for_timeout(200)
-        if not self._gmail_recipient_is_selected(page, recipient):
+        if not self._poll_page(page, lambda: self._gmail_recipient_is_selected(page, recipient), timeout=0.6):
             try:
                 recipient_input.press("Enter")
             except Exception:
                 pass
-            page.wait_for_timeout(200)
+            self._poll_page(page, lambda: self._gmail_recipient_is_selected(page, recipient), timeout=0.6)
 
         subject_box = self._gmail_subject_input(page)
         self._fill_gmail_field(subject_box, subject, "subject")
@@ -11896,8 +12097,7 @@ class DashboardPage(QWidget):
                     control = page.locator(selector).last
                     if control.is_visible():
                         control.click(timeout=1500)
-                        page.wait_for_timeout(400)
-                        if recipient_visible():
+                        if self._poll_page(page, recipient_visible, timeout=0.4):
                             return
                 except Exception:
                     continue
@@ -11908,14 +12108,27 @@ class DashboardPage(QWidget):
                     title = page.get_by_text(label, exact=True).last
                     if title.is_visible():
                         title.click(timeout=1500)
-                        page.wait_for_timeout(400)
-                        if recipient_visible():
+                        if self._poll_page(page, recipient_visible, timeout=0.4):
                             return
                 except Exception:
                     continue
             page.wait_for_timeout(200)
 
         raise RuntimeError("Gmail inline Compose stayed minimized")
+
+    @staticmethod
+    def _poll_page(page, condition: Callable[[], object], *, timeout: float, interval_ms: int = 50) -> bool:
+        """Return as soon as condition() is true, or False after timeout seconds."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                if condition():
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            page.wait_for_timeout(interval_ms)
 
     def _fill_gmail_field(self, locator, value: str, label: str) -> None:
         locator.wait_for(state="visible", timeout=10000)
@@ -12000,7 +12213,7 @@ class DashboardPage(QWidget):
             last_state = (recipient_ready, subject_ready, body_ready)
             if recipient_ready and subject_ready and body_ready:
                 return
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(100)
 
         missing = [
             label
@@ -12077,7 +12290,7 @@ class DashboardPage(QWidget):
 
     def _wait_for_gmail_attachment_layout(self, page) -> None:
         """Let Gmail finish positioning attachment controls in small Compose windows."""
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(250)
         body_locator = page.locator(
             'div[role="textbox"][aria-label*="Message Body"], '
             'div[contenteditable="true"][aria-label*="Message Body"]'
@@ -12087,7 +12300,7 @@ class DashboardPage(QWidget):
             body_locator.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(100)
 
     # ------------------------------------------------------------------
     # API JSON sending: Gmail API + OAuth, no compose UI involved.
@@ -13776,6 +13989,97 @@ class DashboardPage(QWidget):
         smtp_sender.close(session.connection)
         session.connection = None
 
+    def _connect_gmail_browser(self, playwright, session: BrowserSessionHandle | BrowserTabHandle):
+        browser = None
+        last_exc: Exception | None = None
+        # Multiple tabs share one Chrome debugging endpoint. Only the
+        # short CDP handshake is serialized in FIFO order; after
+        # connecting, every tab continues its compose/send work
+        # concurrently. Retry sleeps stay outside the lock so one
+        # temporarily busy connection cannot block all other tabs.
+        connect_deadline = time.monotonic() + 30
+        while time.monotonic() < connect_deadline:
+            with session.connect_lock:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(
+                        self._browser_cdp_url(session),
+                        timeout=5000,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+            if browser is not None:
+                return browser
+            if not self._browser_debug_endpoint_alive(session):
+                break
+            time.sleep(0.25)
+        detail = f" ({last_exc})" if last_exc is not None else ""
+        if self._browser_debug_endpoint_alive(session):
+            raise RuntimeError(
+                f"Gmail browser automation was temporarily busy; retrying.{detail}"
+            )
+        raise CampaignBrowserClosedError(
+            f"Unable to connect to the Gmail browser; campaign stopped.{detail}"
+        )
+
+    @contextlib.contextmanager
+    def _gmail_browser_connection(self, session: BrowserSessionHandle | BrowserTabHandle):
+        """Yield (browser, active_pages) for one send.
+
+        Inside a campaign lane the connection is kept for the lane's whole
+        run (see _LANE_PLAYWRIGHT); anywhere else it lasts for this send only.
+        """
+        from playwright.sync_api import sync_playwright
+
+        if not getattr(_LANE_PLAYWRIGHT, "enabled", False):
+            with sync_playwright() as playwright:
+                yield self._connect_gmail_browser(playwright, session), {}
+            return
+
+        state = getattr(_LANE_PLAYWRIGHT, "state", None)
+        if state is not None and (
+            state["session_id"] != session.session_id or not state["browser"].is_connected()
+        ):
+            _close_lane_playwright()
+            state = None
+        if state is None:
+            manager = sync_playwright()
+            playwright = manager.__enter__()
+            try:
+                browser = self._connect_gmail_browser(playwright, session)
+            except BaseException:
+                manager.__exit__(None, None, None)
+                raise
+            state = {
+                "session_id": session.session_id,
+                "manager": manager,
+                "browser": browser,
+                "active_pages": {},
+            }
+            _LANE_PLAYWRIGHT.state = state
+        try:
+            yield state["browser"], state["active_pages"]
+        except BaseException:
+            if not state["browser"].is_connected():
+                _close_lane_playwright()
+            raise
+
+    def _keep_gmail_page_active(self, page, active_pages: dict) -> None:
+        """Make a covered, minimized or background Gmail tab act like the focused one.
+
+        Focus emulation stops Gmail treating the tab as idle, and the active
+        lifecycle state keeps Chrome from freezing it. Both last as long as
+        the CDP session that set them, which active_pages keeps open.
+        """
+        if page in active_pages:
+            return
+        try:
+            cdp = page.context.new_cdp_session(page)
+            cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+            cdp.send("Page.setWebLifecycleState", {"state": "active"})
+            active_pages[page] = cdp
+        except Exception:
+            pass
+
     def _send_compose_with_playwright(
         self,
         session: BrowserSessionHandle | BrowserTabHandle,
@@ -13847,42 +14151,9 @@ class DashboardPage(QWidget):
     ) -> None:
         ensure_external_dependencies()
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
 
         try:
-            with sync_playwright() as playwright:
-                browser = None
-                last_exc: Exception | None = None
-                # Multiple tabs share one Chrome debugging endpoint. Only the
-                # short CDP handshake is serialized in FIFO order; after
-                # connecting, every tab continues its compose/send work
-                # concurrently. Retry sleeps stay outside the lock so one
-                # temporarily busy connection cannot block all other tabs.
-                connect_deadline = time.monotonic() + 30
-                while time.monotonic() < connect_deadline:
-                    with session.connect_lock:
-                        try:
-                            browser = playwright.chromium.connect_over_cdp(
-                                self._browser_cdp_url(session),
-                                timeout=5000,
-                            )
-                        except Exception as exc:
-                            last_exc = exc
-                    if browser is not None:
-                        break
-                    if not self._browser_debug_endpoint_alive(session):
-                        break
-                    time.sleep(0.25)
-                if browser is None:
-                    detail = f" ({last_exc})" if last_exc is not None else ""
-                    if self._browser_debug_endpoint_alive(session):
-                        raise RuntimeError(
-                            f"Gmail browser automation was temporarily busy; retrying.{detail}"
-                        )
-                    raise CampaignBrowserClosedError(
-                        f"Unable to connect to the Gmail browser; campaign stopped.{detail}"
-                    )
-
+            with self._gmail_browser_connection(session) as (browser, active_pages):
                 pages = []
                 required_page_count = session.tab_index if isinstance(session, BrowserTabHandle) else 1
                 page_deadline = time.monotonic() + 10
@@ -13930,6 +14201,7 @@ class DashboardPage(QWidget):
                 page.set_default_timeout(10000)
                 page.set_default_navigation_timeout(15000)
                 self._gmail_page_from_session(page)
+                self._keep_gmail_page_active(page, active_pages)
                 if log_steps:
                     self._log_action("Gmail page ready")
 
@@ -14012,7 +14284,9 @@ class DashboardPage(QWidget):
                         )
                     self._wait_for_gmail_attachment_layout(page)
 
-                page.wait_for_timeout(1000)
+                # A short settle lets Gmail register the last field input;
+                # the Send lookup below waits for the control itself.
+                page.wait_for_timeout(150)
                 self._dismiss_gmail_confidential_mode(page)
                 # Attachment rendering can replace portions of Compose. Find
                 # the primary control again before sending the final draft.
@@ -14065,8 +14339,6 @@ class DashboardPage(QWidget):
                             send_confirmed = self._wait_for_gmail_send_confirmation(page, send_button, timeout=5)
                 if not send_confirmed:
                     raise RuntimeError("Gmail did not finish sending the message.")
-                if not page.is_closed():
-                    page.wait_for_timeout(300)
                 if composed_inline:
                     session.fast_compose_sends = int(getattr(session, "fast_compose_sends", 0)) + 1
                 if log_steps:
@@ -14168,12 +14440,12 @@ class DashboardPage(QWidget):
                 # Require a short stable period so Gmail has time to finish
                 # replacing the temporary upload row with the final chip.
                 ready_streak += 1
-                if ready_streak >= 4:
+                if ready_streak >= 3:
                     return
             else:
                 ready_streak = 0
             last_visible_names = visible_names
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(150)
 
         missing = [name for name in expected_names if name not in last_visible_names]
         if missing:
@@ -14210,7 +14482,7 @@ class DashboardPage(QWidget):
                         return True
             except Exception:
                 pass
-            page.wait_for_timeout(200)
+            page.wait_for_timeout(50)
         return False
 
     def _confirm_gmail_send_dialog(self, page, *, timeout: float) -> bool:
@@ -14234,7 +14506,7 @@ class DashboardPage(QWidget):
                             return True
             except Exception:
                 pass
-            page.wait_for_timeout(200)
+            page.wait_for_timeout(100)
         return False
 
     def _gmail_visible_control(self, page, selectors: tuple[str, ...], *, timeout: int = 10000):
@@ -14249,7 +14521,7 @@ class DashboardPage(QWidget):
                             return candidate
                 except Exception:
                     continue
-            page.wait_for_timeout(200)
+            page.wait_for_timeout(50)
         raise RuntimeError(f"None of the expected controls became visible ({', '.join(selectors)}).")
 
     def _gmail_subject_input(self, page):
@@ -14280,7 +14552,7 @@ class DashboardPage(QWidget):
                         break
                 except Exception:
                     continue
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(100)
         raise RuntimeError("Gmail compose subject field did not become available.")
 
     def _gmail_recipient_input(self, page):
@@ -16186,10 +16458,10 @@ class DashboardPage(QWidget):
         self.sender_limit.setValue(int(getattr(self.state, "sender_limit", 300)))
         self.sender_limit.blockSignals(False)
         self.delay_from.blockSignals(True)
-        self.delay_from.setValue(float(getattr(self.state, "delay_from", 0.2)))
+        self.delay_from.setValue(float(getattr(self.state, "delay_from", DEFAULT_SEND_DELAY_SECONDS)))
         self.delay_from.blockSignals(False)
         self.delay_to.blockSignals(True)
-        self.delay_to.setValue(float(getattr(self.state, "delay_to", 0.5)))
+        self.delay_to.setValue(float(getattr(self.state, "delay_to", DEFAULT_SEND_DELAY_SECONDS)))
         self.delay_to.blockSignals(False)
         self.retry_count.blockSignals(True)
         self.retry_count.setValue(int(getattr(self.state, "retry_count", 3)))
@@ -16199,7 +16471,7 @@ class DashboardPage(QWidget):
         self.retry_enable_checkbox.blockSignals(False)
         self.automatic_send_checkbox.blockSignals(True)
         self.automatic_send_checkbox.setChecked(
-            bool(getattr(self.state, "automatic_no_delay", True))
+            bool(getattr(self.state, "automatic_no_delay", False))
         )
         self.automatic_send_checkbox.blockSignals(False)
         self.fast_compose_checkbox.blockSignals(True)
@@ -16209,7 +16481,7 @@ class DashboardPage(QWidget):
         self.delay_fixed_radio.blockSignals(True)
         self.delay_random_radio.blockSignals(True)
         self.delay_human_radio.blockSignals(True)
-        delay_type = getattr(self.state, "delay_type", "Auto (system-oriented)")
+        delay_type = getattr(self.state, "delay_type", "Fixed")
         self.delay_fixed_radio.setChecked(delay_type == "Fixed")
         self.delay_random_radio.setChecked(delay_type != "Fixed" and delay_type != "Human-like pattern")
         self.delay_human_radio.setChecked(delay_type == "Human-like pattern")
@@ -17545,6 +17817,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     _redirect_process_temp_dir()
     _sweep_browser_temp_dir(include_shared=True)
+    _keep_app_fully_active()
     try:
         ensure_api_server()
     except Exception as exc:
