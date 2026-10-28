@@ -185,6 +185,144 @@ def _set_hidden_file_attribute(path: Path) -> None:
             ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
     except Exception:
         pass
+
+
+# Scratch space for everything a browser run leaves on disk: temporary
+# (Incognito-mode) Chrome profiles, Chrome's own scoped_dir* files and
+# Playwright's playwright-artifacts-* folders. It lives in the app's hidden
+# data folder instead of the system temp dir, and anything in it no running
+# browser is using is swept on start-up, before every new profile and on
+# exit, so a force-quit never leaves folders behind for good.
+BROWSER_TEMP_DIR = LOCAL_CACHE_DIR / "browser-temp"
+BROWSER_TEMP_PROFILE_PREFIX = "profile-"
+# Profiles this process created and has not removed yet. A sweep never
+# touches these, even before Chrome has written its lock file into them.
+_LIVE_BROWSER_PROFILE_DIRS: set[Path] = set()
+_LIVE_BROWSER_PROFILE_LOCK = threading.Lock()
+# The system temp dir as it was before _redirect_process_temp_dir, for
+# sweeping profiles older builds created there.
+_SYSTEM_TEMP_DIR = Path(tempfile.gettempdir())
+
+
+def _redirect_process_temp_dir() -> None:
+    """Point TMP/TEMP/TMPDIR at BROWSER_TEMP_DIR for this process.
+
+    Chrome and the Playwright driver inherit the environment, so their
+    scratch folders land in our folder too. Python's tempfile already
+    cached the system temp dir at import, so the app's own attachment and
+    preview temp files keep using (and cleaning) the system temp dir.
+    """
+    try:
+        BROWSER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        _set_hidden_file_attribute(LOCAL_CACHE_DIR)
+        _set_hidden_file_attribute(BROWSER_TEMP_DIR)
+    except OSError:
+        return
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[name] = str(BROWSER_TEMP_DIR)
+
+
+def _new_temp_browser_profile_dir(label: str) -> Path:
+    BROWSER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-.") or "guest"
+    profile_dir = Path(tempfile.mkdtemp(prefix=f"{BROWSER_TEMP_PROFILE_PREFIX}{safe_label}-", dir=BROWSER_TEMP_DIR))
+    with _LIVE_BROWSER_PROFILE_LOCK:
+        _LIVE_BROWSER_PROFILE_DIRS.add(profile_dir)
+    return profile_dir
+
+
+def _browser_profile_in_use(profile_dir: Path) -> bool:
+    """True while a Chrome process (from any EzyMailer run) holds this profile."""
+    with _LIVE_BROWSER_PROFILE_LOCK:
+        if profile_dir in _LIVE_BROWSER_PROFILE_DIRS:
+            return True
+    if IS_WINDOWS:
+        # Chrome keeps "lockfile" open without delete sharing while it runs.
+        lock_file = profile_dir / "lockfile"
+        if not lock_file.exists():
+            return False
+        try:
+            lock_file.unlink()
+        except OSError:
+            return True
+        return False
+    # macOS/Linux: SingletonLock is a symlink to "<host>-<pid>".
+    try:
+        target = os.readlink(profile_dir / "SingletonLock")
+    except OSError:
+        return False
+    try:
+        pid = int(target.rsplit("-", 1)[-1])
+        os.kill(pid, 0)
+    except (ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_browser_profile_dir(profile_dir: Path) -> None:
+    """Delete a closed browser's temporary profile.
+
+    On Windows Chrome's child processes can hold files for a moment after
+    the browser process exits, so retry off the calling thread until the
+    folder is gone; a later sweep catches anything still left.
+    """
+    shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def finish() -> None:
+        for _ in range(20):
+            if not profile_dir.exists():
+                break
+            time.sleep(0.5)
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        with _LIVE_BROWSER_PROFILE_LOCK:
+            _LIVE_BROWSER_PROFILE_DIRS.discard(profile_dir)
+
+    if profile_dir.exists():
+        threading.Thread(target=finish, name="ezymailer-profile-cleanup", daemon=True).start()
+    else:
+        with _LIVE_BROWSER_PROFILE_LOCK:
+            _LIVE_BROWSER_PROFILE_DIRS.discard(profile_dir)
+
+
+def _sweep_browser_temp_dir(*, include_shared: bool = False) -> None:
+    """Remove temporary profiles no running browser is using.
+
+    include_shared also removes Playwright and Chrome scratch folders, which
+    can belong to a driver running right now, so only pass it when this
+    process has no browser automation running (start-up and exit).
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.extend(
+            path for path in BROWSER_TEMP_DIR.iterdir() if path.name.startswith(BROWSER_TEMP_PROFILE_PREFIX)
+        )
+    except OSError:
+        pass
+    # Profiles older builds made in the system temp dir ("ezymailer-<user>-<n>-*").
+    # "First Run" is the marker _seed_browser_profile_dir writes, which tells
+    # them apart from the app's attachment temp folders.
+    try:
+        candidates.extend(
+            path for path in _SYSTEM_TEMP_DIR.glob("ezymailer-*") if (path / "First Run").exists()
+        )
+    except OSError:
+        pass
+    for path in candidates:
+        if path.is_dir() and not _browser_profile_in_use(path):
+            shutil.rmtree(path, ignore_errors=True)
+    if not include_shared:
+        return
+    for root in (BROWSER_TEMP_DIR, _SYSTEM_TEMP_DIR):
+        try:
+            leftovers = [path for path in root.glob("playwright-artifacts-*") if path.is_dir()]
+            if root == BROWSER_TEMP_DIR:
+                leftovers.extend(path for path in root.glob("scoped_dir*") if path.is_dir())
+        except OSError:
+            continue
+        for path in leftovers:
+            shutil.rmtree(path, ignore_errors=True)
 ROLE_LOCAL_ONLY = Qt.UserRole + 10
 ROLE_LOCAL_DRAFT_ID = Qt.UserRole + 11
 BUILTIN_BROWSER_DIR_NAME = "playwright-browsers"
@@ -9669,8 +9807,8 @@ class DashboardPage(QWidget):
             profile_dir.mkdir(parents=True, exist_ok=True)
             is_temporary = False
         else:
-            prefix = f"ezymailer-{self.state.username or 'guest'}-{index}-"
-            profile_dir = Path(tempfile.mkdtemp(prefix=prefix))
+            _sweep_browser_temp_dir()
+            profile_dir = _new_temp_browser_profile_dir(f"{self.state.username or 'guest'}-{index}")
             is_temporary = True
         self._seed_browser_profile_dir(profile_dir)
         return profile_dir, is_temporary
@@ -9708,7 +9846,7 @@ class DashboardPage(QWidget):
         if profile_dir is None or not is_temporary:
             return
         try:
-            shutil.rmtree(profile_dir, ignore_errors=True)
+            _remove_browser_profile_dir(profile_dir)
         except Exception:
             pass
 
@@ -17397,10 +17535,16 @@ class MainWindow(QMainWindow):
                 self.dashboard_page._terminate_browser_sessions()
         except Exception:
             pass
+        try:
+            _sweep_browser_temp_dir(include_shared=True)
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
 def main() -> int:
+    _redirect_process_temp_dir()
+    _sweep_browser_temp_dir(include_shared=True)
     try:
         ensure_api_server()
     except Exception as exc:
