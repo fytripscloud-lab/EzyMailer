@@ -419,6 +419,59 @@ def _thread_playwright():
         yield playwright
 
 
+# Gmail's bottom-left notices ("Sending...", "Message sent  Undo", errors).
+# Read-only: clicking anything in them can hit Undo or Cancel.
+GMAIL_NOTICE_JS = """
+(subject) => {
+    const visible = (e) => e.offsetParent !== null;
+    const text = (sel) => [...document.querySelectorAll(sel)].filter(visible)
+        .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
+    const reopened = !!subject && [...document.querySelectorAll('input[name="subjectbox"]')]
+        .some(e => visible(e) && e.value === subject);
+    // Compose windows are dialogs too; their text is the user's own email.
+    const dialogs = [...document.querySelectorAll('[role="alertdialog"], [role="dialog"]')]
+        .filter(e => visible(e) && !e.querySelector('input[name="subjectbox"]'))
+        .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | ');
+    return {notice: text('[role="alert"]'), dialogs, reopened};
+}
+"""
+GMAIL_SEND_ERROR_RE = re.compile(
+    r"limit for sending|sending limit|not sent|couldn.t (?:be )?sen[dt]|could not (?:be )?sen[dt]|"
+    r"unable to send|failed to send",
+    re.IGNORECASE,
+)
+
+
+def _gmail_sends_pending(page) -> bool:
+    """True while Gmail is still sending or holding a message in its Undo window."""
+    notice = str(page.evaluate(GMAIL_NOTICE_JS, "")["notice"])
+    return bool(re.search(r"sending|undo", notice, re.IGNORECASE)) and "discarded" not in notice.lower()
+
+
+def _wait_for_gmail_sends_to_settle(page, timeout: float = 30.0) -> None:
+    """Wait until Gmail has finished every send started from this tab.
+
+    Reloading or closing the tab while Gmail still shows "Sending..." or its
+    Undo notice can leave the message unsent.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if page.is_closed() or not _gmail_sends_pending(page):
+                return
+        except Exception:
+            return
+        page.wait_for_timeout(200)
+
+
+def _settle_lane_gmail_pages() -> None:
+    state = getattr(_LANE_PLAYWRIGHT, "state", None)
+    if state is None:
+        return
+    for page in list(state["active_pages"]):
+        _wait_for_gmail_sends_to_settle(page)
+
+
 def _windows_process_tree(root_pid: int) -> list[int]:
     """The root process and all its descendants (Chrome's renderers, GPU...)."""
     import ctypes
@@ -1971,6 +2024,11 @@ class SmtpRecipientQueue:
         with self._lock:
             return self._items.pop() if self._items else None
 
+    def push(self, recipient: str) -> None:
+        """Return a recipient to the front of the queue."""
+        with self._lock:
+            self._items.append(recipient)
+
     def remaining(self) -> int:
         with self._lock:
             return len(self._items)
@@ -2364,6 +2422,13 @@ class CampaignBrowserClosedError(RuntimeError):
     """Raised when a campaign's browser window is no longer available."""
 
 
+class GmailSendUnconfirmedError(RuntimeError):
+    """Send was clicked but Gmail never confirmed or refused it.
+
+    Not retried: the message may have gone out, and a retry could send it twice.
+    """
+
+
 class CampaignSendWorker(QObject):
     log = Signal(str)
     email_sent = Signal(str, str)
@@ -2447,6 +2512,9 @@ class CampaignSendWorker(QObject):
             return max(self.delay_from, min(self.delay_to, base * random.uniform(0.75, 1.15)))
         return random.uniform(self.delay_from, self.delay_to)
 
+    def _return_unsent(self, recipient: str) -> None:
+        """Hand back a recipient this lane could not send (see QueueLaneWorker)."""
+
     def _iter_tasks(self):
         if self.recipient_queue_path is None:
             yield from self.tasks
@@ -2517,6 +2585,9 @@ class CampaignSendWorker(QObject):
                             # only its own queue. Other browser workers remain
                             # independent and continue sending.
                             error_message = str(exc)
+                            self._return_unsent(recipient)
+                            break
+                        if isinstance(exc, GmailSendUnconfirmedError):
                             break
                         if getattr(exc, "errno", None) == errno.ENOSPC:
                             error_message = "Not enough free storage space to prepare the email."
@@ -2555,6 +2626,7 @@ class CampaignSendWorker(QObject):
             error_message = str(exc)
             self.log.emit(f"[{self._timestamp()}] {self.window_label} failed to read its recipient queue: {error_message}")
         finally:
+            _settle_lane_gmail_pages()
             _LANE_PLAYWRIGHT.enabled = False
             _close_lane_playwright()
 
@@ -2601,6 +2673,12 @@ class QueueLaneWorker(CampaignSendWorker):
         self.shared_queue = shared_queue
         self.lane_limit = max(1, int(lane_limit))
         self.row = row
+
+    def _return_unsent(self, recipient: str) -> None:
+        # This lane stopped (window closed, Gmail limit); another lane sends it.
+        with self._taken_lock:
+            self.shared_queue.push(recipient)
+            self.row.lane_taken = max(0, self.row.lane_taken - 1)
 
     def _iter_tasks(self):
         row = self.row
@@ -11917,6 +11995,19 @@ class DashboardPage(QWidget):
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         return page
 
+    @staticmethod
+    def _in_gmail_notice(control) -> bool:
+        """True for controls on Gmail's "Sending... / Message sent  Undo" notice.
+
+        Its Close (X) matches the compose Close selector; clicking it while the
+        notice turns into "Message sent  Undo" can hit Undo, which cancels the
+        send and reopens the message as a draft.
+        """
+        try:
+            return bool(control.evaluate("e => !!e.closest('[role=\"alert\"]')"))
+        except Exception:
+            return True
+
     def _close_stale_gmail_compose(self, page) -> None:
         """Close unsent Gmail drafts before opening the next compose window."""
         discard_selectors = (
@@ -11929,7 +12020,7 @@ class DashboardPage(QWidget):
                 controls = page.locator(selector)
                 for index in range(controls.count() - 1, -1, -1):
                     control = controls.nth(index)
-                    if control.is_visible():
+                    if control.is_visible() and not self._in_gmail_notice(control):
                         control.click(timeout=1500)
                         # Wait for the draft to actually close so the next
                         # Compose's fields are not confused with its fields.
@@ -11949,7 +12040,7 @@ class DashboardPage(QWidget):
                 controls = page.locator(selector)
                 for index in range(controls.count() - 1, -1, -1):
                     control = controls.nth(index)
-                    if control.is_visible():
+                    if control.is_visible() and not self._in_gmail_notice(control):
                         control.click(timeout=1500)
                         # Wait for the draft to actually close so the next
                         # Compose's fields are not confused with its fields.
@@ -12034,6 +12125,7 @@ class DashboardPage(QWidget):
             or (sends_done > 0 and sends_done % FAST_COMPOSE_RELOAD_EVERY == 0)
         )
         if needs_reload:
+            _wait_for_gmail_sends_to_settle(page)
             page.goto(
                 "https://mail.google.com/mail/u/0/#inbox",
                 wait_until="domcontentloaded",
@@ -14376,6 +14468,9 @@ class DashboardPage(QWidget):
                 if not send_confirmed:
                     raise RuntimeError("Gmail did not finish sending the message.")
                 if composed_inline:
+                    # A closed Compose is not proof of sending; wait for Gmail's verdict.
+                    self._wait_for_gmail_send_outcome(page, session, subject)
+                if composed_inline:
                     session.fast_compose_sends = int(getattr(session, "fast_compose_sends", 0)) + 1
                 if log_steps:
                     self._log_action(f"Gmail send completed for {recipient}")
@@ -14520,6 +14615,55 @@ class DashboardPage(QWidget):
                 pass
             page.wait_for_timeout(50)
         return False
+
+    def _wait_for_gmail_send_outcome(
+        self,
+        page,
+        session: BrowserSessionHandle | BrowserTabHandle,
+        subject: str,
+        *,
+        timeout: float = 45.0,
+    ) -> None:
+        """Return once Gmail says "Message sent"; raise if it refuses or reopens the draft."""
+        started = time.monotonic()
+        seen_sending = False
+        while time.monotonic() - started < timeout:
+            if page.is_closed():
+                raise CampaignBrowserClosedError(
+                    "Gmail browser window was closed before the send could be confirmed."
+                )
+            try:
+                state = page.evaluate(GMAIL_NOTICE_JS, subject)
+            except Exception:
+                page.wait_for_timeout(100)
+                continue
+            notice = str(state.get("notice") or "")
+            problem = GMAIL_SEND_ERROR_RE.search(f"{notice} | {state.get('dialogs') or ''}")
+            if problem:
+                message = f"Gmail did not send the message: {problem.group(0)}"
+                if "limit" in problem.group(0).lower():
+                    self._halt_gmail_row(session, f"Gmail sending limit reached ({problem.group(0)})")
+                raise RuntimeError(message)
+            if state.get("reopened"):
+                raise RuntimeError("Gmail returned the message to a draft instead of sending it.")
+            if re.search(r"sending", notice, re.IGNORECASE):
+                seen_sending = True
+            elif re.search(r"message sent", notice, re.IGNORECASE) and (
+                seen_sending or time.monotonic() - started > 1.5
+            ):
+                return
+            page.wait_for_timeout(100)
+        raise GmailSendUnconfirmedError(
+            "Gmail never confirmed this message as sent; check the account's Sent and Drafts."
+        )
+
+    def _halt_gmail_row(self, session: BrowserSessionHandle | BrowserTabHandle, reason: str) -> None:
+        """Stop every tab of this browser window; its recipients go to other windows."""
+        row = getattr(self, "_lane_row_of", {}).get(session.session_id, session)
+        if hasattr(row, "halt_reason"):
+            row.halt_reason = reason
+            row.halt_status = "Limit"
+        raise CampaignBrowserClosedError(reason)
 
     def _confirm_gmail_send_dialog(self, page, *, timeout: float) -> bool:
         """Accept Gmail's optional keyboard-shortcut confirmation dialog."""
