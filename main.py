@@ -400,6 +400,25 @@ def _close_lane_playwright() -> None:
         pass
 
 
+@contextlib.contextmanager
+def _thread_playwright():
+    """Yield a Playwright instance usable on the calling thread.
+
+    Only one sync Playwright can run per thread, so code that runs inside a
+    campaign lane (attachment rendering) must reuse the lane's open one;
+    starting another fails with "using Playwright Sync API inside the
+    asyncio loop".
+    """
+    state = getattr(_LANE_PLAYWRIGHT, "state", None)
+    if state is not None:
+        yield state["playwright"]
+        return
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        yield playwright
+
+
 def _windows_process_tree(root_pid: int) -> list[int]:
     """The root process and all its descendants (Chrome's renderers, GPU...)."""
     import ctypes
@@ -11623,10 +11642,9 @@ class DashboardPage(QWidget):
     def _render_html_to_jpg(self, html_content: str, output_path: Path) -> None:
         ensure_external_dependencies()
         from PIL import Image
-        from playwright.sync_api import sync_playwright
 
         html_content = html_content.strip() or "<html><body></body></html>"
-        with sync_playwright() as playwright:
+        with _thread_playwright() as playwright:
             binary = self._browser_binary()
             if binary is None:
                 raise RuntimeError("No bundled Chromium runtime was found for this app.")
@@ -14052,6 +14070,7 @@ class DashboardPage(QWidget):
             state = {
                 "session_id": session.session_id,
                 "manager": manager,
+                "playwright": playwright,
                 "browser": browser,
                 "active_pages": {},
             }
