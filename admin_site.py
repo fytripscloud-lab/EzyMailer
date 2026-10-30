@@ -257,6 +257,7 @@ def _html() -> str:
         display_name: "",
         role: "user",
         login_valid_until: "",
+        max_devices: "1",
         loginRestriction: "keep",
         password: "",
       });
@@ -266,6 +267,7 @@ def _html() -> str:
         display_name: "",
         role: "user",
         login_valid_until: "",
+        max_devices: "1",
         loginRestriction: "keep",
         password: "",
       }), []);
@@ -307,6 +309,7 @@ def _html() -> str:
             display_name: selectedUser.display_name || "",
             role: selectedUser.role || "user",
             login_valid_until: selectedUser.login_valid_until ? String(selectedUser.login_valid_until).slice(0, 16) : "",
+            max_devices: String(selectedUser.max_devices || 1),
             loginRestriction: "keep",
             password: "",
           });
@@ -540,6 +543,7 @@ def _html() -> str:
           display_name: source.display_name.trim(),
           role: source.role || "user",
           login_valid_until: source.login_valid_until ? new Date(source.login_valid_until).toISOString() : null,
+          max_devices: Math.min(1000, Math.max(1, parseInt(source.max_devices, 10) || 1)),
         };
         if (source.password.trim()) payload.reset_password = source.password.trim();
         if (source.loginRestriction === "any") payload.clear_device_binding = true;
@@ -562,6 +566,7 @@ def _html() -> str:
           display_name: user.display_name || "",
           role: user.role || "user",
           login_valid_until: user.login_valid_until ? String(user.login_valid_until).slice(0, 16) : "",
+          max_devices: String(user.max_devices || 1),
           loginRestriction: "keep",
           password: "",
         });
@@ -591,6 +596,19 @@ def _html() -> str:
         await openDetails(detailData.user);
       };
 
+      const removeDevice = async (device) => {
+        if (!detailData?.user?.id) return;
+        if (!window.confirm(`Log out ${device.device_name || "this device"}? It frees one device slot for ${detailData.user.username}.`)) return;
+        try {
+          await request(auth, `/api/admin/users/${detailData.user.id}/devices/${device.id}`, { method: "DELETE" });
+          notify("Device logged out", "success");
+          await refreshUsers();
+          await openDetails(detailData.user);
+        } catch (error) {
+          notify(error.message || String(error), "error");
+        }
+      };
+
       const submitUser = async () => {
         if (!auth?.access_token) return notify("Sign in as admin first", "warning");
         const payload = buildUserPayload();
@@ -608,6 +626,7 @@ def _html() -> str:
               display_name: payload.display_name,
               is_active: payload.is_active !== false,
               login_valid_until: payload.login_valid_until || null,
+              max_devices: payload.max_devices,
             }),
           });
           notify("User created", "success");
@@ -928,7 +947,7 @@ def _html() -> str:
             <Table stickyHeader size="small">
               <TableHead>
                 <TableRow>
-                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Last Login", "Emails Sent", "Actions"].map((head) => (
+                  {["ID", "Username", "Name", "Permission", "Status", "Validity", "Devices", "Last Login", "Emails Sent", "Actions"].map((head) => (
                     <TableCell key={head} sx={{ fontWeight: 900 }}>{head}</TableCell>
                   ))}
                 </TableRow>
@@ -942,6 +961,14 @@ def _html() -> str:
                     <TableCell><Chip size="small" label={fmt(user.role)} color={String(user.role || "").toLowerCase() === "admin" ? "secondary" : "default"} /></TableCell>
                     <TableCell><Chip size="small" label={user.is_active ? "Active" : "Inactive"} color={user.is_active ? "success" : "error"} /></TableCell>
                     <TableCell>{formatDate(user.login_valid_until)}</TableCell>
+                    <TableCell>
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label={`${Number(user.device_count || 0)} / ${Number(user.max_devices || 1)}`}
+                        color={Number(user.device_count || 0) >= Number(user.max_devices || 1) ? "warning" : "default"}
+                      />
+                    </TableCell>
                     <TableCell>{`${formatDate(user.last_login_at)} ${fmt(user.last_login_ip)}`}</TableCell>
                     <TableCell>{Number(user.sent_email_count || 0).toLocaleString()}</TableCell>
                     <TableCell>
@@ -951,7 +978,7 @@ def _html() -> str:
                 ))}
                 {!pagedUsers.length && (
                   <TableRow>
-                    <TableCell colSpan={9}>
+                    <TableCell colSpan={10}>
                       <Typography color="text.secondary">No users found for the current search and filter.</Typography>
                     </TableCell>
                   </TableRow>
@@ -1380,13 +1407,11 @@ def _html() -> str:
                 ["deactivate", "Deactivate", menuUser && !!menuUser.is_active],
                 ["admin", "Set Admin", menuUser && String(menuUser.role || "").toLowerCase() !== "admin"],
                 ["user", "Set User", menuUser && String(menuUser.role || "").toLowerCase() === "admin"],
-                ["any-device", "Allow any device", menuUser && !!(menuUser.device_fingerprint || menuUser.device_name)],
-                ["keep-device", "Keep current device", menuUser && !(menuUser.device_fingerprint || menuUser.device_name)],
                 ["valid-30", "Validity +30d"],
                 ["valid-90", "Validity +90d"],
                 ["clear-validity", "Clear validity", menuUser && !!menuUser.login_valid_until],
                 ["reset-password", "Reset password"],
-                ["reset-device", "Reset device", menuUser && !!(menuUser.device_fingerprint || menuUser.device_name)],
+                ["reset-device", "Log out all devices", menuUser && Number(menuUser.device_count || 0) > 0],
               ].filter(([, , visible = true]) => visible).map(([value, label]) => <MenuItem key={value} onClick={() => handleMenu(value)}>{label}</MenuItem>)}
             </Menu>
 
@@ -1444,7 +1469,7 @@ def _html() -> str:
                         onClick={() => detailData?.user && runDetailAction("/reset-device")}
                         disabled={detailLoading || !detailData?.user}
                       >
-                        Reset Device
+                        Log Out All Devices
                       </Button>
                       <Button variant="contained" onClick={() => setDetailOpen(false)}>Close</Button>
                     </Stack>
@@ -1469,6 +1494,7 @@ def _html() -> str:
                           ["Online Status", detailData.online_status ? "Online" : "Offline"],
                           ["Emails Sent", Number(detailData.user.sent_email_count || 0).toLocaleString()],
                           ["Validity", formatDate(detailData.user.login_valid_until) || "No expiry set"],
+                          ["Devices", `${Number(detailData.user.device_count || 0)} of ${Number(detailData.user.max_devices || 1)} in use`],
                           ["Last Login", `${formatDate(detailData.user.last_login_at)} ${fmt(detailData.user.last_login_ip)}`],
                         ].map(([label, value]) => (
                           <Grid item xs={12} sm={6} lg={4} key={label}>
@@ -1502,6 +1528,48 @@ def _html() -> str:
                                 <TableRow>
                                   <TableCell colSpan={2}>
                                     <Typography color="text.secondary">No emails sent yet.</Typography>
+                                  </TableCell>
+                                </TableRow>
+                              )}
+                            </TableBody>
+                          </Table>
+                        </TableContainer>
+                      </Paper>
+
+                      <Paper variant="outlined" sx={{ p: 2, borderRadius: 1.5 }}>
+                        <Typography variant="h6" fontWeight={900}>Logged-in Devices</Typography>
+                        <Typography color="text.secondary" sx={{ mb: 2 }}>
+                          {`${Number(detailData.user.device_count || 0)} of ${Number(detailData.user.max_devices || 1)} allowed devices in use. Logging a device out frees its slot. Admin portal browsers do not count toward the limit.`}
+                        </Typography>
+                        <TableContainer sx={{ maxHeight: 360, overflow: "auto" }}>
+                          <Table stickyHeader size="small">
+                            <TableHead>
+                              <TableRow>
+                                {["Device", "Device ID", "IP", "First Login", "Last Login", ""].map((head) => (
+                                  <TableCell key={head || "actions"} sx={{ fontWeight: 900 }}>{head}</TableCell>
+                                ))}
+                              </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {(detailData.devices || []).map((device) => (
+                                <TableRow key={device.id} hover>
+                                  <TableCell>
+                                    {device.device_name || "Unknown"}
+                                    {device.is_portal && <Chip size="small" label="Admin portal" sx={{ ml: 1 }} />}
+                                  </TableCell>
+                                  <TableCell sx={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{device.device_key}</TableCell>
+                                  <TableCell>{device.device_ip || ""}</TableCell>
+                                  <TableCell>{formatDate(device.first_login_at)}</TableCell>
+                                  <TableCell>{formatDate(device.last_login_at)}</TableCell>
+                                  <TableCell align="right">
+                                    <Button size="small" color="error" variant="outlined" onClick={() => removeDevice(device)}>Log out</Button>
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                              {!(detailData.devices || []).length && (
+                                <TableRow>
+                                  <TableCell colSpan={6}>
+                                    <Typography color="text.secondary">No devices are logged in for this user.</Typography>
                                   </TableCell>
                                 </TableRow>
                               )}
@@ -1768,11 +1836,22 @@ def _html() -> str:
                       <FormControl fullWidth>
                         <InputLabel>Login Restriction</InputLabel>
                         <Select label="Login Restriction" value={form.loginRestriction} onChange={(e) => setForm((prev) => ({ ...prev, loginRestriction: e.target.value }))}>
-                          <MenuItem value="keep">Keep current device binding</MenuItem>
-                          <MenuItem value="any">Allow any device</MenuItem>
+                          <MenuItem value="keep">Keep logged-in devices</MenuItem>
+                          <MenuItem value="any">Log out all devices</MenuItem>
                           <MenuItem value="disable">Disable login</MenuItem>
                         </Select>
                       </FormControl>
+                    </Grid>
+                    <Grid item xs={12} md={6}>
+                      <TextField
+                        label="Allowed Devices"
+                        type="number"
+                        value={form.max_devices}
+                        onChange={(e) => setForm((prev) => ({ ...prev, max_devices: e.target.value }))}
+                        inputProps={{ min: 1, max: 1000, step: 1 }}
+                        helperText="How many devices can be logged in with this username at the same time."
+                        fullWidth
+                      />
                     </Grid>
                     <Grid item xs={12} md={6}>
                       <TextField

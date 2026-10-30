@@ -82,6 +82,16 @@ PASSWORD_ALGORITHM = "sha256"
 JWT_SECRET = os.getenv("EZYM_MAILER_JWT_SECRET", "ezymailer-local-development-secret")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_MINUTES = 24 * 60
+# A user may stay logged in on up to user_db.max_devices devices at once;
+# each device has its own row and session in user_devices. Admin-portal
+# browser logins are stored with PORTAL_DEVICE_PREFIX and never count
+# toward the limit, so a full user can still be managed from the portal.
+MAX_DEVICES_LIMIT = 1000
+PORTAL_DEVICE_PREFIX = "portal:"
+DEVICE_COUNT_SQL = (
+    "(SELECT COUNT(*) FROM user_devices d "
+    "WHERE d.user_id = user_db.id AND LEFT(d.device_key, 7) <> 'portal:') AS device_count"
+)
 
 _server_thread: threading.Thread | None = None
 _bootstrap_lock = threading.Lock()
@@ -127,6 +137,7 @@ class CreateUserRequest(BaseModel):
     display_name: str = Field(default="", max_length=128)
     is_active: bool = True
     login_valid_until: datetime | None = None
+    max_devices: int = Field(default=1, ge=1, le=MAX_DEVICES_LIMIT)
 
 
 class UpdateUserRequest(BaseModel):
@@ -137,6 +148,7 @@ class UpdateUserRequest(BaseModel):
     login_valid_until: datetime | None = None
     reset_password: str | None = Field(default=None, max_length=255)
     clear_device_binding: bool = False
+    max_devices: int | None = Field(default=None, ge=1, le=MAX_DEVICES_LIMIT)
 
 
 class ResetPasswordRequest(BaseModel):
@@ -461,6 +473,7 @@ def _ensure_schema() -> None:
                 "ALTER TABLE user_db ADD COLUMN last_login_at TIMESTAMP NULL DEFAULT NULL",
                 "ALTER TABLE user_db ADD COLUMN last_login_ip VARCHAR(45) NULL",
                 "ALTER TABLE user_db ADD COLUMN last_login_device VARCHAR(255) NULL",
+                "ALTER TABLE user_db ADD COLUMN max_devices INT UNSIGNED NOT NULL DEFAULT 1",
             ):
                 try:
                     cursor.execute(column_sql)
@@ -484,6 +497,23 @@ def _ensure_schema() -> None:
                 )
             else:
                 _migrate_plaintext_passwords(cursor)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_devices (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    user_id INT UNSIGNED NOT NULL,
+                    device_key VARCHAR(255) NOT NULL,
+                    device_name VARCHAR(255) NULL,
+                    device_ip VARCHAR(45) NULL,
+                    session_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                    first_login_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_login_at TIMESTAMP NULL DEFAULT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uq_user_devices (user_id, device_key),
+                    KEY idx_user_devices_user (user_id, last_login_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS login_history (
@@ -710,6 +740,7 @@ def _create_token(user: dict[str, str], session_version: int = 0) -> str:
         "role": user["role"],
         "uid": user["id"],
         "ver": int(session_version or 0),
+        "dev": int(user.get("device_id") or 0),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=JWT_EXPIRES_MINUTES)).timestamp()),
     }
@@ -731,7 +762,8 @@ def _authenticate(
             cursor.execute(
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
-                       device_fingerprint, device_name, device_ip,
+                       device_fingerprint, device_name, device_ip, device_bound_at,
+                       last_login_device, max_devices,
                        password, password_hash, password_salt
                 FROM user_db
                 WHERE username = %s
@@ -744,18 +776,34 @@ def _authenticate(
             if not _verify_password(password, row.get("password_hash"), row.get("password_salt"), row.get("password")):
                 return None
             _assert_user_login_allowed(row, request, device_fingerprint, bypass_device_restriction=bypass_device_restriction)
-            stored_fingerprint = str(row.get("device_fingerprint") or "").strip()
-            incoming_fingerprint = str(device_fingerprint or "").strip()
-            if (
-                stored_fingerprint
-                and incoming_fingerprint
-                and stored_fingerprint != incoming_fingerprint
-                and not force_logout_other_device
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=_login_conflict_payload(row, request, device_fingerprint, device_name),
+            device_key = _device_key(device_fingerprint, portal=bypass_device_restriction)
+            if not bypass_device_restriction:
+                max_devices = max(1, int(row.get("max_devices") or 1))
+                cursor.execute(
+                    """
+                    SELECT id, device_key, device_name, device_ip, first_login_at, last_login_at
+                    FROM user_devices
+                    WHERE user_id = %s AND LEFT(device_key, 7) <> 'portal:'
+                    ORDER BY COALESCE(last_login_at, first_login_at) ASC, id ASC
+                    """,
+                    (row["id"],),
                 )
+                devices = cursor.fetchall() or []
+                known_device = any(device["device_key"] == device_key for device in devices)
+                if not known_device and len(devices) >= max_devices:
+                    if not force_logout_other_device:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=_login_conflict_payload(
+                                row, request, device_fingerprint, device_name, devices, max_devices
+                            ),
+                        )
+                    # Make room by logging out the least recently used devices.
+                    evicted = [int(device["id"]) for device in devices[: len(devices) - max_devices + 1]]
+                    cursor.execute(
+                        f"DELETE FROM user_devices WHERE id IN ({', '.join(['%s'] * len(evicted))})",
+                        evicted,
+                    )
             if not row.get("password_hash") or not row.get("password_salt") or row.get("password"):
                 salt, digest = _hash_password(password)
                 cursor.execute(
@@ -768,12 +816,11 @@ def _authenticate(
                     """,
                     (digest, salt, row["id"]),
                 )
-            bind_device_fingerprint = (device_fingerprint or "").strip() or row.get("device_fingerprint")
-            bind_device_name = (device_name or "").strip() or row.get("device_name")
-            session_version = _bind_or_refresh_device(
+            device_id, session_version = _bind_or_refresh_device(
                 int(row["id"]),
-                bind_device_fingerprint,
-                bind_device_name,
+                device_key,
+                device_fingerprint,
+                device_name,
                 request,
             )
             return {
@@ -782,6 +829,7 @@ def _authenticate(
                 "display_name": str(row.get("display_name") or ""),
                 "role": str(row["role"]),
                 "session_version": str(session_version),
+                "device_id": str(device_id),
             }
     finally:
         connection.close()
@@ -794,6 +842,7 @@ def _create_user(
     display_name: str = "",
     is_active: bool = True,
     login_valid_until: datetime | None = None,
+    max_devices: int = 1,
 ) -> dict[str, Any]:
     connection = _connect(DB_NAME)
     try:
@@ -808,8 +857,8 @@ def _create_user(
             salt, digest = _hash_password(password)
             cursor.execute(
                 """
-                INSERT INTO user_db (username, password, password_hash, password_salt, display_name, role, is_active, login_valid_until)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO user_db (username, password, password_hash, password_salt, display_name, role, is_active, login_valid_until, max_devices)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     username,
@@ -820,6 +869,7 @@ def _create_user(
                     role or "user",
                     1 if is_active else 0,
                     login_valid_until,
+                    max(1, int(max_devices or 1)),
                 ),
             )
             user_id = cursor.lastrowid
@@ -830,6 +880,8 @@ def _create_user(
                 "role": role or "user",
                 "is_active": bool(is_active),
                 "login_valid_until": login_valid_until,
+                "max_devices": max(1, int(max_devices or 1)),
+                "device_count": 0,
             }
     finally:
         connection.close()
@@ -843,8 +895,9 @@ def _list_users() -> list[dict[str, str]]:
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
-                       last_login_at, last_login_ip, last_login_device, created_at, updated_at,
-                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count
+                       last_login_at, last_login_ip, last_login_device, created_at, updated_at, max_devices,
+                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count,
+                       """ + DEVICE_COUNT_SQL + """
                 FROM user_db
                 ORDER BY id ASC
                 """
@@ -943,6 +996,8 @@ def _user_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "sent_email_count": int(row.get("sent_email_count") or 0),
+        "max_devices": max(1, int(row.get("max_devices") or 1)),
+        "device_count": int(row.get("device_count") or 0),
         "online_status": online_status,
         "online_status_label": "Online" if online_status else "Offline",
     }
@@ -1054,22 +1109,44 @@ def _assert_user_login_allowed(
     # Device history is tracked for audit and display, but it does not block login.
 
 
+def _device_key(device_fingerprint: str | None, *, portal: bool = False) -> str:
+    key = (device_fingerprint or "").strip() or "unknown"
+    return f"{PORTAL_DEVICE_PREFIX}{key}"[:255] if portal else key
+
+
+def _iso_or_none(value: Any) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
 def _login_conflict_payload(
     row: dict[str, Any],
     request: Request | None,
     device_fingerprint: str | None,
     device_name: str | None,
+    devices: list[dict[str, Any]],
+    max_devices: int,
 ) -> dict[str, object]:
     current_ip = _client_ip(request) or ""
     current_fingerprint = (device_fingerprint or "").strip()
     current_name = (device_name or "").strip()
-    registered_fingerprint = str(row.get("device_fingerprint") or "").strip()
-    registered_name = str(row.get("device_name") or "").strip()
-    registered_ip = str(row.get("device_ip") or "").strip()
+    # The device that is logged out if the user continues.
+    oldest = devices[0] if devices else {}
+    registered_fingerprint = str(oldest.get("device_key") or "").strip()
+    registered_name = str(oldest.get("device_name") or "").strip()
+    registered_ip = str(oldest.get("device_ip") or "").strip()
+    if max_devices == 1:
+        error = "You are already logged in on another device."
+        message = "You are already logged in on another device. Do you want to log out from the other device and continue?"
+    else:
+        label = registered_name or "the least recently used device"
+        error = f"This account is already logged in on {len(devices)} of {max_devices} allowed devices."
+        message = f"{error} Do you want to log out {label} and continue on this device?"
     return {
-        "error": "You are already logged in on another device.",
-        "message": "You are already logged in on another device. Do you want to log out from the other device and continue?",
+        "error": error,
+        "message": message,
         "action_required": "confirm_logout_other_device",
+        "max_devices": max_devices,
+        "device_count": len(devices),
         "current_device": {
             "device_fingerprint": current_fingerprint,
             "mac_id": current_fingerprint,
@@ -1082,32 +1159,47 @@ def _login_conflict_payload(
             "device_name": registered_name,
             "device_ip": registered_ip,
             "last_login_device": str(row.get("last_login_device") or ""),
-            "device_bound_at": row.get("device_bound_at"),
+            "device_bound_at": _iso_or_none(oldest.get("first_login_at") or row.get("device_bound_at")),
         },
     }
 
 
 def _bind_or_refresh_device(
     user_id: int,
+    device_key: str,
     device_fingerprint: str | None,
     device_name: str | None,
     request: Request | None,
-) -> int:
+) -> tuple[int, int]:
+    """Register or refresh one device session; return (device_id, session_version).
+
+    Logging in again on the same device starts a new session there, which
+    ends that device's previous session but leaves every other device alone.
+    """
     connection = _connect(DB_NAME)
     try:
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             ip_address = _client_ip(request)
             cursor.execute(
                 """
+                INSERT INTO user_devices (user_id, device_key, device_name, device_ip, session_version, last_login_at)
+                VALUES (%s, %s, NULLIF(%s, ''), NULLIF(%s, ''), 1, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE
+                    session_version = session_version + 1,
+                    device_name = COALESCE(VALUES(device_name), device_name),
+                    device_ip = COALESCE(VALUES(device_ip), device_ip),
+                    last_login_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, device_key, (device_name or "").strip(), (ip_address or "").strip()),
+            )
+            # The user row keeps the most recent device for the admin overview.
+            cursor.execute(
+                """
                 UPDATE user_db
                 SET device_fingerprint = COALESCE(NULLIF(%s, ''), device_fingerprint),
                     device_name = COALESCE(NULLIF(%s, ''), device_name),
                     device_ip = COALESCE(NULLIF(%s, ''), device_ip),
-                    session_version = COALESCE(session_version, 0) + 1,
-                    device_bound_at = CASE
-                        WHEN device_fingerprint IS NULL OR device_fingerprint = '' THEN CURRENT_TIMESTAMP
-                        ELSE device_bound_at
-                    END,
+                    device_bound_at = COALESCE(device_bound_at, CURRENT_TIMESTAMP),
                     last_login_at = CURRENT_TIMESTAMP,
                     last_login_ip = %s,
                     last_login_device = %s
@@ -1123,11 +1215,11 @@ def _bind_or_refresh_device(
                 ),
             )
             cursor.execute(
-                "SELECT session_version FROM user_db WHERE id = %s LIMIT 1",
-                (user_id,),
+                "SELECT id, session_version FROM user_devices WHERE user_id = %s AND device_key = %s LIMIT 1",
+                (user_id, device_key),
             )
-            row = cursor.fetchone()
-            return int((row or {}).get("session_version") or 0)
+            row = cursor.fetchone() or {}
+            return int(row.get("id") or 0), int(row.get("session_version") or 0)
     finally:
         connection.close()
 
@@ -1181,6 +1273,7 @@ def _update_user_record(user_id: int, payload: dict[str, Any]) -> dict[str, Any]
             login_valid_until = payload.get("login_valid_until")
             reset_password = str(payload.get("reset_password") or "").strip()
             clear_device_binding = bool(payload.get("clear_device_binding"))
+            max_devices = payload.get("max_devices")
 
             if new_username != old_username:
                 cursor.execute(
@@ -1204,6 +1297,9 @@ def _update_user_record(user_id: int, payload: dict[str, Any]) -> dict[str, Any]
             if login_valid_until is not None:
                 update_parts.append("login_valid_until = %s")
                 params.append(login_valid_until)
+            if max_devices is not None:
+                update_parts.append("max_devices = %s")
+                params.append(max(1, int(max_devices)))
             if reset_password:
                 salt, digest = _hash_password(reset_password)
                 update_parts.extend(["password = %s", "password_hash = %s", "password_salt = %s"])
@@ -1217,6 +1313,8 @@ def _update_user_record(user_id: int, payload: dict[str, Any]) -> dict[str, Any]
                         "device_bound_at = NULL",
                     ]
                 )
+                # Ends every device's session; each device registers again on its next login.
+                cursor.execute("DELETE FROM user_devices WHERE user_id = %s", (user_id,))
 
             params.append(user_id)
             cursor.execute(
@@ -1224,7 +1322,9 @@ def _update_user_record(user_id: int, payload: dict[str, Any]) -> dict[str, Any]
                 params,
             )
             cursor.execute(
-                "SELECT id, username, display_name, role, is_active, login_valid_until, device_fingerprint, device_name, device_ip, device_bound_at, last_login_at, last_login_ip, last_login_device, created_at, updated_at FROM user_db WHERE id = %s LIMIT 1",
+                "SELECT id, username, display_name, role, is_active, login_valid_until, device_fingerprint, device_name, device_ip, device_bound_at, last_login_at, last_login_ip, last_login_device, created_at, updated_at, max_devices, "
+                + DEVICE_COUNT_SQL
+                + " FROM user_db WHERE id = %s LIMIT 1",
                 (user_id,),
             )
             updated = cursor.fetchone()
@@ -1495,12 +1595,27 @@ def _decode_bearer_token(authorization: str | None) -> dict[str, Any]:
         "username": str(payload.get("sub", "")),
         "role": str(payload.get("role", "")),
         "session_version": int(payload.get("ver", 0) or 0),
+        "device_id": int(payload.get("dev", 0) or 0),
     }
 
 
 def _require_admin(current_user: dict[str, str]) -> None:
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+
+
+def _device_session_version(user_id: int, device_id: int) -> int | None:
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT session_version FROM user_devices WHERE id = %s AND user_id = %s LIMIT 1",
+                (device_id, user_id),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+    finally:
+        connection.close()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, str]:
@@ -1519,8 +1634,16 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict[s
             valid_until = valid_until.replace(tzinfo=timezone.utc)
         if valid_until < now:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User login has expired.")
-    if int(user.get("session_version", 0)) != int(row.get("session_version") or 0):
+    if user.get("device_id"):
+        device_version = _device_session_version(int(row["id"]), int(user["device_id"]))
+        if device_version is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="This device was logged out.")
+        if int(user.get("session_version", 0)) != device_version:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired due to a newer login.")
+    elif int(user.get("session_version", 0)) != int(row.get("session_version") or 0):
+        # Token issued before per-device sessions existed.
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired due to a newer login.")
+    user.pop("device_id", None)
     user["display_name"] = str(row.get("display_name") or "")
     user["is_active"] = "1" if bool(row.get("is_active", 1)) else "0"
     return user
@@ -1731,8 +1854,9 @@ def admin_get_user_details(
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
-                       last_login_at, last_login_ip, last_login_device, created_at, updated_at,
-                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count
+                       last_login_at, last_login_ip, last_login_device, created_at, updated_at, max_devices,
+                       (SELECT COALESCE(SUM(sent.sent_count), 0) FROM sent_email_daily sent WHERE sent.user_id = user_db.id) AS sent_email_count,
+                       """ + DEVICE_COUNT_SQL + """
                 FROM user_db
                 WHERE id = %s
                 LIMIT 1
@@ -1782,6 +1906,21 @@ def admin_get_user_details(
             )
             sent_email_daily_rows = cursor.fetchall() or []
 
+            cursor.execute(
+                """
+                SELECT id, device_key, device_name, device_ip, first_login_at, last_login_at,
+                       LEFT(device_key, 7) = 'portal:' AS is_portal
+                FROM user_devices
+                WHERE user_id = %s
+                ORDER BY COALESCE(last_login_at, first_login_at) DESC, id DESC
+                """,
+                (user_id,),
+            )
+            device_rows = [
+                {**device, "is_portal": bool(device.get("is_portal"))}
+                for device in cursor.fetchall() or []
+            ]
+
             return {
                 "ok": True,
                 "user": user,
@@ -1790,6 +1929,7 @@ def admin_get_user_details(
                 "login_history": login_rows,
                 "activity": activity_rows,
                 "device_history": _build_device_history(login_rows),
+                "devices": device_rows,
                 "sent_email_daily": sent_email_daily_rows,
                 "current_device": {
                     "device_fingerprint": str(user_row.get("device_fingerprint") or ""),
@@ -1817,7 +1957,8 @@ def admin_get_user(
                 """
                 SELECT id, username, display_name, role, is_active, login_valid_until,
                        device_fingerprint, device_name, device_ip, device_bound_at,
-                       last_login_at, last_login_ip, last_login_device, created_at, updated_at
+                       last_login_at, last_login_ip, last_login_device, created_at, updated_at, max_devices,
+                       """ + DEVICE_COUNT_SQL + """
                 FROM user_db
                 WHERE id = %s
                 LIMIT 1
@@ -1846,6 +1987,7 @@ def create_user(
             payload.display_name.strip(),
             payload.is_active,
             payload.login_valid_until,
+            payload.max_devices,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -1919,6 +2061,28 @@ def admin_reset_device_binding(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return {"ok": True, "user": user}
+
+
+@app.delete("/api/admin/users/{user_id}/devices/{device_id}")
+def admin_remove_user_device(
+    user_id: int,
+    device_id: int,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict[str, object]:
+    """Log one device out and free its slot in the user's device limit."""
+    _require_admin(current_user)
+    connection = _connect(DB_NAME)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM user_devices WHERE id = %s AND user_id = %s",
+                (device_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found.")
+    finally:
+        connection.close()
+    return {"ok": True}
 
 
 @app.post("/api/activity")
