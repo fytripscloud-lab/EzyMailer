@@ -442,6 +442,38 @@ GMAIL_SEND_ERROR_RE = re.compile(
 )
 
 
+# Detects whether the page still draws frames. Windows stops drawing a Remote
+# Desktop session whose window is minimized or disconnected; Gmail then never
+# finishes "Sending..." and the message is left as a draft.
+# The page's own timers are frozen too while nothing is drawn, so the wait is
+# timed here rather than with setTimeout in the page.
+PAGE_DRAW_PROBE_JS = "() => { window.__ezyDrawn = false; requestAnimationFrame(() => { window.__ezyDrawn = true; }); }"
+SCREEN_HOLD_MAX_SECONDS = 6 * 60 * 60
+# How long a send may sit on Gmail's "Sending..." before it counts as unconfirmed.
+GMAIL_SENDING_MAX_SECONDS = 180
+
+
+def _page_is_drawn(page, timeout: float = 1.0) -> bool:
+    try:
+        page.evaluate(PAGE_DRAW_PROBE_JS)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+            if page.evaluate("() => window.__ezyDrawn === true"):
+                return True
+        return False
+    except Exception:
+        # A failed probe must not hold sending; real failures surface elsewhere.
+        return True
+
+
+def _lane_log(message: str) -> None:
+    """Write to the campaign log from a lane thread (see CampaignSendWorker.run)."""
+    log = getattr(_LANE_PLAYWRIGHT, "log", None)
+    if log is not None:
+        log(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
 def _gmail_sends_pending(page) -> bool:
     """True while Gmail is still sending or holding a message in its Undo window."""
     notice = str(page.evaluate(GMAIL_NOTICE_JS, "")["notice"])
@@ -455,12 +487,18 @@ def _wait_for_gmail_sends_to_settle(page, timeout: float = 30.0) -> None:
     Undo notice can leave the message unsent.
     """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    hold_until = time.monotonic() + SCREEN_HOLD_MAX_SECONDS
+    while True:
         try:
             if page.is_closed() or not _gmail_sends_pending(page):
                 return
         except Exception:
             return
+        if time.monotonic() >= deadline:
+            # Gmail can only finish while the screen is drawn; keep waiting.
+            if _page_is_drawn(page) or time.monotonic() >= hold_until:
+                return
+            deadline = time.monotonic() + timeout
         page.wait_for_timeout(200)
 
 
@@ -2533,6 +2571,7 @@ class CampaignSendWorker(QObject):
         total = self.task_total
         error_message = ""
         _LANE_PLAYWRIGHT.enabled = True
+        _LANE_PLAYWRIGHT.log = self.log.emit
         try:
             task_iterator = self._iter_tasks()
             for task in task_iterator:
@@ -2628,6 +2667,7 @@ class CampaignSendWorker(QObject):
         finally:
             _settle_lane_gmail_pages()
             _LANE_PLAYWRIGHT.enabled = False
+            _LANE_PLAYWRIGHT.log = None
             _close_lane_playwright()
 
         if self.cleanup_callback is not None:
@@ -6678,6 +6718,17 @@ class DashboardPage(QWidget):
         quick_row.addWidget(tile_button)
         quick_row.addWidget(clear_button)
         launch_layout.addLayout(quick_row)
+        if IS_WINDOWS:
+            keep_sending_button = QPushButton("Disconnect && keep sending")
+            keep_sending_button.setObjectName("secondaryButton")
+            keep_sending_button.setToolTip(
+                "Close Remote Desktop but keep this PC drawing its screen, so campaigns keep "
+                "sending at full speed. Minimizing Remote Desktop instead stops Windows drawing "
+                "the screen and holds sending."
+            )
+            keep_sending_button.clicked.connect(self._disconnect_remote_desktop)
+            self._apply_button_icon(keep_sending_button, QStyle.SP_ComputerIcon)
+            launch_layout.addWidget(keep_sending_button)
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Preset"))
         self.launch_preset_label.setObjectName("windowPill")
@@ -10071,6 +10122,45 @@ class DashboardPage(QWidget):
             is_temporary = True
         self._seed_browser_profile_dir(profile_dir)
         return profile_dir, is_temporary
+
+    def _disconnect_remote_desktop(self) -> None:
+        """Move this Remote Desktop session to the PC's own console and disconnect.
+
+        A minimized or disconnected RDP session is not drawn, which stalls Gmail
+        mid-send. On the console Windows keeps drawing as if a monitor were
+        attached, so sending continues; reconnecting with Remote Desktop
+        brings the session back unchanged. Needs administrator rights (tscon).
+        """
+        import ctypes
+
+        if not os.environ.get("SESSIONNAME", "").upper().startswith("RDP-"):
+            self.notify("Not in a Remote Desktop session; nothing to disconnect.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Disconnect & keep sending",
+            "Remote Desktop will disconnect, and this PC keeps drawing its screen so EzyMailer "
+            "keeps sending at full speed.\n\nWindows will ask for administrator permission. "
+            "Connect with Remote Desktop again whenever you want to come back.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        session_id = ctypes.c_ulong()
+        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id))
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        tscon = system_root / "System32" / "tscon.exe"
+        if not tscon.exists():
+            # 32-bit process on 64-bit Windows.
+            tscon = system_root / "Sysnative" / "tscon.exe"
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", str(tscon), f"{session_id.value} /dest:console", None, 0
+        )
+        if int(result) <= 32:
+            self.notify("Remote Desktop was not disconnected (administrator permission was not given).")
+            return
+        self._log_action("Remote Desktop session moved to the console; sending continues in the background")
 
     def _start_browser_priority_keeper(self) -> None:
         """Keep every open browser's whole process tree boosted (Windows).
@@ -14330,6 +14420,7 @@ class DashboardPage(QWidget):
                 page.set_default_navigation_timeout(15000)
                 self._gmail_page_from_session(page)
                 self._keep_gmail_page_active(page, active_pages)
+                self._hold_while_screen_not_drawn(page, session)
                 if log_steps:
                     self._log_action("Gmail page ready")
 
@@ -14625,9 +14716,23 @@ class DashboardPage(QWidget):
         timeout: float = 45.0,
     ) -> None:
         """Return once Gmail says "Message sent"; raise if it refuses or reopens the draft."""
-        started = time.monotonic()
+        started = first_started = time.monotonic()
         seen_sending = False
-        while time.monotonic() - started < timeout:
+        notice = ""
+        while True:
+            if time.monotonic() - started >= timeout:
+                # Gmail stalls on "Sending..." while Windows is not drawing the
+                # screen; it finishes once drawing resumes, so wait for that.
+                if not _page_is_drawn(page):
+                    self._hold_while_screen_not_drawn(page, session)
+                    started = time.monotonic()
+                elif re.search(r"sending", notice, re.IGNORECASE) and (
+                    time.monotonic() - first_started < GMAIL_SENDING_MAX_SECONDS
+                ):
+                    # Still working on it; giving up now leaves it as a draft.
+                    started = time.monotonic() - timeout + 5
+                else:
+                    break
             if page.is_closed():
                 raise CampaignBrowserClosedError(
                     "Gmail browser window was closed before the send could be confirmed."
@@ -14656,6 +14761,31 @@ class DashboardPage(QWidget):
         raise GmailSendUnconfirmedError(
             "Gmail never confirmed this message as sent; check the account's Sent and Drafts."
         )
+
+    def _hold_while_screen_not_drawn(self, page, session: BrowserSessionHandle | BrowserTabHandle) -> None:
+        """Hold this tab while Windows is not drawing its screen.
+
+        Happens when the Remote Desktop window is minimized or disconnected.
+        Starting or finishing a send in that state leaves it as a Gmail draft.
+        """
+        if _page_is_drawn(page):
+            return
+        _lane_log(
+            f"{session.title}: Windows stopped drawing the screen (Remote Desktop minimized or "
+            "disconnected). Sending is on hold until it is shown again; use "
+            "\"Disconnect & keep sending\" to leave it running."
+        )
+        cancel_event = getattr(self, "_campaign_cancel_event", None)
+        held_since = time.monotonic()
+        while not _page_is_drawn(page):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Campaign stopped while the screen was not drawn.")
+            if page.is_closed():
+                raise CampaignBrowserClosedError("Gmail browser window was closed.")
+            if time.monotonic() - held_since > SCREEN_HOLD_MAX_SECONDS:
+                raise RuntimeError("The screen was not drawn for too long; sending stopped.")
+            page.wait_for_timeout(2000)
+        _lane_log(f"{session.title}: the screen is drawn again; sending resumed.")
 
     def _halt_gmail_row(self, session: BrowserSessionHandle | BrowserTabHandle, reason: str) -> None:
         """Stop every tab of this browser window; its recipients go to other windows."""
