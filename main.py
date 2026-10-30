@@ -11931,7 +11931,9 @@ class DashboardPage(QWidget):
                     control = controls.nth(index)
                     if control.is_visible():
                         control.click(timeout=1500)
-                        page.wait_for_timeout(100)
+                        # Wait for the draft to actually close so the next
+                        # Compose's fields are not confused with its fields.
+                        self._poll_page(page, lambda: not control.is_visible(), timeout=1.5)
                         return
             except Exception:
                 continue
@@ -11949,7 +11951,9 @@ class DashboardPage(QWidget):
                     control = controls.nth(index)
                     if control.is_visible():
                         control.click(timeout=1500)
-                        page.wait_for_timeout(100)
+                        # Wait for the draft to actually close so the next
+                        # Compose's fields are not confused with its fields.
+                        self._poll_page(page, lambda: not control.is_visible(), timeout=1.5)
                         return
             except Exception:
                 continue
@@ -12061,6 +12065,9 @@ class DashboardPage(QWidget):
             except Exception:
                 pass
             self._poll_page(page, lambda: self._gmail_recipient_is_selected(page, recipient), timeout=0.6)
+        # Committing the chip makes Gmail redraw the compose header, and a
+        # subject typed during that redraw is silently cleared.
+        page.wait_for_timeout(250)
 
         subject_box = self._gmail_subject_input(page)
         self._fill_gmail_field(subject_box, subject, "subject")
@@ -12070,6 +12077,16 @@ class DashboardPage(QWidget):
             'div[contenteditable="true"][aria-label*="Message Body"]'
         ).first
         self._verify_gmail_body(body_box, body_text, body_html)
+
+        # Confirm the subject survived Gmail's asynchronous header updates;
+        # refill it once if Gmail cleared it.
+        def subject_kept() -> bool:
+            return self._gmail_subject_input(page).input_value() == subject
+
+        if not self._poll_page(page, subject_kept, timeout=0.5):
+            self._fill_gmail_field(self._gmail_subject_input(page), subject, "subject")
+            if not self._poll_page(page, subject_kept, timeout=1.0):
+                raise RuntimeError("Gmail cleared the subject after it was filled.")
 
         if log_steps:
             self._log_action("Gmail inline compose opened")
@@ -14305,7 +14322,7 @@ class DashboardPage(QWidget):
 
                 # A short settle lets Gmail register the last field input;
                 # the Send lookup below waits for the control itself.
-                page.wait_for_timeout(150)
+                page.wait_for_timeout(300)
                 self._dismiss_gmail_confidential_mode(page)
                 # Attachment rendering can replace portions of Compose. Find
                 # the primary control again before sending the final draft.
