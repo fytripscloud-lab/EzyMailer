@@ -33,7 +33,7 @@ from datetime import datetime
 from io import BytesIO
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import quote, urlencode, urlparse, parse_qs
 from math import ceil, sqrt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -472,6 +472,18 @@ def _lane_log(message: str) -> None:
     log = getattr(_LANE_PLAYWRIGHT, "log", None)
     if log is not None:
         log(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
+# Rows of a Drafts search whose subject is exactly the given one.
+GMAIL_DRAFT_ROWS_JS = """
+(subject) => {
+    const clean = (value) => (value || '').replace(/[\\u200b\\u200e\\u200f]/g, '').replace(/\\s+/g, ' ').trim();
+    const rows = [...document.querySelectorAll('div[role="main"] tr.zA')];
+    const matches = rows.map((row, index) => ({row, index})).filter(({row}) =>
+        row.offsetParent !== null && clean((row.querySelector('span.bog') || {}).innerText) === clean(subject));
+    return {count: matches.length, first: matches.length ? matches[0].index : -1};
+}
+"""
 
 
 def _gmail_sends_pending(page) -> bool:
@@ -2496,9 +2508,14 @@ class CampaignSendWorker(QObject):
         window_send_mode: str,
         automatic_no_delay: bool = True,
         cleanup_callback: Callable[[BrowserSessionHandle | BrowserTabHandle], None] | None = None,
+        draft_recovery: Callable[..., list[str]] | None = None,
     ):
         super().__init__()
         self.session = session
+        # Gmail browser lanes: sends a failed recipient's draft, if Gmail kept
+        # one, once the lane's share is done. Returns the recipients it sent.
+        self.draft_recovery = draft_recovery
+        self._draft_candidates: list[tuple[str, str]] = []
         self.tasks = list(tasks or [])
         self.recipient_queue_path = recipient_queue_path
         self.task_factory = task_factory
@@ -2552,6 +2569,30 @@ class CampaignSendWorker(QObject):
 
     def _return_unsent(self, recipient: str) -> None:
         """Hand back a recipient this lane could not send (see QueueLaneWorker)."""
+
+    def _recover_drafts(self) -> int:
+        """Send drafts Gmail kept for this lane's failed recipients; return how many."""
+        if self.draft_recovery is None or not self._draft_candidates or self.cancel_event.is_set():
+            return 0
+        self.log.emit(
+            f"[{self._timestamp()}] {self.window_label} checking Drafts for "
+            f"{len(self._draft_candidates)} unsent email(s)"
+        )
+        try:
+            recovered = self.draft_recovery(self.session, list(self._draft_candidates))
+        except Exception as exc:
+            self.log.emit(f"[{self._timestamp()}] {self.window_label} could not check Drafts: {exc}")
+            return 0
+        subjects = dict(self._draft_candidates)
+        for recipient in recovered:
+            self.log.emit(f"[{self._timestamp()}] {self.window_label} sent {recipient} (from Drafts)")
+            self.email_sent.emit(recipient, subjects.get(recipient, ""))
+        still_unsent = len(self._draft_candidates) - len(recovered)
+        self.log.emit(
+            f"[{self._timestamp()}] {self.window_label} sent {len(recovered)} email(s) from Drafts"
+            + (f"; {still_unsent} still not sent" if still_unsent else "")
+        )
+        return len(recovered)
 
     def _iter_tasks(self):
         if self.recipient_queue_path is None:
@@ -2648,6 +2689,10 @@ class CampaignSendWorker(QObject):
                 elif last_error is not None:
                     error_message = error_message or str(last_error)
                     self.log.emit(f"[{self._timestamp()}] {self.window_label} failed {recipient}: {error_message}")
+                    if not isinstance(last_error, CampaignBrowserClosedError):
+                        # Returned recipients are sent by another lane, so
+                        # their draft here must stay unsent.
+                        self._draft_candidates.append((recipient, subject))
                 else:
                     self.log.emit(f"[{self._timestamp()}] {self.window_label} cancelled {recipient}")
                 self.progress.emit(self.session.session_id, self.window_label, completed, total)
@@ -2661,6 +2706,7 @@ class CampaignSendWorker(QObject):
                 ):
                     if not self._sleep_with_controls(self._delay_seconds()):
                         break
+            completed += self._recover_drafts()
         except Exception as exc:
             error_message = str(exc)
             self.log.emit(f"[{self._timestamp()}] {self.window_label} failed to read its recipient queue: {error_message}")
@@ -11073,6 +11119,11 @@ class DashboardPage(QWidget):
             file_name_mode=str(self._pending_campaign_payload.get("attachment_file_name_mode") or self.attach_file_name_mode or "auto"),
             window_send_mode=getattr(self.state, "window_send_mode", "Parallel"),
             cleanup_callback=self._finish_smtp_lane if isinstance(session, SmtpAccountHandle) else None,
+            draft_recovery=(
+                self._send_campaign_drafts
+                if isinstance(session, (BrowserSessionHandle, BrowserTabHandle))
+                else None
+            ),
             **job.get("worker_kwargs", {}),
         )
         worker.moveToThread(thread)
@@ -14761,6 +14812,103 @@ class DashboardPage(QWidget):
         raise GmailSendUnconfirmedError(
             "Gmail never confirmed this message as sent; check the account's Sent and Drafts."
         )
+
+    def _send_campaign_drafts(
+        self,
+        session: BrowserSessionHandle | BrowserTabHandle,
+        items: list[tuple[str, str]],
+    ) -> list[str]:
+        """Send drafts Gmail kept for this lane's failed recipients.
+
+        Runs on the lane thread after its share is done; must not touch widgets.
+        Only a draft addressed to one of these recipients with that email's
+        exact subject is sent, so the account's other drafts are never touched.
+        Returns the recipients sent.
+        """
+        row = getattr(self, "_lane_row_of", {}).get(session.session_id)
+        if row is not None and getattr(row, "halt_reason", ""):
+            return []  # Gmail refused this account (limit); a draft cannot go either.
+        sent: list[str] = []
+        with self._gmail_browser_connection(session) as (_browser, active_pages):
+            page = next((item for item in active_pages if not item.is_closed()), None)
+            if page is None:
+                return []
+            _wait_for_gmail_sends_to_settle(page)
+            for recipient, subject in items:
+                self._hold_while_screen_not_drawn(page, session)
+                try:
+                    if self._send_campaign_draft(page, session, recipient, subject):
+                        sent.append(recipient)
+                except CampaignBrowserClosedError:
+                    raise
+                except Exception as exc:
+                    _lane_log(f"{session.title}: draft for {recipient} was not sent: {exc}")
+            _wait_for_gmail_sends_to_settle(page)
+            page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=15000)
+        return sent
+
+    def _find_campaign_drafts(self, page, recipient: str, subject: str) -> int:
+        """Search Drafts for this recipient; return how many rows have exactly this subject."""
+        query = quote(f"in:drafts to:{recipient}", safe="").replace("%20", "+")
+        page.goto(f"https://mail.google.com/mail/u/0/#search/{query}", wait_until="domcontentloaded", timeout=15000)
+        # Results render after the navigation; wait for rows or Gmail's no-match text.
+        self._poll_page(
+            page,
+            lambda: page.evaluate(
+                """() => location.hash.startsWith('#search') && (
+                    [...document.querySelectorAll('div[role="main"] tr.zA')].some(r => r.offsetParent !== null) ||
+                    /No messages matched/i.test((document.querySelector('div[role="main"]') || {}).innerText || ''))"""
+            ),
+            timeout=10.0,
+            interval_ms=100,
+        )
+        page.wait_for_timeout(300)
+        return int(page.evaluate(GMAIL_DRAFT_ROWS_JS, subject)["count"])
+
+    def _open_campaign_draft(self, page, subject: str) -> None:
+        index = int(page.evaluate(GMAIL_DRAFT_ROWS_JS, subject)["first"])
+        if index < 0:
+            raise RuntimeError("draft row disappeared")
+        page.locator('div[role="main"] tr.zA').nth(index).click()
+        if not self._poll_page(
+            page,
+            lambda: page.evaluate(GMAIL_NOTICE_JS, subject)["reopened"],
+            timeout=10.0,
+            interval_ms=100,
+        ):
+            raise RuntimeError("the draft did not open")
+
+    def _send_campaign_draft(
+        self,
+        page,
+        session: BrowserSessionHandle | BrowserTabHandle,
+        recipient: str,
+        subject: str,
+    ) -> bool:
+        if not self._find_campaign_drafts(page, recipient, subject):
+            return False
+        self._open_campaign_draft(page, subject)
+        send_button = page.locator(
+            'xpath=//input[@name="subjectbox"]/ancestor::*[.//div[@role="button"][starts-with(@data-tooltip, "Send")]][1]'
+            '//div[@role="button"][starts-with(@data-tooltip, "Send")]'
+        ).last
+        send_button.click(timeout=10000)
+        self._wait_for_gmail_send_outcome(page, session, subject)
+        # Earlier retries can leave identical copies; discard them so none stay
+        # behind. Gmail only drops the sent one from Drafts once it has finished
+        # sending, so wait for that first. Clean-up problems never undo the send.
+        _wait_for_gmail_sends_to_settle(page)
+        try:
+            for _ in range(5):
+                if not self._find_campaign_drafts(page, recipient, subject):
+                    break
+                self._open_campaign_draft(page, subject)
+                page.locator('[aria-label*="Discard draft" i]').last.click(timeout=5000)
+                self._poll_page(page, lambda: not page.evaluate(GMAIL_NOTICE_JS, subject)["reopened"], timeout=5.0)
+                _wait_for_gmail_sends_to_settle(page)
+        except Exception as exc:
+            _lane_log(f"{session.title}: sent {recipient} from Drafts; an extra copy may remain ({exc})")
+        return True
 
     def _hold_while_screen_not_drawn(self, page, session: BrowserSessionHandle | BrowserTabHandle) -> None:
         """Hold this tab while Windows is not drawing its screen.
