@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/dictionary.txt.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/names.json.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/cities.json.gz', 'assets')]
+datas = [('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/dictionary.txt.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/names.json.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/packaging/assets/cities.json.gz', 'assets'), ('/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/EmailValidator/frontend/out', 'validator_frontend')]
 binaries = []
-hiddenimports = ['PIL.Image', 'greenlet._greenlet', 'eval_type_backport']
+hiddenimports = ['PIL.Image', 'greenlet._greenlet', 'eval_type_backport', 'aiosmtplib', 'app.main']
 tmp_ret = collect_all('PIL')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('greenlet')
@@ -12,13 +12,19 @@ tmp_ret = collect_all('lxml')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('charset_normalizer')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('email_validator')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('dns')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('slowapi')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/main.py'],
-    pathex=[],
+    pathex=['/Volumes/Developer Workspace/Projects/Web Projects/ezymailer/EmailValidator/backend'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

@@ -9,15 +9,26 @@ These notes describe the live production setup and how the repository should be 
 - Live host public IP: `15.206.161.73`
 - Live backend API: `http://15.206.161.73:8765/`
 - Live admin frontend: `http://15.206.161.73:8780/`
-- Live EazyValidator backend: `http://15.206.161.73:8766/` (opened by desktop app's "Mail Validator" button)
-- Live EazyValidator frontend: `http://15.206.161.73:8781/`
 - Services to host on the live machine:
   - Backend API
   - Admin frontend
-  - EazyValidator backend + frontend (isolated under `/opt/ezymailer-validator/`, own systemd units, own
-    venv/node process - does not share process or dependencies with the backend/admin services above, so it
-    can be redeployed independently without restarting them)
 - The desktop apps are not hosted on the live server.
+
+### EazyValidator is bundled locally, not live-hosted
+
+The "Mail Validator" button in the desktop app does **not** talk to the live server. EazyValidator
+(`EmailValidator/`) is bundled straight into the `.dmg`/`.exe` via PyInstaller - its FastAPI backend and a
+static (`next build` with `output: "export"`) copy of its frontend both ship inside the app. On first click,
+`ensure_validator_server()` in `main.py` starts that backend in-process on `127.0.0.1:8766` (serving the
+static frontend at `/` too, via `StaticFiles` mounted in `EmailValidator/backend/app/main.py`), then opens it
+in the system browser with the current session's JWT. It works fully offline and shares EzyMailer's own
+`EZYM_MAILER_JWT_SECRET`/JWT scheme automatically, since it's the same process - no live secret-syncing, no
+AWS port opening, no separate login.
+
+A short-lived attempt at hosting it live (ports 8766/8781 on this server) was tried and then superseded by
+the above on 2026-11-04; those systemd services were stopped and disabled (not deleted - see
+`deployment/ubuntu/systemd/ezymailer-validator-*.service` if that direction is ever revisited), and don't need
+new AWS inbound rules.
 
 ## Database Layout
 
@@ -77,10 +88,6 @@ These notes describe the live production setup and how the repository should be 
 - Open the following ports in the AWS security group or load balancer rule set for the live instance:
   - `8765` for the backend API
   - `8780` for the admin frontend
-  - `8766` for the EazyValidator backend **(not yet open as of 2026-11-04 - the IAM credentials available to
-    the assistant for this work have no `ec2:*` permissions, so this needs to be done by someone with
-    console/IAM access)**
-  - `8781` for the EazyValidator frontend **(same blocker as above)**
 - If using a public web entrypoint, place Nginx or a load balancer in front and map standard HTTP/HTTPS traffic to the internal app ports.
 
 ## Hosted Database Rule

@@ -28,8 +28,6 @@ API_HOST = os.getenv("EZYM_MAILER_API_HOST", "127.0.0.1")
 # Fixed local API port used by the hosted backend service.
 API_PORT = int(os.getenv("EZYM_MAILER_API_PORT", "8765"))
 API_BASE_URL = os.getenv("EZYM_MAILER_API_BASE_URL", "http://15.206.161.73:8765")
-# EazyValidator frontend, hosted as its own service on the same live box.
-MAIL_VALIDATOR_URL = os.getenv("EZYM_MAILER_VALIDATOR_URL", "http://15.206.161.73:8781")
 
 _DB_CREDENTIALS_PATH = Path(__file__).resolve().parents[1] / "server_credentials" / "Database_Credentials"
 

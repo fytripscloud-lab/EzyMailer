@@ -49,6 +49,11 @@ pip install pyinstaller
 cleanup_paths
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
+if [ ! -d "$ROOT_DIR/EmailValidator/frontend/out" ]; then
+  echo "EmailValidator/frontend/out is missing - build it first (cd EmailValidator/frontend && npm run build)." >&2
+  exit 1
+fi
+
 pyinstaller \
   --noconfirm \
   --clean \
@@ -58,13 +63,20 @@ pyinstaller \
   --add-data "$ROOT_DIR/packaging/assets/dictionary.txt.gz:assets" \
   --add-data "$ROOT_DIR/packaging/assets/names.json.gz:assets" \
   --add-data "$ROOT_DIR/packaging/assets/cities.json.gz:assets" \
+  --add-data "$ROOT_DIR/EmailValidator/frontend/out:validator_frontend" \
+  --paths "$ROOT_DIR/EmailValidator/backend" \
   --collect-all PIL \
   --collect-all greenlet \
   --collect-all lxml \
   --collect-all charset_normalizer \
+  --collect-all email_validator \
+  --collect-all dns \
+  --collect-all slowapi \
   --hidden-import PIL.Image \
   --hidden-import greenlet._greenlet \
   --hidden-import eval_type_backport \
+  --hidden-import aiosmtplib \
+  --hidden-import app.main \
   --collect-all playwright \
   "$ROOT_DIR/main.py"
 

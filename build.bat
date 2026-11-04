@@ -11,7 +11,12 @@ python -m pip install --upgrade pip || exit /b 1
 python -m pip install --requirement requirements.txt || exit /b 1
 python -m pip install pyinstaller || exit /b 1
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --add-data "packaging\assets\dictionary.txt.gz;assets" --add-data "packaging\assets\names.json.gz;assets" --add-data "packaging\assets\cities.json.gz;assets" --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport main.py || exit /b 1
+if not exist "EmailValidator\frontend\out" (
+    echo ERROR: EmailValidator\frontend\out is missing - build it first ^(cd EmailValidator\frontend ^&^& npm run build^).
+    exit /b 1
+)
+
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name EazyMailer --icon packaging\assets\EazyMailer.ico --add-data "packaging\assets\dictionary.txt.gz;assets" --add-data "packaging\assets\names.json.gz;assets" --add-data "packaging\assets\cities.json.gz;assets" --add-data "EmailValidator\frontend\out;validator_frontend" --paths "EmailValidator\backend" --collect-all PIL --collect-all greenlet --collect-all lxml --collect-all charset_normalizer --collect-all email_validator --collect-all dns --collect-all slowapi --collect-all playwright --hidden-import PIL.Image --hidden-import greenlet._greenlet --hidden-import eval_type_backport --hidden-import aiosmtplib --hidden-import app.main main.py || exit /b 1
 
 if not exist "dist\EazyMailer.exe" (
     echo ERROR: dist\EazyMailer.exe was not generated.

@@ -93,10 +93,24 @@ Open http://localhost:3000. The backend's interactive API docs are at http://loc
 
 ## 5. Deployment notes
 
+**Production path: bundled into the EzyMailer desktop app, not hosted separately.** `next.config.ts` sets
+`output: "export"`; `EmailValidator/backend/app/main.py` mounts that static export (`frontend/out/`) at `/`
+via `StaticFiles`, so one process serves the whole thing. PyInstaller bundles `EmailValidator/backend/app`
+(via `--paths`) and `frontend/out` (via `--add-data ...:validator_frontend`) straight into the `.dmg`/`.exe`
+(`build-macos.sh` / `build.bat`), and `main.py`'s `ensure_validator_server()` starts it on `127.0.0.1:8766`
+the first time the user clicks "Mail Validator" — same pattern as `ensure_api_server()` for the main backend.
+Auth needs no setup: it reads `EZYM_MAILER_JWT_SECRET` from the same process environment as EzyMailer's own
+backend, so a token from EzyMailer's `/api/login` just works here too.
+
+Run `npm run build` (frontend) before every `./build-macos.sh` / `build.bat` — the build scripts fail fast if
+`frontend/out/` is missing.
+
+### Standalone/dev deployment (not currently used in production)
+
 - Both services are stateless aside from the `backend/imported/` filesystem tree — back that up or treat it as ephemeral per your retention policy (`JOB_RETENTION_HOURS`, `CLEANUP_INTERVAL_MINUTES` in `.env`).
 - Run the backend behind a process manager (systemd, pm2, supervisord) with `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1` — keep it to one worker process since job state (running-task tracking, cancellation flags) is in-process memory plus the filesystem; scaling to multiple workers/machines would need that moved to a shared store.
-- Build the frontend for production with `npm run build && npm start`, and set `NEXT_PUBLIC_API_URL` to the backend's public URL; set `CORS_ORIGINS` on the backend to match.
-- Put a reverse proxy (nginx/Caddy) in front of both for TLS; no proxy-specific config is required since progress updates use plain HTTP polling.
+- With `output: "export"`, `next start` no longer works for the frontend — serve `frontend/out/` as static files (the bundled path above already does this via the backend) or revert `output: "export"` in `next.config.ts` if running it as its own Node service again.
+- Put a reverse proxy (nginx/Caddy) in front for TLS; no proxy-specific config is required since progress updates use plain HTTP polling.
 
 ## 6. Test results
 

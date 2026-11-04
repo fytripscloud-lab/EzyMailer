@@ -44,7 +44,6 @@ from typing import Callable, Sequence
 from backend import gmail_oauth, smtp_sender
 from backend.local_api import (
     API_BASE_URL,
-    MAIL_VALIDATOR_URL,
     ensure_api_server,
     get_content as api_get_content,
     get_customer_variables as api_get_customer_variables,
@@ -17304,7 +17303,12 @@ class MainWindow(QMainWindow):
         if not self.state.logged_in or not self.state.auth_token:
             self.show_toast("Log in before opening Mail Validator.", "error")
             return
-        url = QUrl(MAIL_VALIDATOR_URL)
+        try:
+            base_url = ensure_validator_server()
+        except Exception as exc:
+            self.show_toast(f"Could not start Mail Validator: {exc}", "error")
+            return
+        url = QUrl(base_url)
         query = QUrlQuery()
         query.addQueryItem("token", self.state.auth_token)
         url.setQuery(query)
@@ -18296,6 +18300,59 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+
+
+EZYM_VALIDATOR_HOST = "127.0.0.1"
+EZYM_VALIDATOR_PORT = int(os.getenv("EZYM_MAILER_VALIDATOR_PORT", "8766"))
+EZYM_VALIDATOR_BASE_URL = f"http://{EZYM_VALIDATOR_HOST}:{EZYM_VALIDATOR_PORT}"
+_validator_server_thread: threading.Thread | None = None
+_validator_server_lock = threading.Lock()
+
+
+def ensure_validator_server() -> str:
+    """Starts EazyValidator (bundled FastAPI backend + static frontend) on a
+    local port if it isn't already running, the same lazy-start-on-first-use
+    pattern as ensure_api_server() above. Runs fully locally - no dependency
+    on the live server - so "Mail Validator" works offline too."""
+    global _validator_server_thread
+
+    with _validator_server_lock:
+        if _validator_server_thread is not None and _validator_server_thread.is_alive():
+            return EZYM_VALIDATOR_BASE_URL
+
+        try:
+            with urllib.request.urlopen(f"{EZYM_VALIDATOR_BASE_URL}/health", timeout=0.5):
+                return EZYM_VALIDATOR_BASE_URL
+        except Exception:
+            pass
+
+        validator_backend_dir = Path(__file__).resolve().parent / "EmailValidator" / "backend"
+        if str(validator_backend_dir) not in sys.path:
+            sys.path.insert(0, str(validator_backend_dir))
+        os.environ.setdefault("IMPORTED_DIR", str(LOCAL_CACHE_DIR / "validator_imported"))
+
+        import uvicorn as _validator_uvicorn
+        import app.main as _validator_app_module
+
+        config = _validator_uvicorn.Config(
+            _validator_app_module.app,
+            host=EZYM_VALIDATOR_HOST,
+            port=EZYM_VALIDATOR_PORT,
+            log_level="warning",
+            access_log=False,
+            reload=False,
+        )
+        server = _validator_uvicorn.Server(config)
+        _validator_server_thread = threading.Thread(target=server.run, name="EazyValidatorLocal", daemon=True)
+        _validator_server_thread.start()
+
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(f"{EZYM_VALIDATOR_BASE_URL}/health", timeout=0.5):
+                    return EZYM_VALIDATOR_BASE_URL
+            except Exception:
+                time.sleep(0.1)
+        return EZYM_VALIDATOR_BASE_URL
 
 
 def main() -> int:
