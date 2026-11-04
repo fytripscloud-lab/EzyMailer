@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 
 import Home from "@/app/page";
 import { getDiagnostics, getProgress, getReport, getResults } from "@/lib/api";
+import { loginToEzyMailer } from "@/lib/ezymailerAuth";
 import type { DiagnosticsResponse, ProgressResponse, ResultsPage, SummaryReport } from "@/lib/types";
 
 jest.mock("@/lib/api", () => ({
@@ -13,10 +14,15 @@ jest.mock("@/lib/api", () => ({
   getReport: jest.fn(),
 }));
 
+jest.mock("@/lib/ezymailerAuth", () => ({
+  loginToEzyMailer: jest.fn(),
+}));
+
 const mockGetDiagnostics = getDiagnostics as jest.MockedFunction<typeof getDiagnostics>;
 const mockGetProgress = getProgress as jest.MockedFunction<typeof getProgress>;
 const mockGetResults = getResults as jest.MockedFunction<typeof getResults>;
 const mockGetReport = getReport as jest.MockedFunction<typeof getReport>;
+const mockLoginToEzyMailer = loginToEzyMailer as jest.MockedFunction<typeof loginToEzyMailer>;
 
 const STORAGE_KEY = "eazyvalidator_active_job";
 
@@ -54,12 +60,43 @@ describe("Home page session persistence", () => {
     await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
   });
 
-  it("shows an access-restricted screen instead of the upload flow when there's no auth token", async () => {
+  it("shows a login form instead of the upload flow when there's no auth token", async () => {
     window.sessionStorage.removeItem("eazyvalidator_auth_token");
 
     render(<Home />);
 
-    await waitFor(() => expect(screen.getByText("Access restricted")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
+    expect(screen.queryByText("Upload Email List")).not.toBeInTheDocument();
+  });
+
+  it("logging in through the fallback form stores the token and proceeds to upload", async () => {
+    window.sessionStorage.removeItem("eazyvalidator_auth_token");
+    mockLoginToEzyMailer.mockResolvedValue("logged-in-token");
+
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
+
+    await userEvent.type(screen.getByLabelText("Username"), "koushik");
+    await userEvent.type(screen.getByLabelText("Password"), "secret");
+    await userEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+    expect(mockLoginToEzyMailer).toHaveBeenCalledWith("koushik", "secret");
+    expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("logged-in-token");
+  });
+
+  it("shows the server's error message when the fallback login fails", async () => {
+    window.sessionStorage.removeItem("eazyvalidator_auth_token");
+    mockLoginToEzyMailer.mockRejectedValue(new Error("Invalid username or password."));
+
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
+
+    await userEvent.type(screen.getByLabelText("Username"), "koushik");
+    await userEvent.type(screen.getByLabelText("Password"), "wrong");
+    await userEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => expect(screen.getByText("Invalid username or password.")).toBeInTheDocument());
     expect(screen.queryByText("Upload Email List")).not.toBeInTheDocument();
   });
 

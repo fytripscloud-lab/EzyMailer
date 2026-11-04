@@ -2,21 +2,22 @@
 
 import { useEffect, useState } from "react";
 import AppBar from "@mui/material/AppBar";
+import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Container from "@mui/material/Container";
 import Stack from "@mui/material/Stack";
 import Toolbar from "@mui/material/Toolbar";
 import Typography from "@mui/material/Typography";
-import LockIcon from "@mui/icons-material/Lock";
 import MarkEmailReadIcon from "@mui/icons-material/MarkEmailRead";
 
 import ExportSection from "@/components/ExportSection";
+import LoginForm from "@/components/LoginForm";
 import ResultsTable from "@/components/ResultsTable";
 import SummaryReport from "@/components/SummaryReport";
 import SystemStatus from "@/components/SystemStatus";
 import UploadSection from "@/components/UploadSection";
 import ValidationProgress from "@/components/ValidationProgress";
-import { initAuthToken, UNAUTHORIZED_EVENT } from "@/lib/auth";
+import { initAuthToken, setAuthToken, UNAUTHORIZED_EVENT } from "@/lib/auth";
 import { loadPersistedSession, savePersistedSession } from "@/lib/persistedSession";
 import type { ResultFilter } from "@/lib/types";
 
@@ -30,9 +31,28 @@ export default function Home() {
   const [resultsFilter, setResultsFilter] = useState<ResultFilter>("all");
   const [resultsSearch, setResultsSearch] = useState("");
 
-  // EazyValidator has no login of its own - it's only reachable with the JWT
-  // EzyMailer's desktop app hands it via ?token=. No token means this tab
-  // didn't come from a signed-in session; a later 401 flips it back too.
+  // Resumes an in-progress or just-completed job after a page refresh (the
+  // backend job itself is unaffected - it's a separate background task) once
+  // a token is in hand, whether from the URL or a fresh login.
+  function proceedPastAuth() {
+    const session = loadPersistedSession();
+    if (session) {
+      setJobId(session.jobId);
+      setTotalRecords(session.totalRecords);
+      setStage(session.stage);
+    } else {
+      setStage("upload");
+    }
+  }
+
+  const handleLoggedIn = (token: string) => {
+    setAuthToken(token);
+    proceedPastAuth();
+  };
+
+  // Normally opened from EzyMailer's desktop app with the JWT already in the
+  // URL (?token=...) - no login needed. Opened directly with no token, the
+  // "forbidden" stage renders a login form instead; a later 401 flips back.
   useEffect(() => {
     function checkAuthAndRestore() {
       const token = initAuthToken();
@@ -40,18 +60,7 @@ export default function Home() {
         setStage("forbidden");
         return;
       }
-
-      // Restore an in-progress or just-completed job after a page refresh -
-      // the backend job itself is unaffected (it's a separate background
-      // task), but without this the UI would lose track of it.
-      const session = loadPersistedSession();
-      if (session) {
-        setJobId(session.jobId);
-        setTotalRecords(session.totalRecords);
-        setStage(session.stage);
-      } else {
-        setStage("upload");
-      }
+      proceedPastAuth();
     }
     checkAuthAndRestore();
 
@@ -103,14 +112,9 @@ export default function Home() {
       <Container maxWidth="lg" sx={{ py: 4, flex: 1 }}>
         <Stack spacing={3}>
           {stage === "forbidden" && (
-            <Stack spacing={2} sx={{ py: 10, alignItems: "center" }}>
-              <LockIcon color="disabled" sx={{ fontSize: 48 }} />
-              <Typography variant="h6">Access restricted</Typography>
-              <Typography color="text.secondary" sx={{ textAlign: "center", maxWidth: 420 }}>
-                Open EazyValidator from the &quot;Mail Validator&quot; button in EzyMailer - this page
-                isn&apos;t reachable on its own.
-              </Typography>
-            </Stack>
+            <Box sx={{ py: 6 }}>
+              <LoginForm onLoggedIn={handleLoggedIn} />
+            </Box>
           )}
 
           {stage === "upload" && (

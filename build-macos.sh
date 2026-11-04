@@ -49,10 +49,13 @@ pip install pyinstaller
 cleanup_paths
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
-if [ ! -d "$ROOT_DIR/EmailValidator/frontend/out" ]; then
-  echo "EmailValidator/frontend/out is missing - build it first (cd EmailValidator/frontend && npm run build)." >&2
-  exit 1
-fi
+(
+  cd "$ROOT_DIR/EmailValidator/frontend"
+  export NEXT_PUBLIC_API_URL="http://127.0.0.1:8766"
+  export NEXT_PUBLIC_EZYMAILER_API_URL="$EZYM_MAILER_API_BASE_URL"
+  npm install
+  npm run build
+)
 
 pyinstaller \
   --noconfirm \

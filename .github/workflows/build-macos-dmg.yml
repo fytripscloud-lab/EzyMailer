@@ -27,14 +27,6 @@ jobs:
           cache: npm
           cache-dependency-path: EmailValidator/frontend/package-lock.json
 
-      - name: Build EazyValidator frontend static export
-        working-directory: EmailValidator/frontend
-        env:
-          NEXT_PUBLIC_API_URL: http://127.0.0.1:8766
-        run: |
-          npm ci
-          npm run build
-
       - name: Build macOS DMG with all requirements
         env:
           EZYM_MAILER_API_BASE_URL: http://15.206.161.73:8765
