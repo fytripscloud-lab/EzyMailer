@@ -9,9 +9,14 @@ These notes describe the live production setup and how the repository should be 
 - Live host public IP: `15.206.161.73`
 - Live backend API: `http://15.206.161.73:8765/`
 - Live admin frontend: `http://15.206.161.73:8780/`
+- Live EazyValidator backend: `http://15.206.161.73:8766/` (opened by desktop app's "Mail Validator" button)
+- Live EazyValidator frontend: `http://15.206.161.73:8781/`
 - Services to host on the live machine:
   - Backend API
   - Admin frontend
+  - EazyValidator backend + frontend (isolated under `/opt/ezymailer-validator/`, own systemd units, own
+    venv/node process - does not share process or dependencies with the backend/admin services above, so it
+    can be redeployed independently without restarting them)
 - The desktop apps are not hosted on the live server.
 
 ## Database Layout
@@ -72,6 +77,10 @@ These notes describe the live production setup and how the repository should be 
 - Open the following ports in the AWS security group or load balancer rule set for the live instance:
   - `8765` for the backend API
   - `8780` for the admin frontend
+  - `8766` for the EazyValidator backend **(not yet open as of 2026-11-04 - the IAM credentials available to
+    the assistant for this work have no `ec2:*` permissions, so this needs to be done by someone with
+    console/IAM access)**
+  - `8781` for the EazyValidator frontend **(same blocker as above)**
 - If using a public web entrypoint, place Nginx or a load balancer in front and map standard HTTP/HTTPS traffic to the internal app ports.
 
 ## Hosted Database Rule

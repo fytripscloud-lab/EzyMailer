@@ -44,6 +44,7 @@ from typing import Callable, Sequence
 from backend import gmail_oauth, smtp_sender
 from backend.local_api import (
     API_BASE_URL,
+    MAIL_VALIDATOR_URL,
     ensure_api_server,
     get_content as api_get_content,
     get_customer_variables as api_get_customer_variables,
@@ -71,9 +72,11 @@ from PySide6.QtCore import (
     QEvent,
     QPoint,
     QSize,
+    QUrl,
+    QUrlQuery,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QKeySequence, QGuiApplication, QClipboard, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QKeySequence, QGuiApplication, QClipboard, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -2938,6 +2941,13 @@ class TitleBar(QWidget):
         version_badge.setObjectName("versionBadge")
         self.status_badge = QLabel("LOCKED")
         self.status_badge.setObjectName("statusBadge")
+        self.mail_validator_button = QPushButton("Mail Validator")
+        self.mail_validator_button.setObjectName("secondaryButton")
+        self.mail_validator_button.setCursor(Qt.PointingHandCursor)
+        self.mail_validator_button.setToolTip(
+            "Open the bulk email validator in your browser, already signed in"
+        )
+        self.mail_validator_button.setFixedHeight(_scaled_int(24 if IS_MAC else 28, self._scale))
         self.gmail_api_tool_button = QPushButton("Gmail API Automation")
         self.gmail_api_tool_button.setObjectName("secondaryButton")
         self.gmail_api_tool_button.setCursor(Qt.PointingHandCursor)
@@ -2975,6 +2985,7 @@ class TitleBar(QWidget):
         layout.addWidget(spacer)
         layout.addWidget(version_badge)
         layout.addWidget(self.status_badge)
+        layout.addWidget(self.mail_validator_button)
         layout.addWidget(self.gmail_api_tool_button)
         layout.addWidget(self.theme_badge)
         layout.addWidget(self.user_id_label)
@@ -2984,6 +2995,7 @@ class TitleBar(QWidget):
         self.status_badge.setText("READY" if logged_in else "LOCKED")
         self.user_id_label.setText(username if logged_in else "")
         self._window._update_theme_button()
+        self.mail_validator_button.setVisible(logged_in)
         self.gmail_api_tool_button.setVisible(logged_in)
         self.theme_badge.setVisible(logged_in)
         self.user_id_label.setVisible(logged_in)
@@ -17252,6 +17264,7 @@ class MainWindow(QMainWindow):
         self.login_page = LoginPage(self.handle_login, scale=self._scale)
         self.dashboard_page = DashboardPage(self.state, self.handle_logout, self.show_toast, scale=self._scale)
         self.title_bar.gmail_api_tool_button.clicked.connect(self.dashboard_page.open_gmail_api_automation_dialog)
+        self.title_bar.mail_validator_button.clicked.connect(self._open_mail_validator)
         self.stack.addWidget(self.login_page)
         self.stack.addWidget(self.dashboard_page)
         root.addWidget(self.title_bar)
@@ -17286,6 +17299,19 @@ class MainWindow(QMainWindow):
             f"Switched to {'dark' if self._dark_mode else 'light'} mode",
             "success",
         )
+
+    def _open_mail_validator(self) -> None:
+        if not self.state.logged_in or not self.state.auth_token:
+            self.show_toast("Log in before opening Mail Validator.", "error")
+            return
+        url = QUrl(MAIL_VALIDATOR_URL)
+        query = QUrlQuery()
+        query.addQueryItem("token", self.state.auth_token)
+        url.setQuery(query)
+        if QDesktopServices.openUrl(url):
+            self.show_toast("Opening Mail Validator in your browser...", "success")
+        else:
+            self.show_toast("Could not open Mail Validator in your browser.", "error")
 
     def show_toast(self, message: str, kind: str = "info") -> None:
         if kind == "info":

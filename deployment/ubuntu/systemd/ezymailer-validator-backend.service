@@ -1,0 +1,15 @@
+[Unit]
+Description=EazyValidator Backend API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ezymailer-validator/backend
+EnvironmentFile=/etc/ezymailer-validator/backend.env
+ExecStart=/opt/ezymailer-validator/backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8766 --workers 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

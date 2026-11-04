@@ -1,0 +1,15 @@
+[Unit]
+Description=EazyValidator Admin Frontend
+After=network.target
+Requires=ezymailer-validator-backend.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ezymailer-validator/frontend
+ExecStart=/usr/bin/npm start -- -p 8781
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

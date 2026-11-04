@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Env
+.env
+.env.local
+
+# Node
+node_modules/
+.next/
+out/
+npm-debug.log*
+
+# Imported job data (filesystem job storage - not committed)
+backend/imported/uploads/*
+backend/imported/processing/*
+backend/imported/exports/*
+backend/imported/reports/*
+!backend/imported/uploads/.gitkeep
+!backend/imported/processing/.gitkeep
+!backend/imported/exports/.gitkeep
+!backend/imported/reports/.gitkeep
+
+# OS
+.DS_Store
