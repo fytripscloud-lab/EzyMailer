@@ -54,27 +54,36 @@ export default function Home() {
   // URL (?token=...) - no login needed. Opened directly with no token, try
   // auto-login against the same desktop process first (works whenever
   // EzyMailer itself is already signed in) before falling back to the
-  // manual login form. A later 401 flips back to that form too.
+  // manual login form.
+  //
+  // A 401 (e.g. a stale token left over from an earlier run in this same
+  // tab - sessionStorage survives page reloads) retries auto-login too,
+  // rather than jumping straight to the form: the desktop app being signed
+  // in right now is what should decide this, not a token from before.
   useEffect(() => {
+    async function autoLoginOrFallback() {
+      const autoToken = await tryLocalAutoLogin();
+      if (autoToken) {
+        setAuthToken(autoToken);
+        proceedPastAuth();
+      } else {
+        setStage("forbidden");
+      }
+    }
+
     async function checkAuthAndRestore() {
       const token = initAuthToken();
       if (token) {
         proceedPastAuth();
         return;
       }
-
-      const autoToken = await tryLocalAutoLogin();
-      if (autoToken) {
-        setAuthToken(autoToken);
-        proceedPastAuth();
-        return;
-      }
-
-      setStage("forbidden");
+      await autoLoginOrFallback();
     }
     checkAuthAndRestore();
 
-    const onUnauthorized = () => setStage("forbidden");
+    const onUnauthorized = () => {
+      autoLoginOrFallback();
+    };
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
   }, []);

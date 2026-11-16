@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 
 import Home from "@/app/page";
 import { getDiagnostics, getProgress, getReport, getResults } from "@/lib/api";
+import { UNAUTHORIZED_EVENT } from "@/lib/auth";
 import { loginToEzyMailer } from "@/lib/ezymailerAuth";
 import type { DiagnosticsResponse, ProgressResponse, ResultsPage, SummaryReport } from "@/lib/types";
 
@@ -91,6 +92,34 @@ describe("Home page session persistence", () => {
     await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
     expect(screen.queryByText("Sign in to EzyMailer")).not.toBeInTheDocument();
     expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("auto-login-token");
+  });
+
+  it("recovers from a stale token by retrying auto-login instead of jumping straight to the login form", async () => {
+    // beforeEach already seeded a token, so this starts on "upload" like a
+    // normal session - then the stale token gets rejected (401), the same
+    // way a token left over from an earlier run in this tab would.
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: "refreshed-token" }),
+    });
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+    expect(screen.queryByText("Sign in to EzyMailer")).not.toBeInTheDocument();
+    expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("refreshed-token");
+  });
+
+  it("falls back to the login form when a stale token is rejected and auto-login also fails", async () => {
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+
+    global.fetch = jest.fn().mockRejectedValue(new Error("connection refused"));
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
   });
 
   it("logging in through the fallback form stores the token and proceeds to upload", async () => {
