@@ -45,6 +45,8 @@ function diagnostics(): DiagnosticsResponse {
 }
 
 describe("Home page session persistence", () => {
+  const originalFetch = global.fetch;
+
   beforeEach(() => {
     jest.clearAllMocks();
     window.localStorage.clear();
@@ -52,6 +54,14 @@ describe("Home page session persistence", () => {
     // hands it via ?token=; simulate an already-authenticated tab.
     window.sessionStorage.setItem("eazyvalidator_auth_token", "test-token");
     mockGetDiagnostics.mockResolvedValue(diagnostics());
+    // Default: no auto-login available (the /api/v1/session/local probe
+    // fails), as if the desktop app weren't running - tests that need the
+    // success path override this explicitly.
+    global.fetch = jest.fn().mockRejectedValue(new Error("connection refused"));
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
   });
 
   it("shows the upload screen when nothing is persisted", async () => {
@@ -67,6 +77,20 @@ describe("Home page session persistence", () => {
 
     await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
     expect(screen.queryByText("Upload Email List")).not.toBeInTheDocument();
+  });
+
+  it("auto-logs in via the local desktop session instead of showing the login form", async () => {
+    window.sessionStorage.removeItem("eazyvalidator_auth_token");
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: "auto-login-token" }),
+    });
+
+    render(<Home />);
+
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+    expect(screen.queryByText("Sign in to EzyMailer")).not.toBeInTheDocument();
+    expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("auto-login-token");
   });
 
   it("logging in through the fallback form stores the token and proceeds to upload", async () => {

@@ -47,3 +47,23 @@ export function notifyUnauthorized(): void {
   clearAuthToken();
   window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
 }
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+/**
+ * This backend only ever runs bundled inside EzyMailer's own desktop
+ * process (see ensure_validator_server() in main.py), so if its user is
+ * already signed in there, /api/v1/session/local hands out a token without
+ * making them sign in a second time - this is what makes a direct open
+ * (no ?token= from the "Mail Validator" button) skip the login form too.
+ */
+export async function tryLocalAutoLogin(): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/session/local`);
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => ({}));
+    return typeof data?.token === "string" && data.token ? data.token : null;
+  } catch {
+    return null;
+  }
+}

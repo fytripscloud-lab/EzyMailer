@@ -17,7 +17,7 @@ import SummaryReport from "@/components/SummaryReport";
 import SystemStatus from "@/components/SystemStatus";
 import UploadSection from "@/components/UploadSection";
 import ValidationProgress from "@/components/ValidationProgress";
-import { initAuthToken, setAuthToken, UNAUTHORIZED_EVENT } from "@/lib/auth";
+import { initAuthToken, setAuthToken, tryLocalAutoLogin, UNAUTHORIZED_EVENT } from "@/lib/auth";
 import { loadPersistedSession, savePersistedSession } from "@/lib/persistedSession";
 import type { ResultFilter } from "@/lib/types";
 
@@ -51,16 +51,26 @@ export default function Home() {
   };
 
   // Normally opened from EzyMailer's desktop app with the JWT already in the
-  // URL (?token=...) - no login needed. Opened directly with no token, the
-  // "forbidden" stage renders a login form instead; a later 401 flips back.
+  // URL (?token=...) - no login needed. Opened directly with no token, try
+  // auto-login against the same desktop process first (works whenever
+  // EzyMailer itself is already signed in) before falling back to the
+  // manual login form. A later 401 flips back to that form too.
   useEffect(() => {
-    function checkAuthAndRestore() {
+    async function checkAuthAndRestore() {
       const token = initAuthToken();
-      if (!token) {
-        setStage("forbidden");
+      if (token) {
+        proceedPastAuth();
         return;
       }
-      proceedPastAuth();
+
+      const autoToken = await tryLocalAutoLogin();
+      if (autoToken) {
+        setAuthToken(autoToken);
+        proceedPastAuth();
+        return;
+      }
+
+      setStage("forbidden");
     }
     checkAuthAndRestore();
 

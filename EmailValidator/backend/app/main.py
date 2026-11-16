@@ -4,7 +4,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -71,6 +71,27 @@ app.include_router(system_router, dependencies=[Depends(verify_token)])
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/v1/session/local")
+async def local_session() -> dict[str, str]:
+    """Lets the frontend auto-login instead of showing the fallback login
+    form, when this backend is running bundled inside EzyMailer's own
+    desktop process (the only thing that ever starts it - see
+    ensure_validator_server() in main.py) and that app's user is already
+    signed in. Deliberately unauthenticated: its whole purpose is to hand
+    out a token before one exists."""
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        raise HTTPException(status_code=404, detail="Not running inside the EzyMailer desktop app.")
+
+    main_window = getattr(QApplication.instance(), "main_window", None)
+    state = getattr(main_window, "state", None)
+    if not state or not getattr(state, "logged_in", False) or not getattr(state, "auth_token", None):
+        raise HTTPException(status_code=401, detail="Not signed in to EzyMailer.")
+
+    return {"token": state.auth_token}
 
 
 def _frontend_static_dir() -> Path:
