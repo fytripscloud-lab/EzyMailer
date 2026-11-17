@@ -30,6 +30,12 @@ export default function Home() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [resultsFilter, setResultsFilter] = useState<ResultFilter>("all");
   const [resultsSearch, setResultsSearch] = useState("");
+  // Bumped whenever a fresh token is obtained (initial auto-login or a
+  // 401-triggered retry) - stage can go "upload" -> "upload" with no
+  // re-render of its own, so SystemStatus needs this as a key to actually
+  // remount and retry its one-shot check with the new token instead of
+  // sitting on a stale "invalid token" error from the old one.
+  const [authVersion, setAuthVersion] = useState(0);
 
   // Resumes an in-progress or just-completed job after a page refresh (the
   // backend job itself is unaffected - it's a separate background task) once
@@ -47,6 +53,7 @@ export default function Home() {
 
   const handleLoggedIn = (token: string) => {
     setAuthToken(token);
+    setAuthVersion((v) => v + 1);
     proceedPastAuth();
   };
 
@@ -65,6 +72,7 @@ export default function Home() {
       const autoToken = await tryLocalAutoLogin();
       if (autoToken) {
         setAuthToken(autoToken);
+        setAuthVersion((v) => v + 1);
         proceedPastAuth();
       } else {
         setStage("forbidden");
@@ -138,7 +146,7 @@ export default function Home() {
 
           {stage === "upload" && (
             <>
-              <SystemStatus />
+              <SystemStatus key={authVersion} />
               <UploadSection onStarted={handleStarted} />
             </>
           )}

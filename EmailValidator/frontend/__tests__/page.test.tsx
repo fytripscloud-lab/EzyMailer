@@ -112,6 +112,24 @@ describe("Home page session persistence", () => {
     expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("refreshed-token");
   });
 
+  it("retries SystemStatus's check after a 401-triggered token refresh, instead of leaving it stuck on the old error", async () => {
+    mockGetDiagnostics.mockRejectedValueOnce(new Error("Invalid token."));
+
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText(/Invalid token\./)).toBeInTheDocument());
+
+    mockGetDiagnostics.mockResolvedValueOnce(diagnostics());
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: "refreshed-token" }),
+    });
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+
+    await waitFor(() => expect(screen.getByText("Backend API: Connected")).toBeInTheDocument());
+    expect(screen.queryByText(/Invalid token\./)).not.toBeInTheDocument();
+    expect(mockGetDiagnostics).toHaveBeenCalledTimes(2);
+  });
+
   it("falls back to the login form when a stale token is rejected and auto-login also fails", async () => {
     render(<Home />);
     await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
