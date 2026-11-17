@@ -112,6 +112,54 @@ describe("Home page session persistence", () => {
     expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("refreshed-token");
   });
 
+  it("stops retrying after one attempt per page load, instead of looping forever on repeat 401s", async () => {
+    // Simulates auto-login handing back a token the backend keeps
+    // rejecting (e.g. a bug where it's the same always-invalid token every
+    // time) - the first 401 gets one retry, but a second 401 right after
+    // must not trigger another auto-login call.
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: "still-bad-token" }),
+    });
+    global.fetch = mockFetch;
+
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows another auto-login retry after a fresh manual sign-in", async () => {
+    window.sessionStorage.removeItem("eazyvalidator_auth_token");
+    global.fetch = jest.fn().mockRejectedValue(new Error("connection refused"));
+
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("Sign in to EzyMailer")).toBeInTheDocument());
+
+    mockLoginToEzyMailer.mockResolvedValue("manual-login-token");
+    await userEvent.type(screen.getByLabelText("Username"), "koushik");
+    await userEvent.type(screen.getByLabelText("Password"), "secret");
+    await userEvent.click(screen.getByRole("button", { name: /sign in/i }));
+    await waitFor(() => expect(screen.getByText("Upload Email List")).toBeInTheDocument());
+
+    // A 401 right after this fresh manual login should still get its own
+    // retry attempt, not be blocked by an earlier page-load's exhausted cap.
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ token: "auto-refreshed-token" }),
+    });
+    global.fetch = mockFetch;
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+    expect(window.sessionStorage.getItem("eazyvalidator_auth_token")).toBe("auto-refreshed-token");
+  });
+
   it("retries SystemStatus's check after a 401-triggered token refresh, instead of leaving it stuck on the old error", async () => {
     mockGetDiagnostics.mockRejectedValueOnce(new Error("Invalid token."));
 

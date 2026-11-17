@@ -1,9 +1,10 @@
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+import app.core.auth as auth_module
 from tests.conftest import make_token
 
 
@@ -41,6 +42,43 @@ def test_protected_route_accepts_query_param_token(client: TestClient) -> None:
     client.headers.pop("Authorization", None)
     response = client.get(f"/api/v1/system/diagnostics?token={token}")
     assert response.status_code == 200
+
+
+def test_a_token_the_remote_ezymailer_backend_confirms_is_accepted(client: TestClient) -> None:
+    # Stands in for a real production token: signed with the live server's
+    # own secret, which this process never holds, so local verification
+    # fails and it has to fall through to asking that backend directly.
+    client.headers.update({"Authorization": "Bearer production.signed.token"})
+    with patch.object(auth_module, "_verify_with_ezymailer_backend", AsyncMock(return_value=True)):
+        response = client.get("/api/v1/system/diagnostics")
+    assert response.status_code == 200
+
+
+def test_remote_verification_result_is_cached_within_the_ttl(client: TestClient) -> None:
+    client.headers.update({"Authorization": "Bearer production.signed.token"})
+    mock_verify = AsyncMock(return_value=True)
+    with patch.object(auth_module, "_verify_with_ezymailer_backend", mock_verify):
+        first = client.get("/api/v1/system/diagnostics")
+        second = client.get("/api/v1/system/diagnostics")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert mock_verify.call_count == 1
+
+
+def test_rejected_when_the_remote_ezymailer_backend_says_the_token_is_invalid(client: TestClient) -> None:
+    client.headers.update({"Authorization": "Bearer production.signed.token"})
+    with patch.object(auth_module, "_verify_with_ezymailer_backend", AsyncMock(return_value=False)):
+        response = client.get("/api/v1/system/diagnostics")
+    assert response.status_code == 401
+
+
+def test_remote_verification_fails_closed_when_the_backend_is_unreachable(client: TestClient) -> None:
+    # EZYM_MAILER_API_BASE_URL is pointed at a port nothing listens on in
+    # tests (see conftest.test_settings) - this exercises that for real,
+    # without mocking _verify_with_ezymailer_backend itself.
+    client.headers.update({"Authorization": "Bearer production.signed.token"})
+    response = client.get("/api/v1/system/diagnostics")
+    assert response.status_code == 401
 
 
 def _fake_qapplication_module(main_window: object | None) -> types.ModuleType:

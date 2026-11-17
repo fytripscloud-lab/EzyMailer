@@ -8,6 +8,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+import app.core.auth as auth_module
 from app.config import Settings, get_settings
 from app.core.auth import JWT_ALGORITHM, JWT_SECRET
 from app.core.rate_limit import limiter
@@ -24,6 +25,11 @@ def reset_rate_limiter() -> None:
     limiter.reset()
 
 
+@pytest.fixture(autouse=True)
+def reset_remote_token_cache() -> None:
+    auth_module._verified_tokens.clear()
+
+
 @pytest.fixture
 def tmp_imported_dir() -> Iterator[Path]:
     d = Path(tempfile.mkdtemp(prefix="email_validator_test_"))
@@ -38,6 +44,11 @@ def test_settings(tmp_imported_dir: Path, monkeypatch) -> Settings:
     monkeypatch.setenv("ENABLE_SMTP_CHECK", "false")
     monkeypatch.setenv("ENABLE_CATCH_ALL_CHECK", "false")
     monkeypatch.setenv("JOB_RETENTION_HOURS", "24")
+    # A token that fails local signature verification falls through to an
+    # HTTP check against this URL (see app.core.auth) - point it at a port
+    # nothing listens on so that check fails fast (connection refused)
+    # instead of a real network call out to the live server during tests.
+    monkeypatch.setenv("EZYM_MAILER_API_BASE_URL", "http://127.0.0.1:1")
     settings = get_settings()
     # Settings.base_dir is derived from the app package location, not env,
     # so point all storage dirs explicitly at the temp directory for isolation.

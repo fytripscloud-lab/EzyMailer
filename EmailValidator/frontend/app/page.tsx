@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AppBar from "@mui/material/AppBar";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -36,6 +36,12 @@ export default function Home() {
   // remount and retry its one-shot check with the new token instead of
   // sitting on a stale "invalid token" error from the old one.
   const [authVersion, setAuthVersion] = useState(0);
+  // Caps auto-login retries at one per page load (reset only by a fresh
+  // manual sign-in - see handleLoggedIn): without this, a 401 that recurs
+  // right after a "successful" auto-login (e.g. auto-login keeps handing
+  // back the same token the backend keeps rejecting) would retry forever
+  // in a tight loop instead of ever reaching the login form.
+  const hasRetriedAutoLoginRef = useRef(false);
 
   // Resumes an in-progress or just-completed job after a page refresh (the
   // backend job itself is unaffected - it's a separate background task) once
@@ -52,6 +58,7 @@ export default function Home() {
   }
 
   const handleLoggedIn = (token: string) => {
+    hasRetriedAutoLoginRef.current = false;
     setAuthToken(token);
     setAuthVersion((v) => v + 1);
     proceedPastAuth();
@@ -90,6 +97,11 @@ export default function Home() {
     checkAuthAndRestore();
 
     const onUnauthorized = () => {
+      if (hasRetriedAutoLoginRef.current) {
+        setStage("forbidden");
+        return;
+      }
+      hasRetriedAutoLoginRef.current = true;
       autoLoginOrFallback();
     };
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
