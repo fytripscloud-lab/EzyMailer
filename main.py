@@ -167,6 +167,7 @@ LOCAL_API_JSON_OUTPUT_STATE_KEY = "api_json_output_state"
 # inbox when signed in. Plain mail.google.com sends a signed-out Normal-mode
 # window to Workspace's marketing page instead (verified on Windows).
 GMAIL_SIGNIN_URL = "https://accounts.google.com/ServiceLogin?service=mail&continue=https://mail.google.com/mail/u/0/"
+ICLOUD_SIGNIN_URL = "https://www.icloud.com/mail/"
 DEFAULT_API_JSON_OUTPUT_DIR = Path.home() / "Downloads" / "EzyMailer Gmail API JSON"
 
 
@@ -1837,6 +1838,7 @@ class AppState:
     logged_in: bool = False
     auth_token: str = ""
     browser_mode: str = "Incognito"
+    email_provider: str = "Gmail"
     sending_mode: str = "Manual"
     api_json_paths: list[str] = field(default_factory=list)
     smtp_host: str = smtp_sender.DEFAULT_HOST
@@ -6401,6 +6403,8 @@ class DashboardPage(QWidget):
         self.api_json_upload_button = QPushButton("Upload JSON")
         self.incognito_button = QPushButton("Incognito")
         self.normal_button = QPushButton("Normal Mode")
+        self.gmail_provider_button = QPushButton("Gmail")
+        self.icloud_provider_button = QPushButton("iCloud")
         self.normal_message_button = QPushButton("Plain Text")
         self.html_message_button = QPushButton("HTML Body")
         self.data_summary_labels: dict[str, QLabel] = {}
@@ -6811,6 +6815,26 @@ class DashboardPage(QWidget):
         mode_row.addWidget(self.incognito_button)
         mode_row.addWidget(self.normal_button)
         mode_layout.addLayout(mode_row)
+
+        provider_label = QLabel("Email Provider")
+        provider_label.setObjectName("sectionHint")
+        mode_layout.addWidget(provider_label)
+        provider_group = QButtonGroup(self)
+        provider_group.setExclusive(True)
+        self._configure_segmented_button(self.gmail_provider_button, checked=True)
+        self._configure_segmented_button(self.icloud_provider_button)
+        provider_group.addButton(self.gmail_provider_button)
+        provider_group.addButton(self.icloud_provider_button)
+        self.gmail_provider_button.clicked.connect(lambda: self._set_email_provider("Gmail"))
+        self.icloud_provider_button.clicked.connect(lambda: self._set_email_provider("iCloud"))
+        self.gmail_provider_button.setToolTip("Open browser windows signed in to Gmail")
+        self.icloud_provider_button.setToolTip("Open browser windows signed in to iCloud Mail")
+        self._apply_button_icon(self.gmail_provider_button, QStyle.SP_DialogYesButton)
+        self._apply_button_icon(self.icloud_provider_button, QStyle.SP_DialogNoButton)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(self.gmail_provider_button)
+        provider_row.addWidget(self.icloud_provider_button)
+        mode_layout.addLayout(provider_row)
 
         sessions_card, sessions_layout = self._card("Active Sessions", "Open browser windows and their current state.")
         self.sessions_subtitle_label = sessions_card.findChild(QLabel, "sectionSubtitle")
@@ -9583,6 +9607,14 @@ class DashboardPage(QWidget):
         self._log_action(f"Browser mode set to {mode}")
         self.notify(f"Browser mode changed to {mode}")
 
+    def _set_email_provider(self, provider: str) -> None:
+        self.state.email_provider = provider
+        self.gmail_provider_button.setChecked(provider == "Gmail")
+        self.icloud_provider_button.setChecked(provider == "iCloud")
+        self._persist_browser_state()
+        self._log_action(f"Email provider set to {provider}")
+        self.notify(f"Email provider changed to {provider}")
+
     def _set_body_mode(self, mode: str) -> None:
         self.state.body_mode = mode
         self.normal_message_button.setChecked(mode == "Normal Message")
@@ -9620,6 +9652,7 @@ class DashboardPage(QWidget):
     def _current_browser_state_payload(self) -> dict[str, object]:
         return {
             "browser_mode": self.state.browser_mode,
+            "email_provider": self.state.email_provider,
             "sending_mode": self.state.sending_mode,
             "api_json_paths": list(self.state.api_json_paths),
             "smtp_host": self.state.smtp_host,
@@ -9639,6 +9672,7 @@ class DashboardPage(QWidget):
 
     def _apply_browser_state_payload(self, payload: dict[str, object]) -> None:
         browser_mode = str(payload.get("browser_mode") or "Incognito")
+        email_provider = str(payload.get("email_provider") or "Gmail")
         sending_mode = str(payload.get("sending_mode") or "Manual")
         raw_json_paths = payload.get("api_json_paths") or []
         api_json_paths = [
@@ -9655,6 +9689,7 @@ class DashboardPage(QWidget):
             tab_count = 1
 
         self.state.browser_mode = browser_mode if browser_mode in {"Incognito", "Normal"} else "Incognito"
+        self.state.email_provider = email_provider if email_provider in {"Gmail", "iCloud"} else "Gmail"
         self.state.sending_mode = sending_mode if sending_mode in {"Manual", "API JSON", "SMTP"} else "Manual"
         self.state.api_json_paths = self._discover_saved_api_accounts(api_json_paths)
         self.state.launch_preset = launch_preset
@@ -10390,10 +10425,11 @@ class DashboardPage(QWidget):
             tab_count=tab_count,
         )
         if not blank:
-            # One Gmail tab per configured sending tab, opened off the GUI
+            # One mail tab per configured sending tab, opened off the GUI
             # thread. All go through the sign-in URL: plain mail.google.com
             # lands a signed-out Normal window on a marketing page.
-            start_urls = [GMAIL_SIGNIN_URL] * tab_count
+            provider_url = ICLOUD_SIGNIN_URL if self.state.email_provider == "iCloud" else GMAIL_SIGNIN_URL
+            start_urls = [provider_url] * tab_count
             threading.Thread(target=self._open_start_pages, args=(session, start_urls), daemon=True).start()
         return session
 
@@ -10472,6 +10508,7 @@ class DashboardPage(QWidget):
                         self.state.launch_preset or "Default",
                         {
                             "browser_mode": self.state.browser_mode,
+                            "email_provider": self.state.email_provider,
                             "profile_dir": str(session.profile_dir) if session.profile_dir else "",
                         },
                     )
@@ -10554,6 +10591,7 @@ class DashboardPage(QWidget):
                     self.state.launch_preset or "Default",
                     {
                         "browser_mode": self.state.browser_mode,
+                        "email_provider": self.state.email_provider,
                         "profile_dir": str(session.profile_dir) if session.profile_dir else "",
                         "tab_count": session.tab_count,
                     },
@@ -10575,7 +10613,8 @@ class DashboardPage(QWidget):
         title = "Confirm Launch"
         tab_count = max(1, self.tab_spin.value())
         prompt = (
-            f"Launch {self.window_spin.value()} browser window(s) with {tab_count} Gmail tab(s) each "
+            f"Launch {self.window_spin.value()} browser window(s) with {tab_count} "
+            f"{self.state.email_provider} tab(s) each "
             f"using {self.state.browser_mode} mode "
             f"and the {self.launch_preset_label.text()} preset?"
         )
@@ -10701,6 +10740,7 @@ class DashboardPage(QWidget):
                     self.state.launch_preset or "Default",
                     {
                         "browser_mode": self.state.browser_mode,
+                        "email_provider": self.state.email_provider,
                         "profile_dir": str(session.profile_dir) if session.profile_dir else "",
                     },
                 )
@@ -10717,6 +10757,7 @@ class DashboardPage(QWidget):
         self.state.window_count = 1
         self.state.tab_count = 1
         self.state.browser_mode = "Incognito"
+        self.state.email_provider = "Gmail"
         self.state.body_mode = "Normal Message"
         self.state.launch_preset = "Default"
         self.state.ai_provider = "ChatGPT"
@@ -10902,6 +10943,7 @@ class DashboardPage(QWidget):
                 self.state.launch_preset or "Default",
                 {
                     "browser_mode": self.state.browser_mode,
+                    "email_provider": self.state.email_provider,
                     "profile_dir": str(session.profile_dir) if session.profile_dir else "",
                 },
             )
@@ -14360,6 +14402,324 @@ class DashboardPage(QWidget):
         except Exception:
             pass
 
+    # -- iCloud Mail automation -------------------------------------------
+    #
+    # iCloud Mail has no URL-based compose shortcut like Gmail's ?view=cm, so
+    # every send drives the real UI: click Compose, fill To/Subject/Body,
+    # click Send. The app itself lives in a same-origin iframe
+    # (.../applications/mail2/...) that iCloud can replace during its own
+    # internal bootstrap shortly after the tab loads, which turns a held
+    # frame reference into a "Frame was detached" error — every frame lookup
+    # below re-resolves fresh from page.frames instead of caching a frame
+    # object across a wait. The compose body is a further, separate,
+    # cross-origin iframe (.../mail2-rte/...) hosting a plain contenteditable
+    # rich-text editor.
+
+    @staticmethod
+    def _icloud_app_frame(page):
+        """Return iCloud Mail's main app iframe, or None if not (yet) present."""
+        try:
+            frames = page.frames
+        except Exception:
+            return None
+        for frame in frames:
+            try:
+                url = frame.url or ""
+            except Exception:
+                continue
+            if "applications/mail2/" in url and "mail2-message" not in url and "mail2-rte" not in url:
+                return frame
+        return None
+
+    @staticmethod
+    def _icloud_rte_frame(page):
+        """Return the cross-origin rich-text-editor iframe for an open Compose body."""
+        try:
+            frames = page.frames
+        except Exception:
+            return None
+        for frame in frames:
+            try:
+                url = frame.url or ""
+            except Exception:
+                continue
+            if "mail2-rte" in url:
+                return frame
+        return None
+
+    @staticmethod
+    def _icloud_signed_in(page) -> bool:
+        """True once the tab shows a signed-in folder view.
+
+        Signed-out iCloud Mail's title is "iCloud Mail - Apple iCloud"; a
+        signed-in folder view's title always carries "| iCloud Mail" instead
+        (e.g. "Primary | iCloud Mail") — verified live, in every folder.
+        """
+        try:
+            title = page.title()
+        except Exception:
+            return False
+        return "| iCloud Mail" in title and "Apple iCloud" not in title
+
+    def _close_stale_icloud_compose(self, page) -> None:
+        """Cancel any already-open iCloud Mail compose drafts before starting a new one."""
+        frame = self._icloud_app_frame(page)
+        if frame is None:
+            return
+        try:
+            cancel_buttons = frame.locator('ui-button.cancel-compose-button[aria-label="Cancel"]')
+            for index in range(cancel_buttons.count() - 1, -1, -1):
+                try:
+                    cancel_buttons.nth(index).click(timeout=1500, force=True)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _open_icloud_compose(self, page) -> None:
+        """Click iCloud Mail's Compose button in the (possibly just-replaced) app frame."""
+        self._close_stale_icloud_compose(page)
+        deadline = time.monotonic() + 20
+        last_exc: Exception | None = None
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                button = frame.get_by_role("button", name=re.compile(r"^Compose new message")).first
+                button.click(timeout=3000)
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        raise RuntimeError(f"iCloud Mail Compose button was not available ({last_exc}).")
+
+    def _fill_icloud_compose(self, page, recipient: str, subject: str, body_text: str) -> None:
+        """Fill iCloud Mail's To, Subject, and Body fields in an open Compose pane."""
+        deadline = time.monotonic() + 15
+        last_exc: Exception | None = None
+        to_field = None
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                to_field = frame.locator("ui-autocomplete-token-field").first
+                to_field.wait_for(state="visible", timeout=3000)
+                to_field.click(timeout=3000)
+                page.wait_for_timeout(150)
+                page.keyboard.type(recipient, delay=20)
+                page.keyboard.press("Enter")
+                break
+            except Exception as exc:
+                last_exc = exc
+                to_field = None
+                time.sleep(0.5)
+        if to_field is None:
+            raise RuntimeError(f"iCloud Mail To field was not available ({last_exc}).")
+
+        last_exc = None
+        subject_filled = False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                subject_box = frame.get_by_role("textbox", name="Subject:")
+                subject_box.click(timeout=3000)
+                subject_box.fill(subject, timeout=3000)
+                subject_filled = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        if not subject_filled:
+            raise RuntimeError(f"iCloud Mail Subject field was not available ({last_exc}).")
+
+        last_exc = None
+        body_filled = False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            rte_frame = self._icloud_rte_frame(page)
+            if rte_frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                body_box = rte_frame.locator('div[role="textbox"][aria-label="Compose message body"]').first
+                body_box.click(timeout=3000)
+                body_box.fill(body_text, timeout=3000)
+                body_filled = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        if not body_filled:
+            raise RuntimeError(f"iCloud Mail Body field was not available ({last_exc}).")
+
+    def _wait_for_icloud_send_confirmation(self, page, *, timeout: float) -> bool:
+        """Confirm one send: the Send button (and its compose pane) disappears once sent."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            if page.is_closed():
+                raise CampaignBrowserClosedError(
+                    "iCloud Mail browser window was closed before the send could be confirmed."
+                )
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                return True
+            try:
+                send_button = frame.get_by_role("button", name="Send Message")
+                if send_button.count() == 0 or not send_button.first.is_visible():
+                    return True
+            except Exception:
+                return True
+            page.wait_for_timeout(100)
+        return False
+
+    def _send_icloud_compose(self, page) -> None:
+        """Click iCloud Mail's Send button and wait for the send to be confirmed."""
+        deadline = time.monotonic() + 15
+        last_exc: Exception | None = None
+        clicked = False
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                send_button = frame.get_by_role("button", name="Send Message").first
+                send_button.click(timeout=3000)
+                clicked = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        if not clicked:
+            raise RuntimeError(f"iCloud Mail Send button was not available ({last_exc}).")
+        if not self._wait_for_icloud_send_confirmation(page, timeout=20):
+            raise RuntimeError("iCloud Mail did not finish sending the message.")
+
+    def _attach_files_to_icloud(self, page, file_paths: list[str]) -> None:
+        """Attach files to iCloud Mail's open Compose pane via its file input."""
+        deadline = time.monotonic() + 15
+        last_exc: Exception | None = None
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                file_input = frame.locator('input[type="file"]').first
+                file_input.set_input_files(file_paths, timeout=15000)
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        raise RuntimeError(f"iCloud Mail attachment picker did not accept the generated file ({last_exc}).")
+
+    def _wait_for_icloud_attachment_upload(self, page, file_paths: list[str], *, timeout: float) -> None:
+        """Wait until iCloud Mail's attachments list shows every uploaded file."""
+        expected = len(file_paths)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            frame = self._icloud_app_frame(page)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+            try:
+                if frame.locator(".attachments-list > *").count() >= expected:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise RuntimeError("iCloud Mail did not finish uploading the attachment.")
+
+    def _send_icloud_compose_with_playwright(
+        self,
+        session: BrowserSessionHandle | BrowserTabHandle,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        attachment_paths: list[Path] | None = None,
+        log_steps: bool = True,
+    ) -> None:
+        ensure_external_dependencies()
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            with self._gmail_browser_connection(session) as (browser, active_pages):
+                pages = []
+                required_page_count = session.tab_index if isinstance(session, BrowserTabHandle) else 1
+                page_deadline = time.monotonic() + 10
+                while time.monotonic() < page_deadline:
+                    pages = [
+                        page
+                        for context in browser.contexts
+                        for page in context.pages
+                        if not page.is_closed()
+                    ]
+                    if len(pages) >= required_page_count:
+                        break
+                    time.sleep(0.25)
+                if len(pages) < required_page_count:
+                    if isinstance(session, BrowserTabHandle):
+                        raise CampaignBrowserClosedError(
+                            f"{session.title} was closed; its campaign queue stopped."
+                        )
+                    raise CampaignBrowserClosedError("iCloud Mail browser window was closed; campaign stopped.")
+                if isinstance(session, BrowserTabHandle):
+                    page = pages[session.tab_index - 1]
+                else:
+                    page = next((item for item in pages if "icloud.com" in (item.url or "")), None)
+                if page is None:
+                    page = pages[0]
+                    page.set_default_timeout(10000)
+                    page.set_default_navigation_timeout(15000)
+                    page.goto(ICLOUD_SIGNIN_URL, wait_until="domcontentloaded", timeout=15000)
+                    current_url = str(page.url or "")
+                    if "icloud.com" not in current_url:
+                        raise RuntimeError(
+                            f"{session.title} is not signed in to iCloud Mail. Sign in inside that EzyMailer browser window, then start again."
+                        )
+                page.set_default_timeout(10000)
+                page.set_default_navigation_timeout(15000)
+                self._gmail_page_from_session(page)
+                self._keep_gmail_page_active(page, active_pages)
+                self._hold_while_screen_not_drawn(page, session)
+                if log_steps:
+                    self._log_action("iCloud Mail page ready")
+
+                if not self._icloud_signed_in(page):
+                    raise RuntimeError(
+                        f"{session.title} is not signed in to iCloud Mail. Sign in inside that EzyMailer browser window, then start again."
+                    )
+
+                self._open_icloud_compose(page)
+                if log_steps:
+                    self._log_action("iCloud Mail compose opened")
+                self._fill_icloud_compose(page, recipient, subject, body_text)
+                if log_steps:
+                    self._log_action("Recipient, subject, and body loaded")
+                if attachment_paths:
+                    files_to_attach = [str(path) for path in attachment_paths if path.exists()]
+                    if not files_to_attach:
+                        raise RuntimeError("No attachment files were generated.")
+                    self._attach_files_to_icloud(page, files_to_attach)
+                    self._wait_for_icloud_attachment_upload(page, files_to_attach, timeout=60)
+                    if log_steps:
+                        self._log_action(
+                            "Attachment uploaded: " + ", ".join(Path(path).name for path in files_to_attach)
+                        )
+                self._send_icloud_compose(page)
+                if log_steps:
+                    self._log_action(f"iCloud Mail send completed for {recipient}")
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(f"iCloud Mail automation timed out: {exc}") from exc
+
     def _send_compose_with_playwright(
         self,
         session: BrowserSessionHandle | BrowserTabHandle,
@@ -14376,16 +14736,26 @@ class DashboardPage(QWidget):
         *,
         body_html: str = "",
     ) -> None:
+        is_icloud = self.state.email_provider == "iCloud"
         if not attachment_html.strip():
-            self._send_compose_with_playwright_attachment(
-                session,
-                recipient,
-                subject,
-                body_text,
-                [],
-                log_steps=log_steps,
-                body_html=body_html,
-            )
+            if is_icloud:
+                self._send_icloud_compose_with_playwright(
+                    session,
+                    recipient,
+                    subject,
+                    body_text,
+                    log_steps=log_steps,
+                )
+            else:
+                self._send_compose_with_playwright_attachment(
+                    session,
+                    recipient,
+                    subject,
+                    body_text,
+                    [],
+                    log_steps=log_steps,
+                    body_html=body_html,
+                )
             return
         attachment_temp_dir = Path(tempfile.mkdtemp(prefix="ezymailer-gmail-"))
         attachment_paths: list[Path] = []
@@ -14403,15 +14773,25 @@ class DashboardPage(QWidget):
             )
             if log_steps:
                 self._log_action(f"Preparing attachment file for {recipient}")
-            self._send_compose_with_playwright_attachment(
-                session,
-                recipient,
-                subject,
-                body_text,
-                attachment_paths,
-                log_steps=log_steps,
-                body_html=body_html,
-            )
+            if is_icloud:
+                self._send_icloud_compose_with_playwright(
+                    session,
+                    recipient,
+                    subject,
+                    body_text,
+                    attachment_paths,
+                    log_steps=log_steps,
+                )
+            else:
+                self._send_compose_with_playwright_attachment(
+                    session,
+                    recipient,
+                    subject,
+                    body_text,
+                    attachment_paths,
+                    log_steps=log_steps,
+                    body_html=body_html,
+                )
         finally:
             try:
                 shutil.rmtree(attachment_temp_dir, ignore_errors=True)
@@ -15934,6 +16314,7 @@ class DashboardPage(QWidget):
                 self.state.launch_preset or "Default",
                 {
                     "browser_mode": self.state.browser_mode,
+                    "email_provider": self.state.email_provider,
                     "profile_dir": str(session.profile_dir) if session.profile_dir else "",
                     "tab_count": session.tab_count,
                 },
@@ -15955,7 +16336,9 @@ class DashboardPage(QWidget):
 
         launched = self._browser_sessions
         total_tabs = sum(item.tab_count for item in launched)
-        self._log_action(f"Started {len(launched)} browser window(s) with {total_tabs} Gmail tab(s)")
+        self._log_action(
+            f"Started {len(launched)} browser window(s) with {total_tabs} {self.state.email_provider} tab(s)"
+        )
         self.notify(f"Launch started for {len(launched)} window(s) and {total_tabs} tab(s)")
         self.window().launch_loader.set_message(
             "Getting Gmail ready",
@@ -16920,6 +17303,8 @@ class DashboardPage(QWidget):
     def _refresh_controls(self) -> None:
         self.incognito_button.setChecked(self.state.browser_mode == "Incognito")
         self.normal_button.setChecked(self.state.browser_mode == "Normal")
+        self.gmail_provider_button.setChecked(self.state.email_provider == "Gmail")
+        self.icloud_provider_button.setChecked(self.state.email_provider == "iCloud")
         self._sync_sending_mode_buttons()
         self.normal_message_button.setChecked(self.state.body_mode == "Normal Message")
         self.html_message_button.setChecked(self.state.body_mode == "HTML Message")
